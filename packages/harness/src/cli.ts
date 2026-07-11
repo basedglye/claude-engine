@@ -21,6 +21,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve, isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Sim } from "@claude-engine/core";
 import type { Scenario, Verdict } from "./index.js";
 import { runScenario, verifyReplay, replayVerdict } from "./index.js";
 
@@ -33,20 +34,32 @@ function parseArgs(argv: readonly string[]): {
   replay: string | undefined;
   verifyReplay: boolean;
   out: string | undefined;
+  browser: boolean;
+  screenshotDir: string | undefined;
 } {
   let scenario: string | undefined;
   let replay: string | undefined;
   let verifyReplayFlag = false;
   let out: string | undefined;
+  let browser = false;
+  let screenshotDir: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--verify-replay") {
       verifyReplayFlag = true;
+    } else if (arg === "--browser") {
+      browser = true;
     } else if (arg === "--out") {
       out = argv[++i];
       if (!out) {
         console.error("--out requires a file path argument");
+        process.exit(2);
+      }
+    } else if (arg === "--screenshot-dir") {
+      screenshotDir = argv[++i];
+      if (!screenshotDir) {
+        console.error("--screenshot-dir requires a directory path argument");
         process.exit(2);
       }
     } else if (arg === "--replay") {
@@ -65,13 +78,13 @@ function parseArgs(argv: readonly string[]): {
 
   if (!scenario && !replay) {
     console.error(
-      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>]\n" +
+      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--screenshot-dir <dir>]\n" +
         "       npm run harness -- --replay <verdict.json> [--out <file>]"
     );
     process.exit(2);
   }
 
-  return { scenario, replay, verifyReplay: verifyReplayFlag, out };
+  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, screenshotDir };
 }
 
 /** Repo-relative path with forward slashes, for portable storage in a verdict. */
@@ -158,10 +171,70 @@ async function runReplayMode(replaySpec: string, out: string | undefined): Promi
   process.exit(result.verified ? 0 : 3);
 }
 
+async function runBrowserMode(
+  scenario: Scenario,
+  scenarioPath: string,
+  screenshotDir: string | undefined,
+  out: string | undefined
+): Promise<void> {
+  const { runBrowserScenario, BrowserInfraError } = await import("./browser.js");
+
+  let result;
+  try {
+    result = await runBrowserScenario(scenario, repoRoot, screenshotDir === undefined ? {} : { screenshotDir });
+  } catch (err) {
+    if (err instanceof BrowserInfraError) {
+      console.error(`Browser-mode infra failure for "${scenario.name}": ${err.message}`);
+      process.exit(2);
+      return;
+    }
+    console.error(`Browser-mode run for "${scenario.name}" threw:`);
+    console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+    process.exit(2);
+    return;
+  }
+
+  const sim = new Sim(scenario.seed);
+  scenario.setup(sim);
+  const setupStateHash = sim.stateHash();
+
+  const verdict: Verdict = {
+    scenario: scenario.name,
+    seed: scenario.seed,
+    ticks: result.browser.finalTick,
+    passed: result.passed,
+    assertions: [],
+    finalStateHash: result.browser.finalStateHash,
+    eventCount: result.eventCount,
+    entityCount: result.entityCount,
+    replay: {
+      seed: scenario.seed,
+      commands: result.commands,
+      scenarioModule: toRepoRelative(scenarioPath),
+      ticks: result.browser.finalTick,
+      setupStateHash,
+    },
+    perf: { totalMs: 0, avgTickMs: 0, p95TickMs: 0, maxTickMs: 0 },
+    browser: result.browser,
+  };
+
+  const json = JSON.stringify(verdict, null, 2);
+  console.log(json);
+  if (out) {
+    writeFileSync(out, json, "utf8");
+  }
+  process.exit(verdict.passed ? 0 : 1);
+}
+
 async function main(): Promise<void> {
-  const { scenario: spec, replay: replaySpec, verifyReplay: shouldVerifyReplay, out } = parseArgs(
-    process.argv.slice(2)
-  );
+  const {
+    scenario: spec,
+    replay: replaySpec,
+    verifyReplay: shouldVerifyReplay,
+    out,
+    browser,
+    screenshotDir,
+  } = parseArgs(process.argv.slice(2));
 
   if (replaySpec) {
     await runReplayMode(replaySpec, out);
@@ -177,6 +250,11 @@ async function main(): Promise<void> {
     console.error(`Failed to load scenario "${spec}" (resolved: ${scenarioPath}):`);
     console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
     process.exit(2);
+    return;
+  }
+
+  if (browser) {
+    await runBrowserMode(scenario, scenarioPath, screenshotDir, out);
     return;
   }
 

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { Sim } from "@claude-engine/core";
-import { createThreeHost, type SceneContext } from "@claude-engine/renderer-three";
+import { createThreeHost, installTestHook, type SceneContext } from "@claude-engine/renderer-three";
 import { setup, PLAYER_ENTITY, movementKeymap, type PlayerHp, type PlayerPos } from "./game.js";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
@@ -9,26 +9,29 @@ if (!canvas) throw new Error("apps/demo: missing #app canvas in index.html");
 const sim = new Sim("claude-engine-demo-1");
 setup(sim);
 
-let groundAdded = false;
+const hook = installTestHook({
+  world: sim,
+  submit: (command) => sim.submit(command),
+  app: "@claude-engine/demo",
+});
 
 const host = createThreeHost(sim, {
   canvas,
   stepSim: () => sim.step(),
-  submit: (command) => sim.submit(command),
+  submit: (command) => hook.submit(command),
   keymap: movementKeymap("player"),
   syncScene(ctx: SceneContext, world, alpha) {
     ctx.camera.position.set(0, 12, 14);
     ctx.camera.lookAt(0, 0, 0);
 
-    if (!groundAdded) {
+    ctx.scenery("ground", () => {
       const ground = new THREE.Mesh(
         new THREE.PlaneGeometry(40, 40),
         new THREE.MeshStandardMaterial({ color: 0x2f6f4f })
       );
       ground.rotation.x = -Math.PI / 2;
-      ctx.scene.add(ground);
-      groundAdded = true;
-    }
+      return ground;
+    });
 
     const pos = world.getComponent<PlayerPos>(PLAYER_ENTITY, "pos");
     const prevPos = world.getComponent<PlayerPos>(PLAYER_ENTITY, "prevPos");

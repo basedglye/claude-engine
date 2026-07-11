@@ -13,6 +13,10 @@ export interface SceneContext {
   /** Get-or-create the scene object for an entity. The host disposes/removes
    *  objects whose entity no longer exists in the world. */
   objectFor(entity: EntityId, create: () => THREE.Object3D): THREE.Object3D;
+  /** Get-or-create host-owned non-entity scenery (ground, sky, etc), keyed by
+   *  a game-chosen string. Disposed on stop(), unlike objects added directly
+   *  to `scene`. */
+  scenery(key: string, create: () => THREE.Object3D): THREE.Object3D;
 }
 
 export interface ThreeHostOptions {
@@ -55,12 +59,23 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
   scene.add(ambient, sun);
 
   const objects = new Map<EntityId, THREE.Object3D>();
+  const scenery = new Map<string, THREE.Object3D>();
 
   function objectFor(entity: EntityId, create: () => THREE.Object3D): THREE.Object3D {
     let obj = objects.get(entity);
     if (!obj) {
       obj = create();
       objects.set(entity, obj);
+      scene.add(obj);
+    }
+    return obj;
+  }
+
+  function sceneryFor(key: string, create: () => THREE.Object3D): THREE.Object3D {
+    let obj = scenery.get(key);
+    if (!obj) {
+      obj = create();
+      scenery.set(key, obj);
       scene.add(obj);
     }
     return obj;
@@ -87,7 +102,7 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     }
   }
 
-  const ctx: SceneContext = { scene, camera, objectFor };
+  const ctx: SceneContext = { scene, camera, objectFor, scenery: sceneryFor };
 
   function resize(): void {
     const width = canvas.clientWidth || window.innerWidth;
@@ -139,6 +154,8 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
       window.removeEventListener("keyup", onKeyUp);
       for (const obj of objects.values()) disposeObject(obj);
       objects.clear();
+      for (const obj of scenery.values()) disposeObject(obj);
+      scenery.clear();
       renderer.dispose();
     },
   };

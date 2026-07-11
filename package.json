@@ -12,6 +12,7 @@
     "build": "npm run build --workspaces --if-present",
     "test": "node scripts/smoke.mjs",
     "harness": "npm run start --workspace @claude-engine/harness --",
+    "assets:import": "npm run start --workspace @claude-engine/asset-pipeline --",
     "lint": "eslint .",
     "check:purity": "node scripts/check-purity.mjs"
   },
@@ -19,6 +20,7 @@
     "typescript": "^5.6.0",
     "eslint": "^9.13.0",
     "typescript-eslint": "^8.11.0",
-    "@types/node": "^22.9.0"
+    "@types/node": "^22.9.0",
+    "playwright": "^1.61.0"
   }
 }

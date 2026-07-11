@@ -85,7 +85,25 @@ if (!existsSync(skillPath)) {
   }
 }
 
-// 4. Every template contains the required files.
+// 4. The new-game slash command exists with valid frontmatter.
+const newGameCommandPath = resolve(repoRoot, "plugin", "commands", "new-game.md");
+if (!existsSync(newGameCommandPath)) {
+  fail(`Missing ${rel(newGameCommandPath)}`);
+} else {
+  const content = readFileSync(newGameCommandPath, "utf8");
+  const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!frontmatterMatch) {
+    fail("plugin/commands/new-game.md has no frontmatter block");
+  } else {
+    for (const field of ["name", "description"]) {
+      if (!new RegExp(`^${field}:`, "m").test(frontmatterMatch[1])) {
+        fail(`plugin/commands/new-game.md frontmatter missing required field "${field}"`);
+      }
+    }
+  }
+}
+
+// 5. Every template contains the required files.
 const templatesDir = resolve(repoRoot, "templates");
 const REQUIRED_TEMPLATE_FILES = ["package.json", "src/game.ts", "src/main.ts"];
 if (!existsSync(templatesDir)) {

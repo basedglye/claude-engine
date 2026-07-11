@@ -4,15 +4,25 @@
  * .wav: fully hand-parsed. WAV is a simple, well-documented RIFF format —
  * duration = dataChunkSize / byteRate, both read straight from the header.
  *
- * .ogg: documented v0 limitation. Full duration extraction from an
- * Ogg/Vorbis stream by hand is genuinely hard (proper parsing needs a
- * Vorbis-aware bitstream reader). This module makes a best-effort attempt
- * (read the sample rate out of the Vorbis identification header in the
- * first page, and the last Ogg page's granule position, then
- * duration = granule / sampleRate) and, if that best-effort parse doesn't
- * land cleanly, falls back to a *passing* "inconclusive" gate with a detail
- * note — per PHASE-2.md's explicit fallback allowance. No audio-decoding
- * dependency is used anywhere here.
+ * .ogg: documented v0 limitation, an implementation decision (not spec
+ * text — PHASE-2.md only says "duration <= budget"; it names no fallback).
+ * Full duration extraction from an Ogg/Vorbis stream by hand is genuinely
+ * hard (proper parsing needs a Vorbis-aware bitstream reader). This module
+ * makes a best-effort attempt (read the sample rate out of the Vorbis
+ * identification header in the first page, and the last Ogg page's granule
+ * position, then duration = granule / sampleRate) and, if that best-effort
+ * parse doesn't land cleanly, falls back to a *passing* "inconclusive" gate
+ * with a detail note. The byte-size budget still applies unconditionally
+ * regardless of this fallback, so it's not an unbounded pass. No
+ * audio-decoding dependency is used anywhere here.
+ *
+ * Known gap: Ogg files carrying Opus audio (common in practice) have no
+ * Vorbis identification header at all, so they always take the inconclusive
+ * path today — duration is effectively unchecked for Opus-in-Ogg, capped
+ * only by maxBytes. Acceptable for v0 (no game ships audio assets yet);
+ * revisit (Opus header parsing, or making inconclusive a failing gate) when
+ * audio assets become load-bearing. Recorded in docs/PHASE-2.md's Phase 2
+ * addendum (see docs/reviews/phase-2.md fix-list item 3).
  */
 import { statSync, readFileSync } from "node:fs";
 import { extname } from "node:path";

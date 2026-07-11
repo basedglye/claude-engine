@@ -663,7 +663,12 @@ sitting.* Concretely:
     as written); all `Scenario`/`Verdict`/`replay`-bundle changes additive —
     `scripts/smoke.mjs` and all Phase 1 scenarios pass unmodified;
     `renderer-three` changes limited to the two additive items
-    (`installTestHook`, `SceneContext.scenery`); `runScenario` and
+    (`installTestHook`, `SceneContext.scenery`) **plus one addendum item,
+    recorded post-implementation and pre-approved by the review gate
+    (docs/reviews/phase-2.md fix-list item 1): `createOrthographicCamera`,
+    optional `ThreeHostOptions.camera`, and `SceneContext.camera` widened to
+    `THREE.Camera` — see "Invariant / contract impact" below for the full
+    reasoning and backward-compatibility confirmation**; `runScenario` and
     `verifyReplay` signatures unchanged.
 
 ## Non-goals for this phase (explicitly deferred)
@@ -735,10 +740,44 @@ sitting.* Concretely:
   exit codes, stdout purity, and `runScenario`/`verifyReplay` signatures
   unchanged. `playwright` enters as optional (dynamic import; absent ⇒
   headless unaffected, `--browser` exits 2 with guidance).
-- **`@claude-engine/renderer-three`**: two additive public items
-  (`installTestHook` + `WorldforgeHook`; `SceneContext.scenery`). Existing
-  exports byte-compatible. Host-obligations checklist from PHASE-1.md
-  remains in force and extends to the hook.
+- **`@claude-engine/renderer-three`**: **addendum, post-implementation
+  (docs/reviews/phase-2.md fix-list item 1 — pre-approved by that review
+  turn, no separate planning turn required).** The two items originally
+  planned here (`installTestHook` + `WorldforgeHook`; `SceneContext.scenery`)
+  shipped as specified. A third, unplanned-for addition also shipped:
+  `createOrthographicCamera(viewHeight, near?, far?)` (new export), an
+  optional `ThreeHostOptions.camera` (pre-constructed camera override), and
+  `SceneContext.camera` widened from `THREE.PerspectiveCamera` to the
+  `THREE.Camera` base type. Reason: Scope A's own text commits to "an
+  orthographic camera on renderer-three — no new renderer package this
+  phase" for the `topdown-2d` template, which this spec's original
+  contract-impact accounting failed to anticipate needs a host surface
+  change — `createThreeHost` constructs and owns the camera, so a game's
+  `syncScene` has no way to substitute a different projection without one.
+  Confirmed backward-compatible: omitting `camera` still constructs the
+  original `new THREE.PerspectiveCamera(60, 1, 0.1, 1000)`, and every
+  existing `ctx.camera` call site (across `apps/demo` and both templates)
+  uses only `position.set`/`lookAt` — `Object3D` members present on the
+  widened type — so no consumer breaks. `resize()` was extended to handle
+  both camera kinds (aspect-only for perspective; left/right recomputed
+  from a caller-set view height for orthographic). Host-obligations
+  checklist from PHASE-1.md remains in force and extends to all three
+  additions; existing exports otherwise byte-compatible.
+- **`@claude-engine/asset-pipeline` audio gate — addendum, post-
+  implementation (docs/reviews/phase-2.md fix-list item 3).** This spec's
+  Scope C text says only "duration <= budget" for the `audio` gate; it names
+  no fallback behavior. The shipped `.ogg` duration check is a best-effort
+  hand-parse of the Vorbis identification header + final granule position;
+  when that parse doesn't land (notably: **any Ogg file carrying Opus audio,
+  which has no Vorbis header, always hits this path**), it falls back to a
+  passing "inconclusive" gate result rather than failing closed. This is an
+  implementation decision, not spec-mandated — recorded here as the actual
+  decision. The byte-size budget (`maxBytes`) still applies unconditionally
+  regardless of the duration outcome, so this is not an unbounded pass.
+  Acceptable for v0 (no shipped game uses audio assets yet); revisit
+  (Opus header parsing, or making "inconclusive" a failing gate) when audio
+  assets become load-bearing. `.wav` duration remains fully and correctly
+  hand-parsed from the RIFF header in all cases.
 - **New public surface on merge** (treated as contract by the gate, like
   `createThreeHost` was): `@claude-engine/assets` (pure root + `/web`),
   `@claude-engine/asset-pipeline` (API + CLI), the scaffold CLI, and the

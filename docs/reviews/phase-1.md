@@ -7,7 +7,43 @@ Spec: [docs/PHASE-1.md](../PHASE-1.md). All verification below was re-run by
 the reviewer on Windows 10 / Node 24.12.0; no implementer claims were taken
 on trust.
 
-## 1. Verdict: FIX-LIST (2 items)
+## Resubmission verdict: PASS
+
+Resubmitted at `19e4569` ("Fix Phase 1 review fix-list: harness path
+resolution, CLAUDE.md diff"). The reviewer re-ran the full resubmission
+checklist below on 2026-07-11; both fix-list items are resolved and nothing
+regressed. **Phase 1 passes the gate — clear to merge.** (The FIX-LIST
+sections below are preserved as history of the first review round; their
+verification table remains valid evidence.)
+
+Resubmission checks executed by the reviewer (repo root, Windows 10):
+
+| Check | Result |
+|---|---|
+| `npm run build` | exit 0 (all workspaces incl. demo tsc + vite) |
+| `npm run lint` | exit 0 |
+| `npm run check:purity` | exit 0 — no violations in packages/core/src |
+| `npm test` | exit 0 — smoke verdict passed, replay equivalence PASS |
+| `npm run harness --silent -- scenarios/smoke.scenario.mjs` (exact item-1 repro, previously exit 2) | **exit 0**; single JSON verdict, `finalStateHash` 919868270 — fix-list item 1 resolved |
+| `git diff main..phase-1 -- CLAUDE.md` | exactly the spec-flagged `--silent` correction; "(Phase 2+)" annotation reverted — fix-list item 2 resolved |
+| `npm run harness --silent -- smoke` | exit 0, verdict JSON with perf fields |
+| `npm run harness --silent -- smoke --verify-replay` | exit 0; `replayCheck.verified: true`, hashes 919868270/919868270 |
+| `npm run harness --silent -- failing-example` | exit 1; names failed assertion "player reached x:999", `eventsTail` (20 events), replay bundle (seed + commands) |
+| `npm run build:game -w @claude-engine/demo` then `npm run harness --silent -- demo-walk` | both exit 0 |
+| `node packages/harness/dist/cli.js scenarios/smoke.scenario.mjs` (direct relative, INIT_CWD unset) | exit 0 — cwd fallback intact |
+| `node packages/harness/dist/cli.js <absolute path>` | exit 0 |
+| `npm run harness --silent -- nonexistent-scenario` | exit 2, diagnostics on stderr (error path intact) |
+
+The item-1 fix (`resolveScenarioPath()` in
+`packages/harness/src/cli.ts`) resolves relative specs against
+`process.env.INIT_CWD ?? process.cwd()`, exactly as this review suggested;
+bare-name, absolute, direct-invocation, and missing-scenario paths all
+verified unaffected. Exit criteria 3 and 8 move from PARTIALLY MET to MET;
+all 8 criteria are now met. The non-blocking observations in section 6
+(including ticking the ROADMAP.md checkboxes at merge time) remain
+outstanding but do not gate.
+
+## 1. Original verdict (first round): FIX-LIST (2 items) — superseded by PASS above
 
 Close to PASS — 7 of 8 exit criteria fully met, all invariants intact, all
 harness scenarios green, and the reviewer obtained a real-browser pixel check
@@ -206,3 +242,6 @@ Address items 1 and 2, re-run:
 `npm run harness --silent -- scenarios/smoke.scenario.mjs` (must exit 0),
 `git diff main..phase-1 -- CLAUDE.md` (must show only spec-flagged changes),
 then return to this gate.
+
+*Completed at `19e4569` — see "Resubmission verdict: PASS" at the top of
+this document.*

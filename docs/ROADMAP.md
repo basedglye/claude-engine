@@ -29,20 +29,25 @@ carried from Phase 0.
   [PHASE-1.md](PHASE-1.md). **Status: PASS — see
   [docs/reviews/phase-1.md](reviews/phase-1.md).**
 
-## Phase 2 — Skill v0.1 + procedural assets
-- `worldforge` skill: scaffold command, invariants, harness workflow,
+## Phase 2 — Skill v0.1 + procedural assets (spec: [PHASE-2.md](PHASE-2.md))
+- [x] `worldforge` skill: scaffold command, invariants, harness workflow,
   references/ API docs; starter templates (3D world, top-down 2D)
-- Procedural asset layer v0: terrain, primitive creature/prop meshes, icon
-  generator, WebAudio music synth
-- Asset tooling (see docs/DESIGN.md "Procedural asset layer"): Codex for
-  image/texture/icon generation, feeding the import-pipeline validation
-  gates. Blender (headless/scripted, `bpy` + CLI — no manual editing) as a
-  *stretch* procedural mesh backend if hand-rolled Three.js geometry proves
-  insufficient; not required for Phase 2 exit criteria. Grok/other
-  non-Anthropic LLMs explicitly deferred — no identified capability gap.
-- Browser-mode harness (Playwright screenshots), game-feel probes v0
+- [x] Procedural asset layer v0: terrain, primitive creature/prop meshes, icon
+  generator, WebAudio music synth (`@claude-engine/assets`)
+- [x] Asset tooling (see docs/DESIGN.md "Procedural asset layer"):
+  `@claude-engine/asset-pipeline` import gate; Codex for image/texture/icon
+  generation feeding it. Blender remains an unbuilt *stretch* mesh backend
+  (not required for Phase 2 exit criteria — hand-rolled generators sufficed).
+  Grok/other non-Anthropic LLMs stay deferred — no identified capability gap.
+- [x] Browser-mode harness (Playwright, real Chromium screenshots + console/
+  page-error capture), game-feel probes v0 (fps, input-latency)
+- [x] Checkpoint state snapshots in verdicts + replay-from-verdict-JSON
+  (both carried over from Phase 1 — see [PHASE-1.md](PHASE-1.md) and
+  [docs/reviews/phase-1.md](reviews/phase-1.md))
 - Exit criteria: a fresh Claude Code session with the plugin installed can
-  produce a playable, verified 3D scene in one sitting.
+  produce a playable, verified 3D scene in one sitting. Full 12-item
+  testable list in [PHASE-2.md](PHASE-2.md). **Status: PASS — see
+  [docs/reviews/phase-2.md](reviews/phase-2.md).**
 
 ## Phase 3 — Multiplayer + persistence (the Claudecraft critique, answered)
 - Authoritative server host: prediction/reconciliation, interest management,

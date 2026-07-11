@@ -13,6 +13,8 @@
     "test": "node scripts/smoke.mjs",
     "harness": "npm run start --workspace @claude-engine/harness --",
     "assets:import": "npm run start --workspace @claude-engine/asset-pipeline --",
+    "scaffold": "node scripts/scaffold.mjs",
+    "check:plugin": "node scripts/check-plugin.mjs",
     "lint": "eslint .",
     "check:purity": "node scripts/check-purity.mjs"
   },

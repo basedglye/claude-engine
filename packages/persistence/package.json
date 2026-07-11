@@ -1,0 +1,22 @@
+{
+  "name": "@claude-engine/persistence",
+  "version": "0.0.1",
+  "description": "Event-sourced saves: write-ahead command log + periodic snapshots, SQLite (dev) / Postgres (prod) behind one GameStore interface — no hand-rolled SQL in game code",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "better-sqlite3": "^12.4.1",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/pg": "^8.11.10"
+  }
+}

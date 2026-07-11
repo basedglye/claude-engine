@@ -7,7 +7,49 @@ Spec: [docs/PHASE-2.md](../PHASE-2.md). All verification below was re-run by
 the reviewer on Windows 10 / Node 24.12.0; no implementer claims were taken
 on trust.
 
-## 1. Verdict: FIX-LIST (3 items)
+## Resubmission verdict: PASS
+
+Resubmitted at `23a9038` ("Fix Phase 2 review fix-list: renderer-three
+addendum, new-game.md, audio.ts citation"). The reviewer re-ran the full
+resubmission checklist below on 2026-07-11; all three fix-list items are
+resolved and nothing regressed. **Phase 2 passes the gate — clear to merge.**
+(The original FIX-LIST verdict below is preserved as history of the first
+review round; its verification table remains valid evidence — the harness/
+browser/scaffold/import-pipeline checks it ran were not re-executed on
+resubmission, per this gate's own note that only docs plus one new command
+file changed.)
+
+Resubmission checks executed by the reviewer (repo root, Windows 10):
+
+| Check | Result |
+|---|---|
+| `git diff 9dcebeb..23a9038 -- docs/PHASE-2.md` | addendum reads exactly as fix-list item 1 specified: renderer-three's third additive item recorded with the Scope A rationale and backward-compatibility confirmation, cross-referenced from exit criterion 12; a second addendum paragraph records the audio-gate decision (item 3) including the Ogg-Opus-always-inconclusive gap this review flagged |
+| `git diff 9dcebeb..23a9038 -- packages/asset-pipeline/src/gates/audio.ts` | file-header comment no longer cites a nonexistent spec allowance; now says "implementation decision" and points at the PHASE-2.md addendum; the Opus gap is stated explicitly in-file too |
+| `cat plugin/commands/new-game.md` | exists, valid frontmatter (`name`, `description`), content matches the spec's original description (scaffold → verify headless + `--browser` → point at references) |
+| `git diff 9dcebeb..23a9038 -- scripts/check-plugin.mjs` | adds a check requiring `plugin/commands/new-game.md` to exist with `name`/`description` frontmatter, inserted as step 4 (renumbering the old step 4 to 5) |
+| Reviewer's own tamper test: renamed `new-game.md` away, ran `npm run check:plugin` | **exit 1**, `✗ Missing plugin\commands\new-game.md` — restored, re-ran, **exit 0** — item 2's wiring is genuinely enforced, not just claimed |
+| `npm run build` | exit 0 (all workspaces incl. demo tsc + vite) |
+| `npm run lint` | exit 0 |
+| `npm run check:purity` | exit 0 |
+| `npm run check:plugin` | exit 0 |
+| `npm test` | exit 0 — smoke verdict passed, replay equivalence PASS, hash 919868270 unchanged |
+| `git diff main..phase-2 -- CLAUDE.md packages/core/src/types.ts` | empty (0 lines) |
+| `git status --short` | clean |
+
+All three fix-list items are resolved honestly — the renderer-three surface
+change and the audio-gate fallback are now spec-of-record rather than
+commit-message-only rationale, and the false spec citation in `audio.ts` is
+corrected rather than papered over. Exit criteria 12 and Scope A/C are now
+fully met; all 12 exit criteria are met (11 remains "met by proxy" per the
+original review's stated reviewer-judgment handling — unchanged by this
+resubmission, since it concerns a live fresh-session run this gate cannot
+perform, not anything fixed here). The non-blocking observations in section 6
+of the original review (Ogg-Opus gap now documented rather than hidden,
+`replayVerdict` field-naming nit, 3d-world ground-following polish, DEP0190
+warning, audit vulnerabilities, ROADMAP checkboxes) remain outstanding but do
+not gate.
+
+## 1. Original verdict (first round): FIX-LIST (3 items) — superseded by PASS above
 
 Very close to PASS — every mechanical exit criterion the reviewer could run
 (1–10, 12's zero-diff halves) is green, all five invariants are intact, both
@@ -275,3 +317,6 @@ PHASE-2.md addendum commit; item 2 is one small file plus an optional
 confirm `git diff main..phase-2 -- CLAUDE.md packages/core/src/types.ts`
 is still empty, then return to this gate. No harness or browser re-runs are
 required unless code beyond comments/docs changes.
+
+*Completed at `23a9038` — see "Resubmission verdict: PASS" at the top of
+this document.*

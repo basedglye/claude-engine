@@ -93,6 +93,18 @@ This directly targets every category of Claudecraft criticism.
   meshes, icon synthesis, TS-authored audio/music (WebAudio).
 - Import pipeline with validation gates for external assets (format, tri
   budget, materials) — closes the "generated assets aren't game-ready" gap.
+- **Tooling for asset authoring** (decided pre-Phase-2, see ROADMAP.md):
+  - **Codex** (already global policy for image generation) generates 2D
+    image assets — icons, textures — which flow through the same import
+    pipeline as any other external asset.
+  - **Blender, headless/scripted only** (`bpy` + CLI, no manual editing) is
+    a Phase 2 *stretch* mesh-generation backend: still procedural (driven by
+    code, not a human in the Blender UI) and still gated by the import
+    pipeline on export. Not core Phase 2 scope — add only if hand-rolled
+    Three.js geometry generation proves insufficient.
+  - Grok and other non-Anthropic LLMs: explicitly out of scope for now: no
+    identified capability gap Claude/Codex don't already cover in this
+    project's workflow. Revisit only if a concrete need emerges.
 
 ## The plugin (`plugin/`)
 

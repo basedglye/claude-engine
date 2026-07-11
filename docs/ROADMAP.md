@@ -34,6 +34,12 @@ carried from Phase 0.
   references/ API docs; starter templates (3D world, top-down 2D)
 - Procedural asset layer v0: terrain, primitive creature/prop meshes, icon
   generator, WebAudio music synth
+- Asset tooling (see docs/DESIGN.md "Procedural asset layer"): Codex for
+  image/texture/icon generation, feeding the import-pipeline validation
+  gates. Blender (headless/scripted, `bpy` + CLI — no manual editing) as a
+  *stretch* procedural mesh backend if hand-rolled Three.js geometry proves
+  insufficient; not required for Phase 2 exit criteria. Grok/other
+  non-Anthropic LLMs explicitly deferred — no identified capability gap.
 - Browser-mode harness (Playwright screenshots), game-feel probes v0
 - Exit criteria: a fresh Claude Code session with the plugin installed can
   produce a playable, verified 3D scene in one sitting.

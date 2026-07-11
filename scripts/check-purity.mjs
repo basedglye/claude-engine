@@ -226,8 +226,26 @@ function runSelfTest() {
       }
     }
 
+    // Test: a purity root with no /web exclusion (bots) still gets a planted-
+    // violation check — docs/PHASE-3.md exit criterion 1 names it explicitly.
+    function testPlainRoot(rootNamePrefix) {
+      const root = PURITY_ROOTS.find((r) => r.name.startsWith(rootNamePrefix));
+      if (!root || !fs.existsSync(root.dir)) return { hasPathViolation: false, ran: false };
+      const selfTestDir = path.join(root.dir, '.tmp-purity-selftest');
+      fs.mkdirSync(selfTestDir, { recursive: true });
+      const badFile = path.join(selfTestDir, 'bad.ts');
+      fs.writeFileSync(badFile, "const x = Math.random();\n");
+      try {
+        const scan = scanDirectory(root.dir, { excludeDirNames: root.excludeDirNames });
+        return { hasPathViolation: scan.some((v) => v.file === badFile), ran: true };
+      } finally {
+        fs.rmSync(selfTestDir, { recursive: true, force: true });
+      }
+    }
+
     const assetsCheck = testWebExclusion('packages/assets');
     const netCheck = testWebExclusion('packages/net');
+    const botsCheck = testPlainRoot('packages/bots');
 
     const allPass =
       hasThreeViolation &&
@@ -237,7 +255,8 @@ function runSelfTest() {
       assetsCheck.hasPathViolation &&
       assetsCheck.webCorrectlyExcluded &&
       netCheck.hasPathViolation &&
-      netCheck.webCorrectlyExcluded;
+      netCheck.webCorrectlyExcluded &&
+      botsCheck.hasPathViolation;
 
     if (allPass) {
       console.log('PASS: Self-test detected all violation classes');
@@ -249,6 +268,7 @@ function runSelfTest() {
       console.log(`  - three import planted in packages/assets/src/web: correctly EXCLUDED`);
       console.log(`  - Math.random planted in packages/net/src: CAUGHT`);
       console.log(`  - three import planted in packages/net/src/web: correctly EXCLUDED`);
+      console.log(`  - Math.random planted in packages/bots/src: CAUGHT`);
       return 0;
     } else {
       console.error('FAIL: Self-test did not detect all violations');
@@ -260,6 +280,7 @@ function runSelfTest() {
       if (!assetsCheck.webCorrectlyExcluded) console.error('  - packages/assets/src/web exclusion: NOT WORKING (false positive)');
       if (!netCheck.hasPathViolation) console.error('  - Math.random planted in packages/net/src: NOT CAUGHT');
       if (!netCheck.webCorrectlyExcluded) console.error('  - packages/net/src/web exclusion: NOT WORKING (false positive)');
+      if (!botsCheck.hasPathViolation) console.error('  - Math.random planted in packages/bots/src: NOT CAUGHT');
       return 1;
     }
   } finally {

@@ -151,6 +151,15 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   const sessionsByPlayerId = new Map<string, SessionState>();
   const fullCommandLog: Command[] = [];
 
+  // Validated intents and reserved join/leave commands are buffered here,
+  // never sim.submit()-ed directly from a socket/close handler. doTick()
+  // drains this synchronously before persisting+stepping, so the copy taken
+  // for the write-ahead append is provably identical to what step() is
+  // about to consume — a message arriving mid-await (while a persistence
+  // store's appendCommands() call is in flight) can no longer land in the
+  // executing tick without being recorded.
+  let intake: Command[] = [];
+
   let commandsAccepted = 0;
   let commandsRejected = 0;
   const rejectionsByReason: Record<RejectReason, number> = {
@@ -172,14 +181,19 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   function closeSession(session: SessionState, code: CloseCode, message: string): void {
     if (!session.open) return;
     session.open = false;
-    send(session.ws, { t: "close", code, message });
-    session.ws.close();
     sessions.delete(session.ws);
     if (sessionsByPlayerId.get(session.playerId) === session) sessionsByPlayerId.delete(session.playerId);
+    // Every session end — supersede, protocol-error, or shutdown — submits
+    // a leave, so the command log's join/leave pairs always match 1:1 with
+    // real connections. The later "close" event this triggers finds the
+    // session already gone from `sessions` and no-ops (see ws.on("close")).
+    queueReserved("@net/leave", session.actor, { playerId: session.playerId });
+    send(session.ws, { t: "close", code, message });
+    session.ws.close();
   }
 
-  function submitReserved(type: "@net/join" | "@net/leave", actor: string, payload: unknown): void {
-    sim.submit({ tick: sim.tick + 1, actor, type, payload });
+  function queueReserved(type: "@net/join" | "@net/leave", actor: string, payload: unknown): void {
+    intake.push({ tick: sim.tick + 1, actor, type, payload });
   }
 
   const wss = new WebSocketServer({ port });
@@ -230,7 +244,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
           };
           sessions.set(ws, session);
           sessionsByPlayerId.set(result.playerId, session);
-          submitReserved("@net/join", actor, { playerId: result.playerId });
+          queueReserved("@net/join", actor, { playerId: result.playerId });
 
           const byEntity = snapshotByEntity(sim);
           const visibleIds = [...interest.entitiesFor(sim, actor)];
@@ -291,18 +305,18 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
 
           session.tickCounts.set(intent.type, (session.tickCounts.get(intent.type) ?? 0) + 1);
           commandsAccepted++;
-          sim.submit({ tick: sim.tick + 1, actor: session.actor, type: intent.type, payload: intent.payload });
+          intake.push({ tick: sim.tick + 1, actor: session.actor, type: intent.type, payload: intent.payload });
         }
       }
     });
 
     ws.on("close", () => {
       const s = sessions.get(ws);
-      if (!s) return;
+      if (!s) return; // already closed via closeSession() (supersede/protocol-error/shutdown), leave already queued
       s.open = false;
       sessions.delete(ws);
       if (sessionsByPlayerId.get(s.playerId) === s) sessionsByPlayerId.delete(s.playerId);
-      submitReserved("@net/leave", s.actor, { playerId: s.playerId });
+      queueReserved("@net/leave", s.actor, { playerId: s.playerId });
     });
   });
 
@@ -344,6 +358,13 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   async function doTick(): Promise<void> {
     const tickStart = Date.now();
     for (const session of sessions.values()) session.tickCounts.clear();
+
+    // Drain intake synchronously (no await between here and the copy below)
+    // — this, not sim.commands() alone, is what guarantees the write-ahead
+    // copy is exactly what step() is about to consume, regardless of how
+    // long the persistence store's own append takes.
+    for (const command of intake) sim.submit(command);
+    intake = [];
 
     // Write-ahead: persist (and record in the in-memory log) this tick's
     // accepted commands BEFORE stepping — a crash can lose an unexecuted

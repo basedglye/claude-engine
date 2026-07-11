@@ -22,15 +22,48 @@ function check(description, pass) {
   }
 }
 
-function setupGame(sim) {
-  const player = sim.spawn();
-  sim.setComponent(player, "hp", { value: 100000 });
-  const loot = sim.forkRng("loot");
+/**
+ * A join-based multiplayer setup, matching scenarios/lib/net-game.mjs's
+ * component-derived actor->entity lookup (docs/reviews/phase-3.md item 1):
+ * no setup-closure Map, so a fresh setup() call before Sim.restore() has
+ * nothing that needs rebuilding — the lookup just re-derives from whatever
+ * components restore() puts back. This is what the crash-recovery golden
+ * below exercises end to end.
+ */
+function setupMultiplayerGame(sim) {
   sim.addSystem((s) => {
-    const hp = s.getComponent(player, "hp");
-    hp.value -= loot.int(1, 3);
-    hp.value -= s.rng.int(0, 1);
+    for (const c of s.commands()) {
+      if (c.type === "@net/join") {
+        let existing;
+        for (const [id, owner] of s.withComponent("owner")) {
+          if (owner === c.actor) existing = id;
+        }
+        if (existing !== undefined) continue;
+        const entity = s.spawn();
+        s.setComponent(entity, "pos", { x: 0, z: 0 });
+        s.setComponent(entity, "owner", c.actor);
+      } else if (c.type === "move") {
+        let entity;
+        for (const [id, owner] of s.withComponent("owner")) {
+          if (owner === c.actor) entity = id;
+        }
+        if (entity === undefined) continue;
+        const pos = s.getComponent(entity, "pos");
+        pos.x += c.payload.dx;
+        pos.z += c.payload.dz;
+      }
+    }
   });
+}
+
+function byTickMap(commands) {
+  const m = new Map();
+  for (const c of commands) {
+    const list = m.get(c.tick) ?? [];
+    list.push(c);
+    m.set(c.tick, list);
+  }
+  return m;
 }
 
 /** One shared conformance + crash-recovery suite, run against any GameStore. */
@@ -46,31 +79,69 @@ async function runConformanceSuite(store, label) {
 
   check(`[${label}] getGame(missing) returns null`, (await store.getGame(`missing-${randomUUID()}`)) === null);
 
-  // --- crash-recovery golden: N ticks + mid-run snapshot, "crash" (discard
-  // the sim), recoverSim, continue to 2N -> hash equals an uninterrupted
-  // 2N-tick run's.
-  const N = 30;
+  // --- crash-recovery golden: a join, commands before AND after a snapshot
+  // taken strictly before the crash tick, "crash" (discard the sim),
+  // recoverSim, continue with fresh post-restart commands -> hash equals an
+  // uninterrupted run's. This is the composition the engine promises
+  // (snapshot -> restore -> replay-tail -> continue) and the one a naive
+  // golden (snapshot with no pending tail) would never catch failing.
+  const N_SNAPSHOT = 10;
+  const N_CRASH = 20;
+  const N_FINAL = 40;
+  const actor = `player:golden-${gameId}`;
+
+  const commandsBeforeCrash = [
+    { tick: 1, actor, type: "@net/join", payload: {} },
+    { tick: 5, actor, type: "move", payload: { dx: 1, dz: 0 } }, // before the snapshot
+    { tick: 15, actor, type: "move", payload: { dx: 0, dz: 1 } }, // after the snapshot, before the crash
+    // recoverSim replays to the last *command's* tick, not the true crash
+    // tick (trailing command-free ticks are lost, by design — a crash can
+    // lose an unexecuted tail); a command exactly at the crash tick keeps
+    // this golden's recovered.tick assertion exact rather than testing that
+    // separately-documented, non-blocking limitation.
+    { tick: N_CRASH, actor, type: "move", payload: { dx: 0, dz: -2 } },
+  ];
+  const commandsAfterRestart = [
+    { tick: 25, actor, type: "move", payload: { dx: 1, dz: 1 } }, // fresh, submitted post-recovery
+    { tick: 35, actor, type: "move", payload: { dx: -1, dz: 0 } },
+  ];
 
   const continuous = new Sim(seed);
-  setupGame(continuous);
-  for (let t = 0; t < 2 * N; t++) continuous.step();
+  setupMultiplayerGame(continuous);
+  const contByTick = byTickMap([...commandsBeforeCrash, ...commandsAfterRestart]);
+  for (let t = 1; t <= N_FINAL; t++) {
+    for (const c of contByTick.get(t) ?? []) continuous.submit(c);
+    continuous.step();
+  }
   const continuousHash = continuous.stateHash();
 
   const live = new Sim(seed);
-  setupGame(live);
-  const commandsSoFar = [];
-  for (let t = 0; t < N; t++) {
+  setupMultiplayerGame(live);
+  const liveByTick = byTickMap(commandsBeforeCrash);
+  for (let t = 1; t <= N_CRASH; t++) {
+    const tickCommands = liveByTick.get(t) ?? [];
+    for (const c of tickCommands) live.submit(c);
+    if (tickCommands.length > 0) await store.appendCommands(gameId, tickCommands); // write-ahead, per tick
     live.step();
+    if (t === N_SNAPSHOT) await store.saveSnapshot(gameId, live.snapshot());
   }
-  await store.appendCommands(gameId, commandsSoFar); // no commands in this scenario; exercises the empty-batch path
-  await store.saveSnapshot(gameId, live.snapshot());
   // "crash": the live sim is discarded; only the store survives.
 
-  const { sim: recovered } = await recoverSim(store, gameId, setupGame);
-  check(`[${label}] recoverSim restores to the snapshot tick`, recovered.tick === N);
-  for (let t = N; t < 2 * N; t++) recovered.step();
+  const { sim: recovered } = await recoverSim(store, gameId, setupMultiplayerGame);
   check(
-    `[${label}] crash recovery: recovered 2N-tick hash == uninterrupted run's`,
+    `[${label}] recoverSim restores to the snapshot tick + replays the persisted tail to the crash tick`,
+    recovered.tick === N_CRASH
+  );
+
+  // Continue post-restart exactly like a live server would: fresh commands
+  // submitted directly, not read back from the store.
+  const restartByTick = byTickMap(commandsAfterRestart);
+  for (let t = N_CRASH + 1; t <= N_FINAL; t++) {
+    for (const c of restartByTick.get(t) ?? []) recovered.submit(c);
+    recovered.step();
+  }
+  check(
+    `[${label}] crash recovery (join + pre/post-snapshot commands + post-restart continuation): recovered hash == continuous run's`,
     recovered.stateHash() === continuousHash
   );
 

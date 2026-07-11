@@ -113,6 +113,22 @@ Harness checkpoints support resuming from a snapshot instead of replaying
 from tick 1: `npm run harness --silent -- --replay <verdict.json>
 --from-checkpoint <tick>` (see `harness-api.md`).
 
+**All cross-tick sim state must live in components, never in a setup
+closure.** A `Map` (or any variable) that a system populates from commands
+over time — e.g. an actor→entity lookup built up as players join — is
+exactly the kind of state `restore()` cannot rebuild: `setup()` runs fresh
+before `restore()` replaces component data, so a closure-cached index starts
+empty and never learns what the snapshot already contains. Every actor who
+joined before the last snapshot would then have a real entity in the
+restored components but no map entry, silently dropping every replayed
+command for them. Setup closures may still capture *setup-spawned* entity
+ids (a fixed number known at construction time, like a single-player demo's
+one player entity) — that's just a constant, not accumulated state. For
+anything commands add over time, derive the lookup from a component instead
+(e.g. `withComponent("owner")`, scanning for the value that matches an
+actor) so it's automatically correct after any restore. See `net-api.md`'s
+multiplayer workflow for the worked pattern.
+
 ## `types.ts` — the protocol
 
 ```ts

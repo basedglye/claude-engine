@@ -213,7 +213,10 @@ What's persisted is the command log + snapshots, not emitted `GameEvent`s —
 events are derivable outputs; the sim's source of truth (invariant #3) is
 (seed, command log). `recoverSim` is snapshot → `Sim.restore()` → replay the
 tail since the snapshot (`core-api.md`) — a live sim whose `stateHash()`
-matches an uninterrupted run.
+matches an uninterrupted run, *up to the last tick a command was actually
+logged*: a crash can still lose ticks after that with nothing scheduled on
+them (there's nothing to persist for a tick with no commands), which is why
+the server also snapshots on graceful shutdown (`stop()`).
 
 ## `@claude-engine/bots` — load-test drivers
 
@@ -249,9 +252,19 @@ Two ways to use bots:
    `Command.actor` (not the join payload's bare `playerId` — the two are
    different strings; `actor` is server-assigned as `"player:" + playerId`
    and is what `InterestPolicy`/`owner`-component comparisons must match).
-   `apps/demo/src/game.ts` is a worked example — the exact same `setup()`
-   backs the offline demo, the headless harness scenarios, and the net
-   server.
+   **Derive the actor→entity lookup from a component (e.g. scan
+   `withComponent("owner")` for the matching value) — never cache it in a
+   setup-closure `Map`.** A closure Map is state `Sim.restore()` cannot
+   rebuild: a fresh `setup()` call runs before restore replaces component
+   data, so the Map starts empty and any actor who joined before the last
+   snapshot silently loses every replayed command (see `core-api.md`'s
+   restore section for the full reasoning). Make the join handler idempotent
+   per actor too (skip spawning if the lookup already finds an entity for
+   that actor) — a superseded connection's leave and its replacement's join
+   can arrive close together. `apps/demo/src/game.ts` and
+   `scenarios/lib/net-game.mjs` are worked examples — the exact same
+   `setup()` backs the offline demo, the headless harness scenarios, and the
+   net server.
 2. Declare `CommandRule`s for every command type players can send —
    `validate` the payload shape, set `maxPerTick`/`maxPerSecond` for
    anything that shouldn't be spammable.

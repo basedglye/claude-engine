@@ -1,32 +1,49 @@
 // Shared multiplayer game logic for docs/PHASE-3.md Scope F's net-*/soak-*
-// scenarios: spawns an owned entity on @net/join, tracks it by playerId,
-// applies "move" commands, cleans up on @net/leave. Session lifecycle
-// enters entirely through the reserved commands the server host submits —
-// this system never touches sockets or the auth layer.
+// scenarios: spawns an owned entity on @net/join, applies "move" commands,
+// cleans up on @net/leave. Session lifecycle enters entirely through the
+// reserved commands the server host submits — this system never touches
+// sockets or the auth layer.
+//
+// The actor->entity lookup is derived from the "owner" component on every
+// use (via withComponent), NOT cached in a setup-closure Map. A closure Map
+// is exactly the kind of cross-tick state Sim.restore() cannot rebuild —
+// restore() replaces component stores, but a fresh setup() call runs before
+// restore() and would populate a NEW, empty Map that never learns about
+// entities the snapshot already contains. Any actor who joined before the
+// last snapshot would then have a real entity in the restored components
+// but no map entry, silently dropping every replayed command for them.
+// Deriving the lookup from components instead means restore() rebuilding
+// component state is *automatically* correct — there is no separate index
+// to go stale. See references/core-api.md's restore section and
+// references/net-api.md's multiplayer workflow step 1.
+function findEntityByOwner(s, actor) {
+  for (const [entity, owner] of s.withComponent("owner")) {
+    if (owner === actor) return entity;
+  }
+  return undefined;
+}
+
 export function setup(sim) {
-  // Keyed by the full server-assigned actor string ("player:<id>") — the
-  // same value InterestPolicy.entitiesFor(world, actor) receives, so the
-  // "owner" component stored here must match it exactly, not the bare
-  // playerId from @net/join's payload.
-  const entityByActor = new Map();
   sim.addSystem((s) => {
     for (const c of s.commands()) {
       if (c.type === "@net/join") {
+        // Idempotent per actor: a superseded connection's leave and the new
+        // connection's join can arrive close together; never spawn a second
+        // entity for an actor that already has one.
+        if (findEntityByOwner(s, c.actor) !== undefined) continue;
         const entity = s.spawn();
         s.setComponent(entity, "pos", { x: 0, z: 0 });
         s.setComponent(entity, "owner", c.actor);
-        entityByActor.set(c.actor, entity);
         s.emit("joined", { playerId: c.payload.playerId });
       } else if (c.type === "@net/leave") {
-        const entity = entityByActor.get(c.actor);
+        const entity = findEntityByOwner(s, c.actor);
         if (entity !== undefined) {
           s.removeComponent(entity, "pos");
           s.removeComponent(entity, "owner");
-          entityByActor.delete(c.actor);
         }
         s.emit("left", { playerId: c.payload.playerId });
       } else if (c.type === "move") {
-        const entity = entityByActor.get(c.actor);
+        const entity = findEntityByOwner(s, c.actor);
         if (entity === undefined) continue;
         const pos = s.getComponent(entity, "pos");
         if (!pos) continue;
@@ -40,18 +57,12 @@ export function setup(sim) {
 
 /** Adds static, unowned "landmark" entities scattered across a wide area —
  *  positional-only, so a radiusInterest policy has something real to filter
- *  out for a player spawned at the origin. */
+ *  out for a player spawned at the origin. Setup-time only, drawn from a
+ *  forkRng stream so it's captured/restored the same as any other sim-held
+ *  randomness (docs/PHASE-3.md Scope A). */
 export function setupWithLandmarks(sim, count, spread) {
   setup(sim);
-  const rng = new (class {
-    constructor(seed) {
-      this.s = seed >>> 0;
-    }
-    next() {
-      this.s = (this.s * 1103515245 + 12345) >>> 0;
-      return this.s / 4294967296;
-    }
-  })(12345);
+  const rng = sim.forkRng("landmarks");
   for (let i = 0; i < count; i++) {
     const entity = sim.spawn();
     const angle = rng.next() * Math.PI * 2;

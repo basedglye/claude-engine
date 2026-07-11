@@ -436,3 +436,121 @@ hash-equivalent), `smoke --out` → `--replay --from-checkpoint 50`,
 `bots-headless --verify-replay`, and the four committed soak scenarios;
 confirm `git diff main..phase-3 -- CLAUDE.md packages/core/src/types.ts`
 is still empty; then return to this gate.
+
+## Resubmission verdict
+
+Reviewer: Fable 5, resubmission of the step-3 gate against commit `5a39a41`
+("Phase 3 fix-list: address review gate items 1-7"). All verification below
+re-run by the reviewer on Windows 10 / Node 24.12.0; nothing taken on trust.
+
+### Verdict: FIX-LIST (1 item)
+
+All seven original items are addressed — items 1, 3, 4, 5, 6, and 7 are
+**confirmed fixed** by re-executed repros and re-run suites (evidence below).
+But item 2's fix, while it genuinely closes the dropped-command hole it was
+aimed at, **introduces a new defect in the same blocking class**: the
+`intake` queue stamps a command's tick at *arrival* time, so any command
+arriving while the write-ahead `await store.appendCommands(...)` is in
+flight is persisted with a tick one lower than the tick it actually executes
+in. The persisted log then no longer describes the run (invariant #3), and
+the shipped regression test passes anyway only because its game is a
+position accumulator — commutative across ticks — so the mis-placed replay
+happens to converge to the same final hash. Confirmed by reviewer repro
+(scratchpad `resub-new-misstamp.mjs`), same server/mock-store/live-socket
+shape as the shipped test but with a non-commutative per-tick rule
+(`acc = acc*3 + sum(dx)`): **117 of 194 accepted commands executed one tick
+later than their persisted stamp** (first: stamped 1, executed 2), and the
+persisted log replays to hash **46960636 vs the server's own 3552430466**.
+The phase's grounding criterion is therefore still not met for genuinely
+async stores — one step closer (nothing is *lost from the log* anymore),
+but not yet true.
+
+1. **[Grounding criterion + invariant #3 — blocking] Commands arriving
+   during the write-ahead `await` are persisted with a stale tick stamp:
+   logged at tick T, executed at tick T+1.**
+   `packages/server/src/server.ts`: both `queueReserved` and the intent
+   handler stamp `tick: sim.tick + 1` when *pushing to `intake`*. For a
+   message arriving between ticks that's correct — the next `doTick` drains
+   it before `step()` advances the tick. But for a message arriving during
+   `doTick`'s `await store.appendCommands(...)` (the only yield point before
+   `step()`; ws handlers run freely there), `sim.tick` has not advanced yet,
+   so the command is stamped T+1 — and it is *not* drained by the in-flight
+   tick (drain already ran); it waits for the next `doTick`, by which time
+   `step()` has advanced the sim to T+1, and it executes in the step that
+   produces T+2. Consequences, in increasing severity: (a) `replay()` and
+   `recoverSim` execute it at its stamped tick — one tick earlier than the
+   live server did — so per-tick hashes diverge and final-state equality
+   holds only for games whose command effects commute across ticks (the
+   reviewer's non-commutative repro diverges: 46960636 vs 3552430466);
+   (b) if `saveSnapshot` lands on tick T+1 (it runs right after `step()`
+   whenever `sim.tick % snapshotEveryTicks === 0`), the mis-stamped command
+   is excluded from recovery entirely — `commandsSince(gameId, afterTick)`
+   is `tick > afterTick` on both drivers, the command's stamp T+1 equals the
+   snapshot tick, and its effect is not in the snapshot (it executed after)
+   — state ahead of the effective log, the exact failure class item 2's fix
+   was meant to end. Storeless servers are immune (`doTick` has no `await`
+   before `step()` without a store, so handlers cannot interleave) — which
+   is why every soak and its headless replay stay green.
+   **Fix**: stamp at drain time, not arrival time — the drain loop in
+   `doTick` becomes `for (const command of intake) sim.submit({ ...command,
+   tick: sim.tick + 1 });` (drain runs synchronously immediately before the
+   copy and `step()`, so `sim.tick + 1` is provably the executing tick;
+   intake order is preserved, so supersede's leave-before-join ordering is
+   unaffected). The queue-time stamp then carries no meaning — drop it or
+   stamp 0 to make that explicit. Strengthen the shipped write-ahead
+   regression test so commutativity can never mask this again: either give
+   its game a non-commutative per-tick rule (the repro's `acc*3 + dx` shape
+   is ready-made) or assert from inside a system that `c.tick === s.tick`
+   for every consumed command. Re-verify with the repro above (expect 0
+   mis-stamps and hash-equal replay).
+
+### Original items 1–7: re-verification evidence
+
+| # | Status | Evidence (re-run by this reviewer) |
+|---|---|---|
+| 1 | **FIXED** | Original timeline re-run against the real `scenarios/lib/net-game.mjs` `setup` + `sqliteStore` + `recoverSim` (join@1, moves@2/4/8/12, snapshot@6, crash@15, continue to 30): recovered hash **194278080 == continuous 194278080**, pos `{x:1,z:2}` both sides (previously 198819683 vs 194278080). `recoverSim` lands on tick 12 (last command's tick) exactly as documented. Both reference games now derive the actor→entity lookup from the `owner` component; constraint documented in `core-api.md` (restore section) and `net-api.md` (workflow step 1), including the honest trailing-ticks caveat this review asked for. |
+| 2 | **FIXED as scoped, but see new item 1** | Original repro shape re-run (real `startGameServer`, setTimeout-based macrotask store, live socket pumping moves for 3 s): **194 accepted == 194 logged** (plus the `@net/join`), server hash == log-replay hash **3594635481** (previously 266 vs 196, hashes divergent). No command is dropped from the log anymore. The residual defect is the stamp skew above — a different mechanism in the same path. |
+| 3 | **FIXED** | `npm run test -w @claude-engine/server`: **8/8 consecutive runs exit 0**, 18/18 checks each (original flake was ~1-in-6). `messageOfType` discards non-matching frames with a timeout. |
+| 4 | **FIXED** | New lifecycle test passes live: after a supersede the log shows `@net/join`, `@net/leave`, `@net/join` for the actor — correct 1:1 accounting (two real connections occurred, so two joins; the intervening leave is the eviction). `closeSession` queues the leave before the new join enters intake (FIFO preserves order), the later ws `close` event correctly no-ops, and both reference games' join handlers are idempotent per actor. |
+| 5 | **FIXED** | `node scripts/check-purity.mjs --self-test` exit 0, output includes "Math.random planted in packages/bots/src: CAUGHT". |
+| 6 | **FIXED** | Golden rewritten as a join-based scenario: join@1, move@5 (pre-snapshot@10), move@15, move@20 (= crash tick), crash, `recoverSim` (asserts tick == 20), fresh moves @25/@35 to 40 — hash-equal with the uninterrupted run. Passes (`npm run test -w @claude-engine/persistence` exit 0; Postgres skips cleanly without `DATABASE_URL`, as expected locally). Doubles as item 1's regression test as requested. |
+| 7 | **FIXED** | `setupWithLandmarks` uses `sim.forkRng("landmarks")`; the LCG constant `1103515245` no longer appears anywhere under `scenarios/`, `apps/`, or `packages/`. |
+
+### Verification battery (all re-run)
+
+`npm run build` / `lint` / `check:purity` / `--self-test` / `check:plugin` /
+`npm test` — all exit 0, smoke hash **919868270** unchanged. Core (7),
+net (19), bots (10), persistence (9 + pg SKIP), server (18 × 8 runs) — all
+green. `smoke --out` → `--replay` → `--replay --from-checkpoint 50`: exit
+0/0/0, `verified: true` both. `bots-headless --verify-replay`: passed,
+`replayCheck.verified: true` (2434575262 == 2434575262), 50 `bot:wanderer`
+commands in the bundle. All four committed soaks exit 0 — net-walk's and
+soak-ci's verdicts replay headlessly `verified: true`; net-interest still
+filters (avgReplicatedEntities 2 vs 42 server entities); net-abuse still
+rejects on all three reasons (unknown-type 17, invalid-payload 17,
+rate-limited 126). `demo-walk` passes (the shared-pattern rewrite of
+`apps/demo/src/game.ts` regressed nothing). `git diff main..phase-3 --
+CLAUDE.md packages/core/src/types.ts` — **empty**.
+
+### Non-blocking observations (carry forward, no action required this loop)
+
+- `packages/server/scripts/test.mjs`'s `setupGame` still caches
+  `playerId -> entity` in a closure `Map` — harmless here (test-only, never
+  restored), but it is now the documented anti-pattern; align it with the
+  component-derived lookup next time the file is touched so no in-repo
+  example contradicts `net-api.md`.
+- `findEntityByOwner` is a linear scan over `withComponent("owner")` per
+  command (and the demo's prevPos system iterates it per tick). O(players)
+  per command is nothing at soak-50 scale — all soaks re-ran green with the
+  new pattern — but it compounds with Phase 4's entity counts; revisit
+  alongside the existing per-broadcast `snapshot()` note under the spec's
+  measure-first stance.
+
+### Resubmission instructions
+
+Address the single item above (a two-line product change plus a hardened
+regression test), re-run `npm run test -w @claude-engine/server` (5×+), the
+mis-stamp repro shape (non-commutative game under the macrotask store —
+expect 0 mis-stamps, hash-equal replay), and the unchanged-surface spot
+checks (`npm test` smoke hash, one soak + headless replay); then return to
+this gate. Everything else in this phase is verified and holding.

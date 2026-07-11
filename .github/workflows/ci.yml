@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, phase-1]
+    branches: [main, phase-1, phase-2]
   pull_request:
-    branches: [main, phase-1]
+    branches: [main, phase-1, phase-2]
 
 jobs:
   ci:
@@ -35,8 +35,80 @@ jobs:
       - name: Check purity
         run: npm run check:purity
 
+      - name: Check plugin (manifest, marketplace, SKILL.md, templates)
+        run: npm run check:plugin
+
       - name: Test (smoke)
         run: npm test
 
+      - name: Assets determinism tests
+        run: npm run test --workspace @claude-engine/assets
+
       - name: Harness smoke scenario
         run: npm run harness --silent -- smoke
+
+      - name: Harness checkpoint + replay-from-verdict
+        run: |
+          npm run harness --silent -- smoke --out /tmp/smoke-verdict.json
+          npm run harness --silent -- --replay /tmp/smoke-verdict.json
+
+      - name: Asset import pipeline fixtures
+        run: |
+          npm run assets:import --silent -- packages/asset-pipeline/fixtures/good-texture.png --type texture --into /tmp/ci-import --validate-only
+          npm run assets:import --silent -- packages/asset-pipeline/fixtures/good-mesh.glb --type mesh --into /tmp/ci-import
+          if npm run assets:import --silent -- packages/asset-pipeline/fixtures/bad-texture-oversized.png --type texture --into /tmp/ci-import --validate-only; then
+            echo "bad-texture-oversized.png should have failed validation" >&2
+            exit 1
+          fi
+          if npm run assets:import --silent -- packages/asset-pipeline/fixtures/bad-mesh-overtris.glb --type mesh --into /tmp/ci-import --validate-only; then
+            echo "bad-mesh-overtris.glb should have failed validation" >&2
+            exit 1
+          fi
+
+      - name: Scaffold smoke (both templates, unedited)
+        run: |
+          set -e
+          for template in 3d-world topdown-2d; do
+            app="ci-scaffold-$template"
+            npm run scaffold --silent -- "$app" --template "$template"
+            npm install
+            npm run build --workspace "@claude-engine/$app"
+            npm run harness --silent -- "apps/$app/scenarios/first-run.scenario.mjs"
+            rm -rf "apps/$app"
+            npm install
+          done
+
+  browser:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Harness demo-visual scenario (--browser)
+        run: npm run harness --silent -- demo-visual --browser
+
+      - name: Upload browser-mode screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-browser-screenshots
+          path: artifacts/harness/
+          if-no-files-found: error

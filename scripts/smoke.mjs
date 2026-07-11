@@ -1,6 +1,6 @@
 // Smoke test: a toy game on the sim kernel, verified through the harness,
 // plus a replay-equivalence check. Run with: node scripts/smoke.mjs
-import { Sim, replay } from "../packages/core/dist/index.js";
+import { replay } from "../packages/core/dist/index.js";
 import { runScenario } from "../packages/harness/dist/index.js";
 
 function setup(sim) {

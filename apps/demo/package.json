@@ -1,0 +1,20 @@
+{
+  "name": "@claude-engine/demo",
+  "version": "0.0.1",
+  "description": "Phase 1 disposable browser-playable toy demo proving the renderer-three host works",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:game": "tsc -p tsconfig.game.json",
+    "build": "npm run build:game && vite build"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "@claude-engine/renderer-three": "*"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

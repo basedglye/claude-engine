@@ -22,31 +22,74 @@ export interface PlayerHp {
 
 const MOVE_SPEED = 1;
 
+function spawnPlayer(s: Sim, owner: string): EntityId {
+  const entity = s.spawn();
+  s.setComponent<PlayerPos>(entity, "pos", { x: 0, y: 0 });
+  s.setComponent<PlayerPos>(entity, "prevPos", { x: 0, y: 0 });
+  s.setComponent<PlayerHp>(entity, "hp", { value: 100 });
+  s.setComponent<string>(entity, "owner", owner);
+  return entity;
+}
+
 export function setup(sim: Sim): void {
-  const player = sim.spawn(); // == PLAYER_ENTITY: first entity spawned
-  sim.setComponent<PlayerPos>(player, "pos", { x: 0, y: 0 });
-  sim.setComponent<PlayerPos>(player, "prevPos", { x: 0, y: 0 });
-  sim.setComponent<PlayerHp>(player, "hp", { value: 100 });
+  // Keyed by actor: offline mode always submits actor "player" (see
+  // movementKeymap below) and pre-registers PLAYER_ENTITY under it here, so
+  // the same per-actor systems serve both the single-player demo and net
+  // mode (Phase 3 Scope G) without duplicating movement/hazard logic.
+  // Networked actors are the server-assigned "player:<id>" string, added on
+  // @net/join and removed on @net/leave — session lifecycle enters entirely
+  // through this reserved-command path, never as a host-side mutation.
+  const entityByActor = new Map<string, EntityId>();
+  const player = spawnPlayer(sim, "player"); // == PLAYER_ENTITY: first entity spawned
+  entityByActor.set("player", player);
   const hazard = sim.forkRng("hazard");
 
-  // Movement system: consumes "move" commands, keeps a previous-position
-  // component so hosts can interpolate render position between ticks
-  // without engine-owned snapshot history (see docs/PHASE-1.md interpolation
-  // note — IWorld exposes only current state in Phase 1).
+  // Session lifecycle: only relevant in net mode (offline mode never
+  // submits @net/join or @net/leave — the sole entity is spawned above).
   sim.addSystem((s) => {
-    const pos = s.getComponent<PlayerPos>(player, "pos")!;
-    s.setComponent<PlayerPos>(player, "prevPos", { x: pos.x, y: pos.y });
     for (const c of s.commands()) {
-      if (c.type !== "move") continue;
-      const { dx, dy } = c.payload as { dx: number; dy: number };
-      pos.x += dx;
-      pos.y += dy;
-      s.emit("moved", { x: pos.x, y: pos.y });
+      if (c.type === "@net/join") {
+        const payload = c.payload as { playerId: string };
+        entityByActor.set(c.actor, spawnPlayer(s, c.actor));
+        s.emit("joined", { playerId: payload.playerId });
+      } else if (c.type === "@net/leave") {
+        const entity = entityByActor.get(c.actor);
+        if (entity !== undefined) {
+          s.removeComponent(entity, "pos");
+          s.removeComponent(entity, "prevPos");
+          s.removeComponent(entity, "hp");
+          s.removeComponent(entity, "owner");
+          entityByActor.delete(c.actor);
+        }
+      }
     }
   });
 
-  // Hazard system: deterministic random damage, same pattern as the smoke
-  // scenario, so the demo also demonstrates the seeded/forked Rng contract.
+  // Movement system: consumes "move" commands per actor, keeps a previous-
+  // position component so hosts can interpolate render position between
+  // ticks without engine-owned snapshot history (see docs/PHASE-1.md
+  // interpolation note — IWorld exposes only current state).
+  sim.addSystem((s) => {
+    for (const entity of entityByActor.values()) {
+      const pos = s.getComponent<PlayerPos>(entity, "pos");
+      if (pos) s.setComponent<PlayerPos>(entity, "prevPos", { x: pos.x, y: pos.y });
+    }
+    for (const c of s.commands()) {
+      if (c.type !== "move") continue;
+      const entity = entityByActor.get(c.actor);
+      if (entity === undefined) continue;
+      const pos = s.getComponent<PlayerPos>(entity, "pos");
+      if (!pos) continue;
+      const { dx, dy } = c.payload as { dx: number; dy: number };
+      pos.x += dx;
+      pos.y += dy;
+      s.emit("moved", { actor: c.actor, x: pos.x, y: pos.y });
+    }
+  });
+
+  // Hazard system: deterministic random damage to the offline demo's single
+  // player, same pattern as the smoke scenario — demonstrates the seeded/
+  // forked Rng contract. Not extended to networked players (Non-goals).
   sim.addSystem((s) => {
     if (s.tick % 40 !== 0) return;
     const hp = s.getComponent<PlayerHp>(player, "hp")!;

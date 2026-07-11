@@ -61,6 +61,11 @@ export interface ClientSessionOptions {
 export interface ClientSession {
   readonly world: ClientWorld;
   readonly status: "connecting" | "open" | "closed";
+  /** The server-assigned actor string ("player:<id>"), populated once
+   *  "welcome" arrives (empty string beforehand). Games need this to tell
+   *  their own entity apart from others' (e.g. an "owner" component set to
+   *  Command.actor server-side, matched against this client-side). */
+  readonly actor: string;
   submitIntent(intent: CommandIntent): void;
   stats(): ClientNetStats;
   close(): void;
@@ -270,6 +275,9 @@ export function createClientSession(opts: ClientSessionOptions): ClientSession {
     world,
     get status() {
       return status;
+    },
+    get actor() {
+      return selfActor;
     },
     submitIntent(intent: CommandIntent): void {
       const seq = ++seqCounter;

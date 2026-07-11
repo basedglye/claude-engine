@@ -17,7 +17,10 @@ class Rng {
   int(min: number, max: number): number;   // inclusive
   pick<T>(items: readonly T[]): T;
   fork(label: string): Rng;                // independent, reproducible stream
+  getState(): RngState;                    // capture exact draw position
+  static fromState(state: RngState): Rng;  // resume from a captured state
 }
+type RngState = readonly [number, number, number, number];
 ```
 
 `fork(label)` derives an independent stream so adding draws in one subsystem
@@ -55,10 +58,14 @@ class Sim implements IWorld {
 
   step(): void;                            // advance exactly one tick
   stateHash(): number;                     // deterministic, replay-divergence detector
-  snapshot(): SimSnapshot;                 // evidence dump — NOT a restore point (no Rng state)
+  forkRng(label: string): Rng;             // tracked fork — capturable/restorable (see below)
+  snapshot(): SimSnapshot;                 // v2: a faithful restore point
+  restore(snapshot: SimSnapshot): void;    // requires setup() already run on this sim
 }
 
 function replay(seed: string, setup: (sim: Sim) => void, commandLog: readonly Command[], ticks: number): number[];
+
+class RestoreError extends Error {}       // thrown by restore() on a v:1 snapshot or fork-label mismatch
 ```
 
 Component values must be JSON-serializable — `stateHash()` and `snapshot()`
@@ -66,22 +73,45 @@ both depend on this. Systems run in registration order, every tick, forever
 (no removal). Iteration order over collections is deterministic (insertion
 order for `Map`-backed component stores).
 
+### Snapshots and `Sim.restore()`
+
 `snapshot()` (`snapshot.ts`) returns:
 
 ```ts
 interface SimSnapshot {
-  v: 1;
+  v: 2;
   tick: number;
   nextEntity: EntityId;
   stateHash: number;
-  components: Record<string, [EntityId, unknown][]>;  // insertion order
+  components: Record<string, [EntityId, unknown][]>;  // insertion order, deep-cloned
+  rng: { root: RngState; forks: [string, RngState][] };
 }
 ```
 
-No Rng state is captured. A faithful restore-from-snapshot contract needs
-the sim to track forked Rng streams (it doesn't, by design — games hold
-their own forks), and is deferred to the Phase 3 persistence work. Treat
-`snapshot()` output as evidence for a verdict, never as a save file.
+**Use `sim.forkRng(label)` instead of `sim.rng.fork(label)` for any stream a
+system holds across ticks.** `forkRng` delegates to exactly `this.rng.fork
+(label)` (identical draw sequence — migrating a call site 1:1 changes no
+hashes) but also *registers* the returned stream so `snapshot()`/`restore()`
+can capture and faithfully resume it. It's setup-time only: it throws once
+`step()` has run, and throws on a duplicate label. `sim.rng.fork(...)` called
+directly (untracked) remains correct for transient, setup-local derivation
+whose output lands in a component (e.g. terrain seeds — see "Procedural
+assets" below), and for host/asset code, which isn't sim state — just don't
+hold an untracked fork across ticks, or a restore can't reproduce it.
+
+`restore(snapshot)` requires `setup()` to have already run on the target
+`Sim` (systems are code and are never serialized — restore replaces *data*,
+not logic): it replaces component stores, `tick`/`nextEntity`, and Rng state
+(root + every `forkRng`-registered stream, matched by label), then clears
+pending commands and the event log (events are derivable outputs; the
+persisted source of truth is the command log — see `net-api.md`'s
+persistence section). Throws `RestoreError` if the snapshot is `v: 1`
+(pre-Phase-3 evidence, not restorable) or if the target sim's `forkRng`
+registrations don't match the snapshot's.
+
+Harness checkpoints support resuming from a snapshot instead of replaying
+from tick 1: `npm run harness --silent -- --replay <verdict.json>
+--from-checkpoint <tick>` (see `harness-api.md`).
 
 ## `types.ts` — the protocol
 

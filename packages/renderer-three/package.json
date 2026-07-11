@@ -1,0 +1,15 @@
+{
+  "name": "@claude-engine/renderer-three",
+  "version": "0.0.1",
+  "description": "Three.js/WebGPU render host for ClaudeEngine sims (web-first host; reads IWorld, submits Commands)",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*"
+  }
+}

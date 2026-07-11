@@ -1,0 +1,19 @@
+{
+  "name": "claude-engine-monorepo",
+  "private": true,
+  "version": "0.0.1",
+  "description": "ClaudeEngine — an AI-native game engine and Claude Code plugin",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "node scripts/smoke.mjs",
+    "harness": "npm run start --workspace @claude-engine/harness --"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

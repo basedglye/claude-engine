@@ -1,0 +1,12 @@
+{
+  "name": "worldforge",
+  "description": "Build games on ClaudeEngine: deterministic sim kernel, headless verification harness, procedural assets, and multiplayer infrastructure — designed for agent-driven game development.",
+  "version": "0.0.1",
+  "author": {
+    "name": "basedglye"
+  },
+  "homepage": "https://github.com/basedglye/claude-engine",
+  "repository": "https://github.com/basedglye/claude-engine",
+  "license": "MIT",
+  "keywords": ["gamedev", "game-engine", "threejs", "webgpu", "deterministic", "playtesting"]
+}

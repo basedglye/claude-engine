@@ -48,4 +48,4 @@ Before claiming a change works: `npm run build`, then run the relevant
 harness scenario (`npm run harness --silent -- <scenario>`) and read its JSON
 verdict — `--silent` suppresses npm's own banner so stdout is the verdict
 JSON alone. For rendering changes, capture a screenshot via the harness
-browser mode (Phase 2+).
+browser mode.

@@ -63,7 +63,13 @@ function resolveScenarioPath(spec: string): string {
   if (isBareName) {
     return resolve(repoRoot, "scenarios", `${spec}.scenario.mjs`);
   }
-  return isAbsolute(spec) ? spec : resolve(process.cwd(), spec);
+  if (isAbsolute(spec)) return spec;
+  // The root `harness` script delegates through `npm run start --workspace
+  // @claude-engine/harness --`, which runs with cwd=packages/harness, not
+  // the caller's original directory. npm sets INIT_CWD to that original
+  // directory precisely for this case; fall back to process.cwd() when the
+  // CLI is invoked directly (e.g. `node dist/cli.js <path>`).
+  return resolve(process.env.INIT_CWD ?? process.cwd(), spec);
 }
 
 async function loadScenario(path: string): Promise<Scenario> {

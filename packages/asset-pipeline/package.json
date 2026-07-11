@@ -1,0 +1,16 @@
+{
+  "name": "@claude-engine/asset-pipeline",
+  "version": "0.0.1",
+  "description": "Asset import pipeline — validation gates (format/size/dims/tris/materials/duration) every externally-produced asset must pass before entering a game",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "claude-engine-assets-import": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js"
+  }
+}

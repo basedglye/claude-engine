@@ -1,5 +1,9 @@
 import { Sim, type Command, type GameEvent, type SimSnapshot } from "@claude-engine/core";
 
+/** Thrown when --from-checkpoint names a tick with no checkpoint, or one
+ *  whose snapshot predates Sim.restore() support (v: 1). */
+export class CheckpointError extends Error {}
+
 /**
  * Harness v0: run a scenario against a sim and return a structured verdict.
  *
@@ -210,6 +214,86 @@ export function replayVerdict(scenario: Scenario, verdict: Verdict, source: stri
     for (const c of byTick.get(t) ?? []) sim.submit(c);
     sim.step();
     const expected = checkpointTicks.get(t);
+    if (expected) {
+      const actual = sim.stateHash();
+      checkpointResults.push({ tick: t, expected: expected.stateHash, actual, match: actual === expected.stateHash });
+    }
+  }
+
+  const actualFinalHash = sim.stateHash();
+  return {
+    source,
+    scenarioModule,
+    verified: actualFinalHash === verdict.finalStateHash && checkpointResults.every((c) => c.match),
+    expectedFinalHash: verdict.finalStateHash,
+    actualFinalHash,
+    setupDrift: false,
+    ...(checkpointResults.length > 0 ? { checkpointResults } : {}),
+  };
+}
+
+/**
+ * Like replayVerdict, but resumes from a checkpoint's v2 snapshot instead of
+ * replaying from tick 1 (Sim.restore(), Scope A). Still runs setup() first —
+ * systems are code and are never serialized — and still checks setupStateHash
+ * before restoring, so module drift is diagnosed the same way as full replay.
+ * Only commands after `fromTick` are injected; only checkpoints after
+ * `fromTick` are compared.
+ */
+export function replayVerdictFromCheckpoint(
+  scenario: Scenario,
+  verdict: Verdict,
+  fromTick: number,
+  source: string
+): ReplayVerdict {
+  const scenarioModule = verdict.replay.scenarioModule ?? "";
+  const checkpoint = (verdict.checkpoints ?? []).find((c) => c.tick === fromTick);
+  if (!checkpoint) {
+    throw new CheckpointError(`No checkpoint at tick ${fromTick} in this verdict`);
+  }
+  if (checkpoint.snapshot.v !== 2) {
+    throw new CheckpointError(
+      `Checkpoint at tick ${fromTick} is a v:${checkpoint.snapshot.v} snapshot (evidence-only, not restorable) — re-run without --from-checkpoint`
+    );
+  }
+
+  const sim = new Sim(verdict.replay.seed);
+  scenario.setup(sim);
+  const setupStateHash = sim.stateHash();
+
+  if (
+    verdict.replay.setupStateHash !== undefined &&
+    setupStateHash !== verdict.replay.setupStateHash
+  ) {
+    return {
+      source,
+      scenarioModule,
+      verified: false,
+      expectedFinalHash: verdict.finalStateHash,
+      actualFinalHash: setupStateHash,
+      setupDrift: true,
+    };
+  }
+
+  sim.restore(checkpoint.snapshot);
+
+  const byTick = new Map<number, Command[]>();
+  for (const c of verdict.replay.commands) {
+    if (c.tick <= fromTick) continue;
+    const list = byTick.get(c.tick) ?? [];
+    list.push(c);
+    byTick.set(c.tick, list);
+  }
+  const laterCheckpoints = new Map(
+    (verdict.checkpoints ?? []).filter((c) => c.tick > fromTick).map((c) => [c.tick, c])
+  );
+  const checkpointResults: { tick: number; expected: number; actual: number; match: boolean }[] = [];
+
+  const ticks = verdict.replay.ticks ?? verdict.ticks;
+  for (let t = fromTick + 1; t <= ticks; t++) {
+    for (const c of byTick.get(t) ?? []) sim.submit(c);
+    sim.step();
+    const expected = laterCheckpoints.get(t);
     if (expected) {
       const actual = sim.stateHash();
       checkpointResults.push({ tick: t, expected: expected.stateHash, actual, match: actual === expected.stateHash });

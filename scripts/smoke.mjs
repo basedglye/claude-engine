@@ -7,7 +7,7 @@ function setup(sim) {
   const player = sim.spawn();
   sim.setComponent(player, "pos", { x: 0, y: 0 });
   sim.setComponent(player, "hp", { value: 100 });
-  const loot = sim.rng.fork("loot");
+  const loot = sim.forkRng("loot");
 
   // movement system: consume "move" commands
   sim.addSystem((s) => {

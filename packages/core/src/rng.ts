@@ -6,6 +6,9 @@
  * subsystem never perturbs another — the key to keeping replays stable as
  * games grow.
  */
+/** The four sfc32 state words, in order. Captures/restores exact draw position. */
+export type RngState = readonly [number, number, number, number];
+
 export class Rng {
   private a: number;
   private b: number;
@@ -20,6 +23,29 @@ export class Rng {
     this.c = s ^ 0x85ebca6b;
     this.d = (s * 0x27d4eb2f) >>> 0;
     for (let i = 0; i < 12; i++) this.nextUint32();
+  }
+
+  /** Snapshot the exact internal state — same seed + state ⇒ same future draws. */
+  getState(): RngState {
+    return [this.a, this.b, this.c, this.d];
+  }
+
+  /** Construct an Rng that continues exactly from a captured state (no
+   *  reseed/warmup — this is a resume, not a new stream). */
+  static fromState(state: RngState): Rng {
+    const rng = Object.create(Rng.prototype) as Rng;
+    rng.restoreState(state);
+    return rng;
+  }
+
+  /** Mutate this Rng's state in place. Used by Sim.restore() so existing
+   *  references to a Sim.forkRng() stream (e.g. held by a game closure)
+   *  keep drawing from the restored sequence rather than going stale. */
+  restoreState(state: RngState): void {
+    this.a = state[0];
+    this.b = state[1];
+    this.c = state[2];
+    this.d = state[3];
   }
 
   nextUint32(): number {

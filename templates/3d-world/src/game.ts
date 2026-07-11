@@ -72,7 +72,7 @@ export function setup(sim: Sim): void {
   sim.setComponent<PlayerPos>(player, "pos", { x: 0, z: 0 });
   sim.setComponent<PlayerPos>(player, "prevPos", { x: 0, z: 0 });
   sim.setComponent<PlayerHp>(player, "hp", { value: 100 });
-  const hazard = sim.rng.fork("hazard");
+  const hazard = sim.forkRng("hazard");
 
   // Movement system: consumes "move" commands, ground-follows via heightAt
   // (a legitimate sim concern — the terrain shape affects gameplay, unlike

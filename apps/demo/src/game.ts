@@ -27,7 +27,7 @@ export function setup(sim: Sim): void {
   sim.setComponent<PlayerPos>(player, "pos", { x: 0, y: 0 });
   sim.setComponent<PlayerPos>(player, "prevPos", { x: 0, y: 0 });
   sim.setComponent<PlayerHp>(player, "hp", { value: 100 });
-  const hazard = sim.rng.fork("hazard");
+  const hazard = sim.forkRng("hazard");
 
   // Movement system: consumes "move" commands, keeps a previous-position
   // component so hosts can interpolate render position between ticks

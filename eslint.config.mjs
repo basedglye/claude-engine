@@ -168,14 +168,16 @@ export default [
       'no-restricted-imports': [
         'error',
         {
-          paths: [{ name: 'three', message: 'three is a host library, banned from packages/bots' }],
-          patterns: [
-            { group: ['node:*'], message: 'Node built-ins banned from packages/bots' },
-            {
-              group: ['fs', 'path', 'os', 'child_process', 'stream', 'http', 'https', 'net', 'crypto', 'events', 'util', 'buffer', 'assert'],
-              message: 'Node built-ins banned from packages/bots',
-            },
+          // Exact-match `paths` (not glob `patterns.group`): a bare "net"
+          // glob also matches @claude-engine/net's basename via gitignore-
+          // style matching, which bots legitimately imports for CommandIntent.
+          paths: [
+            { name: 'three', message: 'three is a host library, banned from packages/bots' },
+            ...['fs', 'path', 'os', 'child_process', 'stream', 'http', 'https', 'net', 'crypto', 'events', 'util', 'buffer', 'assert'].map(
+              (name) => ({ name, message: 'Node built-ins banned from packages/bots' })
+            ),
           ],
+          patterns: [{ group: ['node:*'], message: 'Node built-ins banned from packages/bots' }],
         },
       ],
       'no-restricted-properties': [

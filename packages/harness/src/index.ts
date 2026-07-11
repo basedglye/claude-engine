@@ -1,4 +1,5 @@
 import { Sim, type Command, type GameEvent, type SimSnapshot } from "@claude-engine/core";
+import type { BotDriver } from "@claude-engine/bots";
 
 /** Thrown when --from-checkpoint names a tick with no checkpoint, or one
  *  whose snapshot predates Sim.restore() support (v: 1). */
@@ -27,6 +28,9 @@ export interface Scenario {
   browser?: unknown;
   /** Bounds on probe result keys, e.g. { "fps.avg": { min: 30 } }. Evaluated only in --browser runs. */
   feelTargets?: Record<string, { min?: number; max?: number }>;
+  /** Headless bot drivers; their emitted commands are recorded into the
+   *  verdict's replay bundle, so replay needs no bot code. */
+  bots?: readonly BotDriver[];
 }
 
 export interface Checkpoint {
@@ -87,11 +91,25 @@ export function runScenario(scenario: Scenario): Verdict {
   }
   const checkpointTicks = new Set(scenario.checkpoints ?? []);
   const checkpoints: Checkpoint[] = [];
+  // Only built (and only used for verdict.replay.commands) when bots are
+  // present — a bot-free scenario's replay bundle stays byte-identical to
+  // `scenario.commands ?? []`, unaffected by tick-grouping order.
+  const submittedCommands: Command[] | undefined = scenario.bots ? [] : undefined;
 
   const tickMs: number[] = [];
   const start = performance.now();
   for (let t = 1; t <= scenario.ticks; t++) {
-    for (const c of byTick.get(t) ?? []) sim.submit(c);
+    for (const c of byTick.get(t) ?? []) {
+      sim.submit(c);
+      submittedCommands?.push(c);
+    }
+    for (const bot of scenario.bots ?? []) {
+      for (const intent of bot.act(sim, t)) {
+        const command: Command = { tick: t, actor: bot.actor, type: intent.type, payload: intent.payload };
+        sim.submit(command);
+        submittedCommands?.push(command);
+      }
+    }
     const tickStart = performance.now();
     sim.step();
     tickMs.push(performance.now() - tickStart);
@@ -126,7 +144,7 @@ export function runScenario(scenario: Scenario): Verdict {
     entityCount: countEntities(sim),
     replay: {
       seed: scenario.seed,
-      commands: scenario.commands ?? [],
+      commands: submittedCommands ?? scenario.commands ?? [],
       ticks: scenario.ticks,
       setupStateHash,
     },
@@ -141,15 +159,21 @@ export function runScenario(scenario: Scenario): Verdict {
   };
 }
 
-/** Replay the given (seed, commands) against a fresh sim and compare the final state hash. */
+/**
+ * Replay the given (seed, commands) against a fresh sim and compare the
+ * final state hash. `commands` defaults to `scenario.commands` (existing
+ * callers unchanged); the CLI's --verify-replay passes a bot scenario's
+ * *recorded* command log instead, so replay never needs to run bot code.
+ */
 export function verifyReplay(
   scenario: Scenario,
-  expectedHash: number
+  expectedHash: number,
+  commands?: readonly Command[]
 ): { verified: boolean; expectedHash: number; actualHash: number } {
   const sim = new Sim(scenario.seed);
   scenario.setup(sim);
   const byTick = new Map<number, Command[]>();
-  for (const c of scenario.commands ?? []) {
+  for (const c of commands ?? scenario.commands ?? []) {
     const list = byTick.get(c.tick) ?? [];
     list.push(c);
     byTick.set(c.tick, list);

@@ -306,7 +306,7 @@ async function main(): Promise<void> {
   verdict.replay.scenarioModule = toRepoRelative(scenarioPath);
 
   if (shouldVerifyReplay) {
-    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash);
+    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands);
   }
 
   const json = JSON.stringify(verdict, null, 2);

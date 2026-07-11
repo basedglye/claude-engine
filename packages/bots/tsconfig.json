@@ -3,8 +3,9 @@
   "compilerOptions": {
     "outDir": "dist",
     "rootDir": "src",
-    "types": ["node"]
+    "lib": ["ES2022"],
+    "types": []
   },
   "include": ["src"],
-  "references": [{ "path": "../core" }, { "path": "../bots" }, { "path": "../net" }]
+  "references": [{ "path": "../core" }, { "path": "../net" }]
 }

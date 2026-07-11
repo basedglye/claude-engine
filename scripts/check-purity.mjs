@@ -147,6 +147,11 @@ const PURITY_ROOTS = [
     dir: path.join(REPO_ROOT, 'packages', 'net', 'src'),
     excludeDirNames: new Set(['web']),
   },
+  {
+    name: 'packages/bots/src',
+    dir: path.join(REPO_ROOT, 'packages', 'bots', 'src'),
+    excludeDirNames: new Set(),
+  },
 ];
 
 function runSelfTest() {

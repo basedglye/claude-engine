@@ -1,0 +1,22 @@
+{
+  "name": "@claude-engine/server",
+  "version": "0.0.1",
+  "description": "Authoritative server host: prediction reconciliation counterpart, interest management, input validation + rate limiting at the boundary, pluggable auth, persistence wiring",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "@claude-engine/net": "*",
+    "@claude-engine/persistence": "*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
+  }
+}

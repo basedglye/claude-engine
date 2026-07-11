@@ -9,10 +9,14 @@ import { startHostLoop } from "./host-loop.js";
  */
 export interface SceneContext {
   scene: THREE.Scene;
-  camera: THREE.PerspectiveCamera;
+  camera: THREE.Camera;
   /** Get-or-create the scene object for an entity. The host disposes/removes
    *  objects whose entity no longer exists in the world. */
   objectFor(entity: EntityId, create: () => THREE.Object3D): THREE.Object3D;
+  /** Get-or-create host-owned non-entity scenery (ground, sky, etc), keyed by
+   *  a game-chosen string. Disposed on stop(), unlike objects added directly
+   *  to `scene`. */
+  scenery(key: string, create: () => THREE.Object3D): THREE.Object3D;
 }
 
 export interface ThreeHostOptions {
@@ -27,10 +31,21 @@ export interface ThreeHostOptions {
   /** KeyboardEvent.code -> command factory. Fired once per sim tick while the
    *  key is held; returning null submits nothing. */
   keymap?: Record<string, (world: IWorld) => Command | null>;
+  /** Optional pre-constructed camera (e.g. via createOrthographicCamera for
+   *  a top-down game). Defaults to a standard PerspectiveCamera — existing
+   *  callers are unaffected. */
+  camera?: THREE.Camera;
 }
 
 export interface ThreeHost {
   stop(): void;
+}
+
+/** A top-down-friendly orthographic camera: `viewHeight` world units are
+ *  visible top-to-bottom; width follows on first resize(). */
+export function createOrthographicCamera(viewHeight: number, near = 0.1, far = 1000): THREE.OrthographicCamera {
+  const halfHeight = viewHeight / 2;
+  return new THREE.OrthographicCamera(-halfHeight, halfHeight, halfHeight, -halfHeight, near, far);
 }
 
 /**
@@ -47,7 +62,7 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+  const camera = options.camera ?? new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
 
   const ambient = new THREE.AmbientLight(0xffffff, 0.6);
   const sun = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -55,12 +70,23 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
   scene.add(ambient, sun);
 
   const objects = new Map<EntityId, THREE.Object3D>();
+  const scenery = new Map<string, THREE.Object3D>();
 
   function objectFor(entity: EntityId, create: () => THREE.Object3D): THREE.Object3D {
     let obj = objects.get(entity);
     if (!obj) {
       obj = create();
       objects.set(entity, obj);
+      scene.add(obj);
+    }
+    return obj;
+  }
+
+  function sceneryFor(key: string, create: () => THREE.Object3D): THREE.Object3D {
+    let obj = scenery.get(key);
+    if (!obj) {
+      obj = create();
+      scenery.set(key, obj);
       scene.add(obj);
     }
     return obj;
@@ -87,14 +113,25 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     }
   }
 
-  const ctx: SceneContext = { scene, camera, objectFor };
+  const ctx: SceneContext = { scene, camera, objectFor, scenery: sceneryFor };
 
   function resize(): void {
     const width = canvas.clientWidth || window.innerWidth;
     const height = canvas.clientHeight || window.innerHeight;
     renderer.setSize(width, height, false);
-    camera.aspect = width / Math.max(height, 1);
-    camera.updateProjectionMatrix();
+    const aspect = width / Math.max(height, 1);
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.aspect = aspect;
+      camera.updateProjectionMatrix();
+    } else if (camera instanceof THREE.OrthographicCamera) {
+      // Preserve the vertical view size the caller configured; only
+      // left/right follow the canvas aspect ratio.
+      const viewHeight = camera.top - camera.bottom;
+      const halfWidth = (viewHeight * aspect) / 2;
+      camera.left = -halfWidth;
+      camera.right = halfWidth;
+      camera.updateProjectionMatrix();
+    }
   }
   resize();
   window.addEventListener("resize", resize);
@@ -139,6 +176,8 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
       window.removeEventListener("keyup", onKeyUp);
       for (const obj of objects.values()) disposeObject(obj);
       objects.clear();
+      for (const obj of scenery.values()) disposeObject(obj);
+      scenery.clear();
       renderer.dispose();
     },
   };

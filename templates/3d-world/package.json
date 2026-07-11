@@ -1,0 +1,21 @@
+{
+  "name": "__PACKAGE_NAME__",
+  "version": "0.0.1",
+  "description": "ClaudeEngine 3D world starter template (worldforge scaffold).",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:game": "tsc -p tsconfig.game.json",
+    "build": "npm run build:game && vite build"
+  },
+  "dependencies": {
+    "@claude-engine/assets": "*",
+    "@claude-engine/core": "*",
+    "@claude-engine/renderer-three": "*"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

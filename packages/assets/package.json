@@ -1,0 +1,30 @@
+{
+  "name": "@claude-engine/assets",
+  "version": "0.0.1",
+  "description": "Procedural asset layer: deterministic terrain, meshes, icons, and music from a seeded Rng; /web adapter rasterizes/schedules for the browser",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web/index.d.ts",
+      "default": "./dist/web/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.169.0"
+  }
+}

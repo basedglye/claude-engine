@@ -6,6 +6,10 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./browser": { "types": "./dist/browser.d.ts", "default": "./dist/browser.js" }
+  },
   "bin": {
     "claude-engine-harness": "dist/cli.js"
   },
@@ -15,5 +19,11 @@
   },
   "dependencies": {
     "@claude-engine/core": "*"
+  },
+  "peerDependencies": {
+    "playwright": "^1.61.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright": { "optional": true }
   }
 }

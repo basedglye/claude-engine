@@ -6,3 +6,4 @@ dist-game/
 .DS_Store
 coverage/
 harness-out/
+artifacts/

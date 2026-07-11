@@ -554,3 +554,122 @@ mis-stamp repro shape (non-commutative game under the macrotask store —
 expect 0 mis-stamps, hash-equal replay), and the unchanged-surface spot
 checks (`npm test` smoke hash, one soak + headless replay); then return to
 this gate. Everything else in this phase is verified and holding.
+
+## Final verdict
+
+Reviewer: Fable 5, final pass of the step-3 gate against commit `d97459d`
+("Phase 3 fix-list resubmission item 1: stamp intake commands at drain, not
+arrival"). All verification below re-run by this reviewer on Windows 10 /
+Node 24.12.0; nothing taken on trust.
+
+### Verdict: PASS
+
+The tick mis-stamp defect is closed, the fix's reasoning is sound, the full
+branch battery is green, and all 13 exit criteria — including the grounding
+criterion that was false at the first gate and still skewed at the second —
+now hold together as a coherent whole. **This phase is ready to merge.** Per
+[docs/WORKFLOW.md](../WORKFLOW.md), the next steps are: merge `phase-3` to
+`main`, tag, tick ROADMAP.md's Phase 3 checkboxes (standing reminder from
+the first review), perform the criterion-12 live two-tab check at merge per
+its own fallback clause, and move the roadmap to Phase 4.
+
+### The mis-stamp fix: verified three ways
+
+1. **Fresh repro, non-commutative rule** (scratchpad
+   `final-misstamp-repro.mjs` — same shape as the resubmission repro that
+   failed against `5a39a41`: real `startGameServer`, setTimeout-based
+   macrotask-async mock `GameStore` (30 ms `appendCommands`), live socket
+   pumping varying-`dx` moves every 4 ms for 3 s, per-tick rule
+   `acc = acc*3 + sum(dx)` so cross-tick mis-ordering cannot converge by
+   commutativity, plus an in-system `c.tick !== s.tick` recorder and
+   per-tick hash capture from the server's own `state` broadcasts):
+   **196/196 accepted commands persisted, 0 stamp/execution mismatches,
+   persisted per-tick distribution identical to live execution, final hash
+   3382181747 == 3382181747, and all 66 live-broadcast per-tick hashes match
+   the replay exactly** (previously: 117/194 mis-stamped, hashes
+   46960636 vs 3552430466). Run twice (second: 195/195, hashes
+   630521388 == 630521388, 0 divergent of 66 ticks) — stable.
+2. **Falsifiability check**: the reviewer sabotaged the *built dist only*
+   (reintroduced arrival-time stamping), and the same repro immediately
+   produced 121 mismatches with the exact prior signature (first: stamped 1,
+   executed 2) and divergent hashes; the shipped server suite run against
+   that sabotaged dist also failed — specifically on its new "write-ahead:
+   no command executed on a different tick than it was stamped for" check
+   (37 mismatches, exit 1) — while its final-hash check still *passed*,
+   confirming both that the commutative-masking analysis was right and that
+   the new in-system check is the load-bearing detector, exactly as the fix
+   intended. Dist restored by clean rebuild; repro green again; working
+   tree clean.
+3. **Code reasoning** (`packages/server/src/server.ts`): `IntakeItem`
+   carries no tick; grep confirms the drain loop in `doTick` is the *only*
+   `sim.submit` call in the server, stamping `sim.tick + 1` synchronously
+   with zero awaits between the drain, the write-ahead copy, and nothing
+   else able to touch `pendingCommands` during the `appendCommands`/
+   `saveSnapshot` awaits (handlers only push unstamped items to `intake`).
+   The stamp is therefore assigned exactly once, at the only instant it is
+   provably the executing tick. Commands still in `intake` at `stop()` are
+   never drained or persisted — consistent with the documented "a crash can
+   lose an unexecuted tail, never state ahead of the log" contract, since
+   they never executed either. The snapshot-boundary exclusion consequence
+   (resubmission item 1(b)) is closed by construction: with accurate stamps,
+   a command stamped ≤ snapshot tick has its effect in the snapshot, and
+   `commandsSince`'s strict `tick > afterTick` is again correct.
+
+### Stability and regression battery (all re-run this pass)
+
+- **Server suite: 8/8 consecutive runs exit 0, 20/20 checks each**, with
+  both new tick-stamp checks ("no command executed on a different tick than
+  it was stamped for", storeless and write-ahead variants) confirmed
+  present-and-passing in the output, not silently absent.
+- `npm run build` / `lint` / `check:purity` / `--self-test` (bots fixture
+  CAUGHT) / `check:plugin` / `npm test` — all exit 0, smoke hash
+  **919868270** unchanged.
+- Core (7), net (19), bots (10), persistence (9 + clean Postgres SKIP
+  without `DATABASE_URL`) — all green, matching both prior passes' counts.
+- `smoke --out` → `--replay` → `--replay --from-checkpoint 50`: exit 0/0/0,
+  `verified: true`, checkpoint-100 919868270 == 919868270.
+- `bots-headless --verify-replay` + `--replay` of its verdict: both exit 0,
+  `verified: true`.
+- All four committed soaks exit 0: net-walk (verdict replays headlessly
+  `verified: true`), net-interest (avgReplicatedEntities 2 vs 42 server
+  entities), net-abuse (unknown-type 17 / invalid-payload 16 /
+  rate-limited 135, ticks complete), soak-ci (verdict replays headlessly
+  `verified: true`).
+- **soak-50 re-run for the final gate** (the intake path changed twice since
+  pass 1's run): exit 0 — connected 50, disconnected 0, tickP95Ms 1,
+  tickMaxMs 1, 1216 ticks. Criterion 11 holds against the as-merged code.
+- `demo-walk` exit 0 — the shared game-logic rewrite in
+  `apps/demo/src/game.ts` remains unregressed.
+- `git diff main..phase-3 -- CLAUDE.md`, `packages/core/src/types.ts`,
+  `packages/renderer-three` — all **empty**. `git status --short` clean.
+
+### Exit criteria: final end-to-end confirmation
+
+All 13 criteria MET (criterion 12 met by proxy per its own fallback clause,
+as in both prior passes; the live two-tab check falls to the session owner
+at merge). The three that were PARTIALLY MET at the first gate — 1 (bots
+self-test fixture), 8 (crash-recovery golden), 10 (flaky server suite) —
+were confirmed fixed at the resubmission and re-confirmed green this pass.
+The grounding criterion — *a persisted multiplayer session survives a
+server restart with replay-equivalent state* — is now genuinely true end to
+end: the taught game pattern is restore-safe (item 1), no accepted command
+escapes the persisted log (item 2), every persisted stamp equals its
+execution tick (resubmission item 1), the persistence golden exercises the
+composed join → snapshot → tail path, and the write-ahead regression test
+can no longer be fooled by commutative math.
+
+### New findings from the d97459d diff and its test refactor
+
+None blocking; nothing new introduced. The `createGameSetup()` refactor
+correctly resolves the carried-forward non-blocking note (the test file's
+own closure-`Map` anti-pattern is gone; lookups are `owner`-component-
+derived and join is idempotent per actor, matching the documented pattern),
+each test block gets a fresh instance, and the race test's replay side
+correctly uses a separate fresh setup rather than the live server's
+instance. Prior non-blocking observations (linear `owner` scans and
+per-broadcast `snapshot()` cost — revisit at Phase 4 scale under the spec's
+measure-first stance; `npm audit`'s 2 pre-existing dev-tooling advisories;
+the small documentation notes) carry forward unchanged and none block
+merge.
+
+**PASS — merge `phase-3` to `main`, tag, and proceed to Phase 4 planning.**

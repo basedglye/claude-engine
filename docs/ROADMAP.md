@@ -12,21 +12,22 @@ carried from Phase 0.
 - [x] ECS-lite store, 20 Hz fixed-tick loop, seeded forkable Rng *(landed in Phase 0)*
 - [x] Command queue / event log / per-tick state hash / replay runner *(landed in Phase 0)*
 - [x] Harness v0: run scenario → JSON verdict (assertions, perf, replay bundle) *(landed in Phase 0)*
-- [ ] CI + lint + sim-purity enforcement (workflow, ESLint, `check:purity`
+- [x] CI + lint + sim-purity enforcement (workflow, ESLint, `check:purity`
   self-testing script, DOM/Node-free core tsconfig) — carried from Phase 0
-- [ ] Harness CLI: `npm run harness -- <scenario>` real (JSON verdict on
-  stdout, exit codes, `--verify-replay`); committed `scenarios/` incl. a
-  deliberately failing reproduce-a-failure fixture
-- [ ] Verdict enrichment: tick-time p95/max, entity count, event-log tail on
+- [x] Harness CLI: `npm run harness --silent -- <scenario>` real (JSON
+  verdict on stdout, exit codes, `--verify-replay`); committed `scenarios/`
+  incl. a deliberately failing reproduce-a-failure fixture
+- [x] Verdict enrichment: tick-time p95/max, entity count, event-log tail on
   failure (checkpoint state snapshots deferred to Phase 2 — see PHASE-1.md)
-- [ ] Actual Three.js `renderer-three` host: scene/camera/loop/resize, input
+- [x] Actual Three.js `renderer-three` host: scene/camera/loop/resize, input
   → Commands via keymap, game-supplied scene sync — zero game knowledge
-- [ ] `apps/demo`: browser-playable toy game (WASD on a plane) whose exact
+- [x] `apps/demo`: browser-playable toy game (WASD on a plane) whose exact
   sim module also passes a headless harness scenario
 - Exit criteria: an agent can build a toy game, run a scenario, read a
   verdict, and reproduce a failure from seed+log — no human eyes needed;
   CI enforces build/lint/purity/smoke on every push. Full testable list in
-  [PHASE-1.md](PHASE-1.md).
+  [PHASE-1.md](PHASE-1.md). **Status: PASS — see
+  [docs/reviews/phase-1.md](reviews/phase-1.md).**
 
 ## Phase 2 — Skill v0.1 + procedural assets
 - `worldforge` skill: scaffold command, invariants, harness workflow,

@@ -1,4 +1,5 @@
 import { Rng } from "./rng.js";
+import type { SimSnapshot } from "./snapshot.js";
 import type { Command, EntityId, GameEvent, IWorld } from "./types.js";
 
 export type System = (world: Sim) => void;
@@ -118,6 +119,24 @@ export class Sim implements IWorld {
       }
     }
     return h >>> 0;
+  }
+
+  /**
+   * Plain-JSON dump of current state — evidence for verdicts, not a restore
+   * point (see SimSnapshot doc comment: no Rng state is captured).
+   */
+  snapshot(): SimSnapshot {
+    const components: Record<string, [EntityId, unknown][]> = {};
+    for (const [name, store] of this.components) {
+      components[name] = [...store.entries()];
+    }
+    return {
+      v: 1,
+      tick: this.tick,
+      nextEntity: this.nextEntity,
+      stateHash: this.stateHash(),
+      components,
+    };
   }
 }
 

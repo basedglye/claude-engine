@@ -38,6 +38,7 @@ export default {
   ticks: 100,
   setup,
   commands,
+  checkpoints: [10, 50, 100],
   assertions: [
     {
       description: "player moved to (4,4)",

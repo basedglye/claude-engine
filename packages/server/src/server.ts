@@ -78,6 +78,14 @@ interface SessionState {
   open: boolean;
 }
 
+/** A queued intent or reserved command, not yet stamped with a tick — see
+ *  the `intake` declaration in startGameServer for why. */
+interface IntakeItem {
+  actor: string;
+  type: string;
+  payload?: unknown;
+}
+
 function percentile(samples: readonly number[], p: number): number {
   if (samples.length === 0) return 0;
   const sorted = [...samples].sort((a, b) => a - b);
@@ -152,13 +160,18 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   const fullCommandLog: Command[] = [];
 
   // Validated intents and reserved join/leave commands are buffered here,
-  // never sim.submit()-ed directly from a socket/close handler. doTick()
-  // drains this synchronously before persisting+stepping, so the copy taken
-  // for the write-ahead append is provably identical to what step() is
-  // about to consume — a message arriving mid-await (while a persistence
-  // store's appendCommands() call is in flight) can no longer land in the
-  // executing tick without being recorded.
-  let intake: Command[] = [];
+  // never sim.submit()-ed directly from a socket/close handler, and
+  // deliberately NOT stamped with a tick at arrival time: a message can
+  // arrive during doTick's `await store.appendCommands(...)` (the only
+  // yield point before step() — ws handlers run freely then), and if we
+  // stamped `sim.tick + 1` at that moment, the command would be persisted
+  // for a tick it won't actually execute in (drain already ran for the
+  // in-flight tick; this item waits for the next one, by which point
+  // step() has advanced sim.tick past the stamp). doTick() drains this
+  // synchronously and stamps `sim.tick + 1` at that instant instead — the
+  // tick it is provably about to execute in — before persisting+stepping,
+  // so the write-ahead copy is guaranteed to describe reality.
+  let intake: IntakeItem[] = [];
 
   let commandsAccepted = 0;
   let commandsRejected = 0;
@@ -193,7 +206,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
   }
 
   function queueReserved(type: "@net/join" | "@net/leave", actor: string, payload: unknown): void {
-    intake.push({ tick: sim.tick + 1, actor, type, payload });
+    intake.push({ actor, type, payload });
   }
 
   const wss = new WebSocketServer({ port });
@@ -305,7 +318,7 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
 
           session.tickCounts.set(intent.type, (session.tickCounts.get(intent.type) ?? 0) + 1);
           commandsAccepted++;
-          intake.push({ tick: sim.tick + 1, actor: session.actor, type: intent.type, payload: intent.payload });
+          intake.push({ actor: session.actor, type: intent.type, payload: intent.payload });
         }
       }
     });
@@ -360,10 +373,16 @@ export async function startGameServer(opts: GameServerOptions): Promise<GameServ
     for (const session of sessions.values()) session.tickCounts.clear();
 
     // Drain intake synchronously (no await between here and the copy below)
-    // — this, not sim.commands() alone, is what guarantees the write-ahead
-    // copy is exactly what step() is about to consume, regardless of how
-    // long the persistence store's own append takes.
-    for (const command of intake) sim.submit(command);
+    // and stamp the tick right now, not at arrival time — sim.tick + 1 is
+    // provably the tick this command is about to execute in only at this
+    // exact instant. Stamping earlier (e.g. when a message arrives during
+    // the previous tick's write-ahead await, before this drain runs) would
+    // record a tick the command doesn't actually execute in once it misses
+    // its intended drain and rides along to the next one instead.
+    const nextTick = sim.tick + 1;
+    for (const item of intake) {
+      sim.submit({ tick: nextTick, actor: item.actor, type: item.type, payload: item.payload });
+    }
     intake = [];
 
     // Write-ahead: persist (and record in the in-memory log) this tick's

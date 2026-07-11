@@ -17,30 +17,54 @@ function check(description, pass) {
   }
 }
 
-function setupGame(sim) {
-  const spawned = new Map(); // playerId -> entity
-  sim.addSystem((s) => {
-    for (const c of s.commands()) {
-      if (c.type === "@net/join") {
-        const entity = s.spawn();
-        s.setComponent(entity, "pos", { x: 0, z: 0 });
-        s.setComponent(entity, "owner", c.payload.playerId);
-        spawned.set(c.payload.playerId, entity);
-      } else if (c.type === "@net/leave") {
-        const entity = spawned.get(c.payload.playerId);
-        if (entity !== undefined) s.removeComponent(entity, "pos");
-      } else if (c.type === "move") {
-        const entity = spawned.get(c.actor.replace(/^player:/, ""));
-        if (entity !== undefined) {
-          const pos = s.getComponent(entity, "pos");
-          if (pos) {
-            pos.x += c.payload.dx;
-            pos.z += c.payload.dz ?? 0;
+/**
+ * A join-based game, component-derived actor->entity lookup (never a
+ * setup-closure Map — see docs/reviews/phase-3.md item 1 / net-api.md).
+ * Also records any command whose stamped tick doesn't match the tick it
+ * actually executes in — the regression check for item 2's tick-stamp bug
+ * (a commutative accumulator game could pass with mis-stamped commands by
+ * coincidence; this check doesn't depend on the game's math at all).
+ */
+function createGameSetup() {
+  const tickMismatches = [];
+  function setup(sim) {
+    sim.addSystem((s) => {
+      for (const c of s.commands()) {
+        if (c.tick !== s.tick) tickMismatches.push({ stampedTick: c.tick, executedTick: s.tick, type: c.type });
+
+        if (c.type === "@net/join") {
+          let existing;
+          for (const [id, owner] of s.withComponent("owner")) {
+            if (owner === c.actor) existing = id;
+          }
+          if (existing !== undefined) continue;
+          const entity = s.spawn();
+          s.setComponent(entity, "pos", { x: 0, z: 0 });
+          s.setComponent(entity, "owner", c.actor);
+        } else if (c.type === "@net/leave") {
+          for (const [id, owner] of s.withComponent("owner")) {
+            if (owner === c.actor) {
+              s.removeComponent(id, "pos");
+              s.removeComponent(id, "owner");
+              break;
+            }
+          }
+        } else if (c.type === "move") {
+          for (const [id, owner] of s.withComponent("owner")) {
+            if (owner === c.actor) {
+              const pos = s.getComponent(id, "pos");
+              if (pos) {
+                pos.x += c.payload.dx;
+                pos.z += c.payload.dz ?? 0;
+              }
+              break;
+            }
           }
         }
       }
-    }
-  });
+    });
+  }
+  return { setup, tickMismatches };
 }
 
 /** Waits for the next message of a specific `t`, discarding anything else —
@@ -109,9 +133,10 @@ const moveRule = { validate: (p) => typeof p?.dx === "number", maxPerTick: 1, ma
 
 // --- live server: auth-failed close, welcome, superseded, validation -------
 {
+  const { setup, tickMismatches } = createGameSetup();
   const server = await startGameServer({
     seed: "server-test-seed",
-    setup: setupGame,
+    setup,
     auth: devAuth(),
     commands: { move: moveRule },
     port: 0,
@@ -160,6 +185,7 @@ const moveRule = { validate: (p) => typeof p?.dx === "number", maxPerTick: 1, ma
   wsA.close();
   wsA2.close();
   await server.stop();
+  check("no command executed on a different tick than it was stamped for", tickMismatches.length === 0);
 }
 
 // --- Scope C session lifecycle (docs/reviews/phase-3.md item 4): a
@@ -167,9 +193,10 @@ const moveRule = { validate: (p) => typeof p?.dx === "number", maxPerTick: 1, ma
 // @net/leave before the new connection's @net/join, so lifecycle stays 1:1
 // with real connections (no orphaned entity, no duplicate join).
 {
+  const { setup } = createGameSetup();
   const lifecycleServer = await startGameServer({
     seed: "server-lifecycle-seed",
-    setup: setupGame,
+    setup,
     auth: devAuth(),
     commands: { move: moveRule },
     port: 0,
@@ -236,9 +263,10 @@ const moveRule = { validate: (p) => typeof p?.dx === "number", maxPerTick: 1, ma
 
   const raceMoveRule = { validate: (p) => typeof p?.dx === "number", maxPerTick: 50, maxPerSecond: 1000 };
   const delayedStore = makeDelayedStore(30);
+  const { setup, tickMismatches } = createGameSetup();
   const raceServer = await startGameServer({
     seed: "server-race-seed",
-    setup: setupGame,
+    setup,
     auth: devAuth(),
     commands: { move: raceMoveRule },
     port: 0,
@@ -271,8 +299,15 @@ const moveRule = { validate: (p) => typeof p?.dx === "number", maxPerTick: 1, ma
   if (accepted !== loggedMoves) {
     console.log(`  accepted=${accepted} loggedMoves=${loggedMoves} totalLogged=${delayedStore.log.length}`);
   }
+  check("write-ahead: no command executed on a different tick than it was stamped for", tickMismatches.length === 0);
+  if (tickMismatches.length > 0) {
+    console.log(`  ${tickMismatches.length} mismatch(es), e.g. ${JSON.stringify(tickMismatches[0])}`);
+  }
 
-  const replayedHashes = replay("server-race-seed", setupGame, delayedStore.log, raceServer.world.tick);
+  // A fresh setup (its own tickMismatches/component state) for the replay
+  // side — this must be a game-logic clone, not the live server's instance.
+  const { setup: replaySetup } = createGameSetup();
+  const replayedHashes = replay("server-race-seed", replaySetup, delayedStore.log, raceServer.world.tick);
   const replayedFinalHash = replayedHashes[replayedHashes.length - 1];
   check(
     "write-ahead: replaying the store's persisted log matches the server's own final hash",

@@ -39,6 +39,7 @@ function parseArgs(argv: readonly string[]): {
   verifyReplay: boolean;
   out: string | undefined;
   browser: boolean;
+  soak: boolean;
   screenshotDir: string | undefined;
   fromCheckpoint: number | undefined;
 } {
@@ -47,6 +48,7 @@ function parseArgs(argv: readonly string[]): {
   let verifyReplayFlag = false;
   let out: string | undefined;
   let browser = false;
+  let soak = false;
   let screenshotDir: string | undefined;
   let fromCheckpoint: number | undefined;
 
@@ -56,6 +58,8 @@ function parseArgs(argv: readonly string[]): {
       verifyReplayFlag = true;
     } else if (arg === "--browser") {
       browser = true;
+    } else if (arg === "--soak") {
+      soak = true;
     } else if (arg === "--out") {
       out = argv[++i];
       if (!out) {
@@ -102,7 +106,7 @@ function parseArgs(argv: readonly string[]): {
     process.exit(2);
   }
 
-  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, screenshotDir, fromCheckpoint };
+  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, soak, screenshotDir, fromCheckpoint };
 }
 
 /** Repo-relative path with forward slashes, for portable storage in a verdict. */
@@ -261,6 +265,56 @@ async function runBrowserMode(
   process.exit(verdict.passed ? 0 : 1);
 }
 
+async function runSoakMode(scenario: Scenario, scenarioPath: string, out: string | undefined): Promise<void> {
+  const { runSoakScenario, SoakInfraError } = await import("./soak.js");
+
+  let result;
+  try {
+    result = await runSoakScenario(scenario, repoRoot);
+  } catch (err) {
+    if (err instanceof SoakInfraError) {
+      console.error(`Soak-mode infra failure for "${scenario.name}": ${err.message}`);
+      process.exit(2);
+      return;
+    }
+    console.error(`Soak-mode run for "${scenario.name}" threw:`);
+    console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+    process.exit(2);
+    return;
+  }
+
+  const sim = new Sim(scenario.seed);
+  scenario.setup(sim);
+  const setupStateHash = sim.stateHash();
+
+  const verdict: Verdict = {
+    scenario: scenario.name,
+    seed: scenario.seed,
+    ticks: result.soak.server.finalTick,
+    passed: result.passed,
+    assertions: [],
+    finalStateHash: result.soak.server.finalStateHash,
+    eventCount: result.eventCount,
+    entityCount: result.entityCount,
+    replay: {
+      seed: scenario.seed,
+      commands: result.commands,
+      scenarioModule: toRepoRelative(scenarioPath),
+      ticks: result.soak.server.finalTick,
+      setupStateHash,
+    },
+    perf: { totalMs: 0, avgTickMs: 0, p95TickMs: 0, maxTickMs: 0 },
+    soak: result.soak,
+  };
+
+  const json = JSON.stringify(verdict, null, 2);
+  console.log(json);
+  if (out) {
+    writeFileSync(out, json, "utf8");
+  }
+  process.exit(verdict.passed ? 0 : 1);
+}
+
 async function main(): Promise<void> {
   const {
     scenario: spec,
@@ -268,6 +322,7 @@ async function main(): Promise<void> {
     verifyReplay: shouldVerifyReplay,
     out,
     browser,
+    soak,
     screenshotDir,
     fromCheckpoint,
   } = parseArgs(process.argv.slice(2));
@@ -291,6 +346,11 @@ async function main(): Promise<void> {
 
   if (browser) {
     await runBrowserMode(scenario, scenarioPath, screenshotDir, out);
+    return;
+  }
+
+  if (soak) {
+    await runSoakMode(scenario, scenarioPath, out);
     return;
   }
 

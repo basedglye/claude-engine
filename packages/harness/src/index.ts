@@ -31,6 +31,19 @@ export interface Scenario {
   /** Headless bot drivers; their emitted commands are recorded into the
    *  verdict's replay bundle, so replay needs no bot code. */
   bots?: readonly BotDriver[];
+  /** Server-side config for --soak (the game vocabulary the engine can't
+   *  infer): { commands: Record<string, CommandRule>; interest?:
+   *  InterestPolicy; filterEvent?: (...) => boolean } — kept as `unknown`
+   *  here (cast in soak.ts) the same way `browser` is, to avoid a static
+   *  dependency on @claude-engine/server from this module. */
+  net?: unknown;
+  /** Present iff this scenario supports --soak runs (see
+   *  @claude-engine/harness/soak's SoakSpec) — same `unknown`-typed pattern
+   *  as `browser` for the same reason. */
+  soak?: unknown;
+  /** Bounds on SoakReport keys, e.g. { "server.tickP95Ms": { max: 50 } }.
+   *  Evaluated only in --soak runs (feelTargets stays browser-only). */
+  soakTargets?: Record<string, { min?: number; max?: number }>;
 }
 
 export interface Checkpoint {
@@ -76,6 +89,8 @@ export interface Verdict {
   checkpoints?: Checkpoint[];
   /** Present iff run with --browser (see @claude-engine/harness/browser). */
   browser?: unknown;
+  /** Present iff run with --soak (see @claude-engine/harness/soak). */
+  soak?: unknown;
 }
 
 export function runScenario(scenario: Scenario): Verdict {

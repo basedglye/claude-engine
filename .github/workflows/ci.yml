@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, phase-1, phase-2]
+    branches: [main, phase-1, phase-2, phase-3]
   pull_request:
-    branches: [main, phase-1, phase-2]
+    branches: [main, phase-1, phase-2, phase-3]
 
 jobs:
   ci:
@@ -44,13 +44,36 @@ jobs:
       - name: Assets determinism tests
         run: npm run test --workspace @claude-engine/assets
 
+      - name: Core unit tests (Rng state, forkRng, Sim.restore)
+        run: npm run test --workspace @claude-engine/core
+
+      - name: Net unit tests (protocol, client prediction/reconciliation)
+        run: npm run test --workspace @claude-engine/net
+
+      - name: Bots unit tests
+        run: npm run test --workspace @claude-engine/bots
+
+      - name: Server unit tests (auth, validation, rate limiting)
+        run: npm run test --workspace @claude-engine/server
+
       - name: Harness smoke scenario
         run: npm run harness --silent -- smoke
 
-      - name: Harness checkpoint + replay-from-verdict
+      - name: Harness checkpoint + replay-from-verdict (+ --from-checkpoint)
         run: |
           npm run harness --silent -- smoke --out /tmp/smoke-verdict.json
           npm run harness --silent -- --replay /tmp/smoke-verdict.json
+          npm run harness --silent -- --replay /tmp/smoke-verdict.json --from-checkpoint 50
+
+      - name: Harness bots-headless scenario (--verify-replay)
+        run: npm run harness --silent -- bots-headless --verify-replay
+
+      - name: Harness soak scenarios (net-walk, net-interest, net-abuse, soak-ci)
+        run: |
+          npm run harness --silent -- net-walk --soak
+          npm run harness --silent -- net-interest --soak
+          npm run harness --silent -- net-abuse --soak
+          npm run harness --silent -- soak-ci --soak
 
       - name: Asset import pipeline fixtures
         run: |
@@ -77,6 +100,48 @@ jobs:
             rm -rf "apps/$app"
             npm install
           done
+
+  persistence:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: claude_engine
+          POSTGRES_PASSWORD: claude_engine
+          POSTGRES_DB: claude_engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U claude_engine"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    strategy:
+      matrix:
+        node-version: [22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Persistence tests (SQLite + Postgres conformance/crash-recovery)
+        env:
+          DATABASE_URL: postgres://claude_engine:claude_engine@localhost:5432/claude_engine_test
+        run: npm run test --workspace @claude-engine/persistence
 
   browser:
     runs-on: ubuntu-latest

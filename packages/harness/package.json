@@ -18,7 +18,10 @@
     "start": "node dist/cli.js"
   },
   "dependencies": {
-    "@claude-engine/core": "*"
+    "@claude-engine/core": "*",
+    "@claude-engine/bots": "*",
+    "@claude-engine/net": "*",
+    "@claude-engine/server": "*"
   },
   "peerDependencies": {
     "playwright": "^1.61.0"

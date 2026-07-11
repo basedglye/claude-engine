@@ -51,7 +51,7 @@ export function setup(sim: Sim): void {
   sim.setComponent<GridPos>(player, "pos", { x: 0, y: 0 });
   sim.setComponent<GridPos>(player, "prevPos", { x: 0, y: 0 });
   sim.setComponent<PlayerHp>(player, "hp", { value: 100 });
-  const hazard = sim.rng.fork("hazard");
+  const hazard = sim.forkRng("hazard");
 
   // Grid movement system: one tile per "move" command.
   sim.addSystem((s) => {

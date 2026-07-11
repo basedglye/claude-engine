@@ -1,0 +1,17 @@
+{
+  "name": "@claude-engine/bots",
+  "version": "0.0.1",
+  "description": "Goal-driven bot drivers — read IWorld, return CommandIntents, never touch a Sim — reusable as harness/soak load-test traffic",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "@claude-engine/net": "*"
+  }
+}

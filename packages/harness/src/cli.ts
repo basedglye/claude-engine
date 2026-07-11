@@ -2,10 +2,12 @@
 /**
  * Harness CLI — makes `npm run harness -- <scenario>` real.
  *
- * Contract (docs/PHASE-1.md, section C; extended by docs/PHASE-2.md, Scope D/E):
+ * Contract (docs/PHASE-1.md, section C; extended by docs/PHASE-2.md Scope D/E
+ * and docs/PHASE-3.md Scope A):
  *   npm run harness -- <scenario> [--verify-replay] [--out <file>]
- *                                 [--browser] [--screenshot-dir <dir>]
+ *                                 [--browser] [--screenshot-dir <dir>] [--soak]
  *   npm run harness -- --replay <verdict.json> [--out <file>]
+ *                                 [--from-checkpoint <tick>]
  *
  * stdout carries exactly one JSON document (the Verdict, or ReplayVerdict in
  * --replay mode) and nothing else. All human-readable diagnostics go to
@@ -13,17 +15,19 @@
  *   0 — all assertions passed (and replay verified, if requested)
  *   1 — one or more assertions failed (or, in --browser mode, a browser check failed)
  *   2 — scenario failed to load or threw mid-run; in --replay mode, the
- *       verdict/module was unreadable or the scenario module has drifted
- *       since the verdict was produced (setupStateHash mismatch); in
- *       --browser mode, an infra failure (build/serve/hook timeout/missing Playwright)
+ *       verdict/module was unreadable, the scenario module has drifted since
+ *       the verdict was produced (setupStateHash mismatch), or (with
+ *       --from-checkpoint) the named tick has no checkpoint / a v:1
+ *       (evidence-only) snapshot; in --browser mode, an infra failure
+ *       (build/serve/hook timeout/missing Playwright)
  *   3 — replay divergence (under --verify-replay, or in --replay mode)
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve, isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Sim } from "@claude-engine/core";
+import { Sim, RestoreError } from "@claude-engine/core";
 import type { Scenario, Verdict } from "./index.js";
-import { runScenario, verifyReplay, replayVerdict } from "./index.js";
+import { runScenario, verifyReplay, replayVerdict, replayVerdictFromCheckpoint, CheckpointError } from "./index.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 // dist/cli.js -> packages/harness/dist -> packages/harness -> packages -> repo root
@@ -35,14 +39,18 @@ function parseArgs(argv: readonly string[]): {
   verifyReplay: boolean;
   out: string | undefined;
   browser: boolean;
+  soak: boolean;
   screenshotDir: string | undefined;
+  fromCheckpoint: number | undefined;
 } {
   let scenario: string | undefined;
   let replay: string | undefined;
   let verifyReplayFlag = false;
   let out: string | undefined;
   let browser = false;
+  let soak = false;
   let screenshotDir: string | undefined;
+  let fromCheckpoint: number | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -50,6 +58,8 @@ function parseArgs(argv: readonly string[]): {
       verifyReplayFlag = true;
     } else if (arg === "--browser") {
       browser = true;
+    } else if (arg === "--soak") {
+      soak = true;
     } else if (arg === "--out") {
       out = argv[++i];
       if (!out) {
@@ -62,6 +72,14 @@ function parseArgs(argv: readonly string[]): {
         console.error("--screenshot-dir requires a directory path argument");
         process.exit(2);
       }
+    } else if (arg === "--from-checkpoint") {
+      const raw = argv[++i];
+      const tick = raw ? Number(raw) : NaN;
+      if (!raw || !Number.isInteger(tick)) {
+        console.error("--from-checkpoint requires an integer tick argument");
+        process.exit(2);
+      }
+      fromCheckpoint = tick;
     } else if (arg === "--replay") {
       replay = argv[++i];
       if (!replay) {
@@ -78,13 +96,17 @@ function parseArgs(argv: readonly string[]): {
 
   if (!scenario && !replay) {
     console.error(
-      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--screenshot-dir <dir>]\n" +
-        "       npm run harness -- --replay <verdict.json> [--out <file>]"
+      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--screenshot-dir <dir>] [--soak]\n" +
+        "       npm run harness -- --replay <verdict.json> [--out <file>] [--from-checkpoint <tick>]"
     );
     process.exit(2);
   }
+  if (fromCheckpoint !== undefined && !replay) {
+    console.error("--from-checkpoint is only valid with --replay");
+    process.exit(2);
+  }
 
-  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, screenshotDir };
+  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, soak, screenshotDir, fromCheckpoint };
 }
 
 /** Repo-relative path with forward slashes, for portable storage in a verdict. */
@@ -121,7 +143,11 @@ async function loadScenario(path: string): Promise<Scenario> {
   return scenario;
 }
 
-async function runReplayMode(replaySpec: string, out: string | undefined): Promise<void> {
+async function runReplayMode(
+  replaySpec: string,
+  out: string | undefined,
+  fromCheckpoint: number | undefined
+): Promise<void> {
   const verdictPath = isAbsolute(replaySpec)
     ? replaySpec
     : resolve(process.env.INIT_CWD ?? process.cwd(), replaySpec);
@@ -154,7 +180,20 @@ async function runReplayMode(replaySpec: string, out: string | undefined): Promi
     return;
   }
 
-  const result = replayVerdict(scenario, verdict, replaySpec);
+  let result;
+  try {
+    result =
+      fromCheckpoint === undefined
+        ? replayVerdict(scenario, verdict, replaySpec)
+        : replayVerdictFromCheckpoint(scenario, verdict, fromCheckpoint, replaySpec);
+  } catch (err) {
+    if (err instanceof CheckpointError || err instanceof RestoreError) {
+      console.error(err.message);
+      process.exit(2);
+      return;
+    }
+    throw err;
+  }
   const json = JSON.stringify(result, null, 2);
   console.log(json);
   if (out) {
@@ -226,6 +265,56 @@ async function runBrowserMode(
   process.exit(verdict.passed ? 0 : 1);
 }
 
+async function runSoakMode(scenario: Scenario, scenarioPath: string, out: string | undefined): Promise<void> {
+  const { runSoakScenario, SoakInfraError } = await import("./soak.js");
+
+  let result;
+  try {
+    result = await runSoakScenario(scenario, repoRoot);
+  } catch (err) {
+    if (err instanceof SoakInfraError) {
+      console.error(`Soak-mode infra failure for "${scenario.name}": ${err.message}`);
+      process.exit(2);
+      return;
+    }
+    console.error(`Soak-mode run for "${scenario.name}" threw:`);
+    console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+    process.exit(2);
+    return;
+  }
+
+  const sim = new Sim(scenario.seed);
+  scenario.setup(sim);
+  const setupStateHash = sim.stateHash();
+
+  const verdict: Verdict = {
+    scenario: scenario.name,
+    seed: scenario.seed,
+    ticks: result.soak.server.finalTick,
+    passed: result.passed,
+    assertions: [],
+    finalStateHash: result.soak.server.finalStateHash,
+    eventCount: result.eventCount,
+    entityCount: result.entityCount,
+    replay: {
+      seed: scenario.seed,
+      commands: result.commands,
+      scenarioModule: toRepoRelative(scenarioPath),
+      ticks: result.soak.server.finalTick,
+      setupStateHash,
+    },
+    perf: { totalMs: 0, avgTickMs: 0, p95TickMs: 0, maxTickMs: 0 },
+    soak: result.soak,
+  };
+
+  const json = JSON.stringify(verdict, null, 2);
+  console.log(json);
+  if (out) {
+    writeFileSync(out, json, "utf8");
+  }
+  process.exit(verdict.passed ? 0 : 1);
+}
+
 async function main(): Promise<void> {
   const {
     scenario: spec,
@@ -233,11 +322,13 @@ async function main(): Promise<void> {
     verifyReplay: shouldVerifyReplay,
     out,
     browser,
+    soak,
     screenshotDir,
+    fromCheckpoint,
   } = parseArgs(process.argv.slice(2));
 
   if (replaySpec) {
-    await runReplayMode(replaySpec, out);
+    await runReplayMode(replaySpec, out, fromCheckpoint);
     return;
   }
 
@@ -258,6 +349,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (soak) {
+    await runSoakMode(scenario, scenarioPath, out);
+    return;
+  }
+
   let verdict;
   try {
     verdict = runScenario(scenario);
@@ -270,7 +366,7 @@ async function main(): Promise<void> {
   verdict.replay.scenarioModule = toRepoRelative(scenarioPath);
 
   if (shouldVerifyReplay) {
-    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash);
+    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands);
   }
 
   const json = JSON.stringify(verdict, null, 2);

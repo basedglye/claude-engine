@@ -8,11 +8,15 @@
   "scripts": {
     "dev": "vite",
     "build:game": "tsc -p tsconfig.game.json",
-    "build": "npm run build:game && vite build"
+    "build:server": "tsc -p tsconfig.server.json",
+    "build": "npm run build:game && vite build",
+    "serve": "npm run build:server --silent && node dist-server/server.js"
   },
   "dependencies": {
     "@claude-engine/core": "*",
-    "@claude-engine/renderer-three": "*"
+    "@claude-engine/net": "*",
+    "@claude-engine/renderer-three": "*",
+    "@claude-engine/server": "*"
   },
   "devDependencies": {
     "vite": "^5.4.0"

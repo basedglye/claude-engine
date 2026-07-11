@@ -119,6 +119,18 @@ against budgets, and on success copies the asset into
 `apps/<app-name>/assets/` with a manifest entry. See
 `references/assets-api.md` for the full gate list and budgets.
 
+## Workflow: multiplayer
+
+Netcode, persistence, auth, and input validation are engine packages
+(`@claude-engine/net`/`server`/`persistence`/`bots`) — never hand-roll a
+socket, SQL, or a token in game code. Full API + a worked example
+(`apps/demo`'s net mode) in `references/net-api.md`. In short: the same
+`setup(sim)` that runs single-player also runs on the authoritative server,
+plus one addition — a system reacting to `"@net/join"`/`"@net/leave"`
+commands to spawn/despawn player entities. Verify with the harness's
+`--soak` mode (real server, real WebSocket bot clients, a replay-able
+command log) before ever opening a browser tab.
+
 ## Design guidance
 
 - Keep systems small and data-driven; content (quests, NPCs, items) belongs

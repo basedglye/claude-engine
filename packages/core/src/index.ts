@@ -1,6 +1,6 @@
-export { Rng } from "./rng.js";
-export { Sim, replay, type System } from "./sim.js";
-export { type SimSnapshot } from "./snapshot.js";
+export { Rng, type RngState } from "./rng.js";
+export { Sim, replay, RestoreError, type System } from "./sim.js";
+export { type SimSnapshot, type SimSnapshotV1 } from "./snapshot.js";
 export {
   TICK_RATE_HZ,
   TICK_MS,

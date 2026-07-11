@@ -142,6 +142,16 @@ const PURITY_ROOTS = [
     dir: path.join(REPO_ROOT, 'packages', 'assets', 'src'),
     excludeDirNames: new Set(['web']),
   },
+  {
+    name: 'packages/net/src (excluding src/web)',
+    dir: path.join(REPO_ROOT, 'packages', 'net', 'src'),
+    excludeDirNames: new Set(['web']),
+  },
+  {
+    name: 'packages/bots/src',
+    dir: path.join(REPO_ROOT, 'packages', 'bots', 'src'),
+    excludeDirNames: new Set(),
+  },
 ];
 
 function runSelfTest() {
@@ -187,39 +197,66 @@ function runSelfTest() {
     const hasMathRandomViolation = violations3.some((v) => v.type === 'math-random');
     const hasSpacedBuiltinViolation = violations4.some((v) => v.type === 'node-builtin-import');
 
-    // Test 5: the assets purity root is actually scanned, and its /web
-    // exclusion actually excludes (docs/PHASE-2.md Scope B enforcement
-    // extension) — exercised through the real scanDirectory()/PURITY_ROOTS
-    // machinery, not scanFile() in isolation.
-    const assetsRoot = PURITY_ROOTS.find((r) => r.name.startsWith('packages/assets'));
-    let hasAssetsPathViolation = false;
-    let webPathCorrectlyExcluded = true;
-    if (assetsRoot && fs.existsSync(assetsRoot.dir)) {
-      const assetsSelfTestDir = path.join(assetsRoot.dir, '.tmp-purity-selftest');
-      const webSelfTestDir = path.join(assetsRoot.dir, 'web', '.tmp-purity-selftest');
-      fs.mkdirSync(assetsSelfTestDir, { recursive: true });
+    // Test 5+: for each purity root that ships a /web exclusion, plant a
+    // Math.random violation in the pure root and a three-import "violation"
+    // in web/ — exercised through the real scanDirectory()/PURITY_ROOTS
+    // machinery (not scanFile() in isolation), confirming both that the
+    // root is actually scanned AND that its web/ exclusion actually excludes.
+    function testWebExclusion(rootNamePrefix) {
+      const root = PURITY_ROOTS.find((r) => r.name.startsWith(rootNamePrefix));
+      if (!root || !fs.existsSync(root.dir)) return { hasPathViolation: false, webCorrectlyExcluded: true, ran: false };
+      const rootSelfTestDir = path.join(root.dir, '.tmp-purity-selftest');
+      const webSelfTestDir = path.join(root.dir, 'web', '.tmp-purity-selftest');
+      fs.mkdirSync(rootSelfTestDir, { recursive: true });
       fs.mkdirSync(webSelfTestDir, { recursive: true });
-      const assetsBadFile = path.join(assetsSelfTestDir, 'bad.ts');
+      const rootBadFile = path.join(rootSelfTestDir, 'bad.ts');
       const webBadFile = path.join(webSelfTestDir, 'bad.ts');
-      fs.writeFileSync(assetsBadFile, "const x = Math.random();\n");
+      fs.writeFileSync(rootBadFile, "const x = Math.random();\n");
       fs.writeFileSync(webBadFile, "import * as THREE from 'three';\n");
       try {
-        const assetsScan = scanDirectory(assetsRoot.dir, { excludeDirNames: assetsRoot.excludeDirNames });
-        hasAssetsPathViolation = assetsScan.some((v) => v.file === assetsBadFile);
-        webPathCorrectlyExcluded = !assetsScan.some((v) => v.file === webBadFile);
+        const scan = scanDirectory(root.dir, { excludeDirNames: root.excludeDirNames });
+        return {
+          hasPathViolation: scan.some((v) => v.file === rootBadFile),
+          webCorrectlyExcluded: !scan.some((v) => v.file === webBadFile),
+          ran: true,
+        };
       } finally {
-        fs.rmSync(assetsSelfTestDir, { recursive: true, force: true });
+        fs.rmSync(rootSelfTestDir, { recursive: true, force: true });
         fs.rmSync(webSelfTestDir, { recursive: true, force: true });
       }
     }
+
+    // Test: a purity root with no /web exclusion (bots) still gets a planted-
+    // violation check — docs/PHASE-3.md exit criterion 1 names it explicitly.
+    function testPlainRoot(rootNamePrefix) {
+      const root = PURITY_ROOTS.find((r) => r.name.startsWith(rootNamePrefix));
+      if (!root || !fs.existsSync(root.dir)) return { hasPathViolation: false, ran: false };
+      const selfTestDir = path.join(root.dir, '.tmp-purity-selftest');
+      fs.mkdirSync(selfTestDir, { recursive: true });
+      const badFile = path.join(selfTestDir, 'bad.ts');
+      fs.writeFileSync(badFile, "const x = Math.random();\n");
+      try {
+        const scan = scanDirectory(root.dir, { excludeDirNames: root.excludeDirNames });
+        return { hasPathViolation: scan.some((v) => v.file === badFile), ran: true };
+      } finally {
+        fs.rmSync(selfTestDir, { recursive: true, force: true });
+      }
+    }
+
+    const assetsCheck = testWebExclusion('packages/assets');
+    const netCheck = testWebExclusion('packages/net');
+    const botsCheck = testPlainRoot('packages/bots');
 
     const allPass =
       hasThreeViolation &&
       hasNodeBuiltinViolation &&
       hasMathRandomViolation &&
       hasSpacedBuiltinViolation &&
-      hasAssetsPathViolation &&
-      webPathCorrectlyExcluded;
+      assetsCheck.hasPathViolation &&
+      assetsCheck.webCorrectlyExcluded &&
+      netCheck.hasPathViolation &&
+      netCheck.webCorrectlyExcluded &&
+      botsCheck.hasPathViolation;
 
     if (allPass) {
       console.log('PASS: Self-test detected all violation classes');
@@ -229,6 +266,9 @@ function runSelfTest() {
       console.log(`  - Node builtin, space before closing paren (require('fs' )): CAUGHT`);
       console.log(`  - Math.random planted in packages/assets/src: CAUGHT`);
       console.log(`  - three import planted in packages/assets/src/web: correctly EXCLUDED`);
+      console.log(`  - Math.random planted in packages/net/src: CAUGHT`);
+      console.log(`  - three import planted in packages/net/src/web: correctly EXCLUDED`);
+      console.log(`  - Math.random planted in packages/bots/src: CAUGHT`);
       return 0;
     } else {
       console.error('FAIL: Self-test did not detect all violations');
@@ -236,8 +276,11 @@ function runSelfTest() {
       if (!hasNodeBuiltinViolation) console.error('  - Node builtin: NOT CAUGHT');
       if (!hasMathRandomViolation) console.error('  - Math.random: NOT CAUGHT');
       if (!hasSpacedBuiltinViolation) console.error("  - Node builtin require('fs' ) (spaced): NOT CAUGHT");
-      if (!hasAssetsPathViolation) console.error('  - Math.random planted in packages/assets/src: NOT CAUGHT');
-      if (!webPathCorrectlyExcluded) console.error('  - packages/assets/src/web exclusion: NOT WORKING (false positive)');
+      if (!assetsCheck.hasPathViolation) console.error('  - Math.random planted in packages/assets/src: NOT CAUGHT');
+      if (!assetsCheck.webCorrectlyExcluded) console.error('  - packages/assets/src/web exclusion: NOT WORKING (false positive)');
+      if (!netCheck.hasPathViolation) console.error('  - Math.random planted in packages/net/src: NOT CAUGHT');
+      if (!netCheck.webCorrectlyExcluded) console.error('  - packages/net/src/web exclusion: NOT WORKING (false positive)');
+      if (!botsCheck.hasPathViolation) console.error('  - Math.random planted in packages/bots/src: NOT CAUGHT');
       return 1;
     }
   } finally {

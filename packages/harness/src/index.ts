@@ -1,4 +1,9 @@
 import { Sim, type Command, type GameEvent, type SimSnapshot } from "@claude-engine/core";
+import type { BotDriver } from "@claude-engine/bots";
+
+/** Thrown when --from-checkpoint names a tick with no checkpoint, or one
+ *  whose snapshot predates Sim.restore() support (v: 1). */
+export class CheckpointError extends Error {}
 
 /**
  * Harness v0: run a scenario against a sim and return a structured verdict.
@@ -23,6 +28,22 @@ export interface Scenario {
   browser?: unknown;
   /** Bounds on probe result keys, e.g. { "fps.avg": { min: 30 } }. Evaluated only in --browser runs. */
   feelTargets?: Record<string, { min?: number; max?: number }>;
+  /** Headless bot drivers; their emitted commands are recorded into the
+   *  verdict's replay bundle, so replay needs no bot code. */
+  bots?: readonly BotDriver[];
+  /** Server-side config for --soak (the game vocabulary the engine can't
+   *  infer): { commands: Record<string, CommandRule>; interest?:
+   *  InterestPolicy; filterEvent?: (...) => boolean } — kept as `unknown`
+   *  here (cast in soak.ts) the same way `browser` is, to avoid a static
+   *  dependency on @claude-engine/server from this module. */
+  net?: unknown;
+  /** Present iff this scenario supports --soak runs (see
+   *  @claude-engine/harness/soak's SoakSpec) — same `unknown`-typed pattern
+   *  as `browser` for the same reason. */
+  soak?: unknown;
+  /** Bounds on SoakReport keys, e.g. { "server.tickP95Ms": { max: 50 } }.
+   *  Evaluated only in --soak runs (feelTargets stays browser-only). */
+  soakTargets?: Record<string, { min?: number; max?: number }>;
 }
 
 export interface Checkpoint {
@@ -68,6 +89,8 @@ export interface Verdict {
   checkpoints?: Checkpoint[];
   /** Present iff run with --browser (see @claude-engine/harness/browser). */
   browser?: unknown;
+  /** Present iff run with --soak (see @claude-engine/harness/soak). */
+  soak?: unknown;
 }
 
 export function runScenario(scenario: Scenario): Verdict {
@@ -83,11 +106,25 @@ export function runScenario(scenario: Scenario): Verdict {
   }
   const checkpointTicks = new Set(scenario.checkpoints ?? []);
   const checkpoints: Checkpoint[] = [];
+  // Only built (and only used for verdict.replay.commands) when bots are
+  // present — a bot-free scenario's replay bundle stays byte-identical to
+  // `scenario.commands ?? []`, unaffected by tick-grouping order.
+  const submittedCommands: Command[] | undefined = scenario.bots ? [] : undefined;
 
   const tickMs: number[] = [];
   const start = performance.now();
   for (let t = 1; t <= scenario.ticks; t++) {
-    for (const c of byTick.get(t) ?? []) sim.submit(c);
+    for (const c of byTick.get(t) ?? []) {
+      sim.submit(c);
+      submittedCommands?.push(c);
+    }
+    for (const bot of scenario.bots ?? []) {
+      for (const intent of bot.act(sim, t)) {
+        const command: Command = { tick: t, actor: bot.actor, type: intent.type, payload: intent.payload };
+        sim.submit(command);
+        submittedCommands?.push(command);
+      }
+    }
     const tickStart = performance.now();
     sim.step();
     tickMs.push(performance.now() - tickStart);
@@ -122,7 +159,7 @@ export function runScenario(scenario: Scenario): Verdict {
     entityCount: countEntities(sim),
     replay: {
       seed: scenario.seed,
-      commands: scenario.commands ?? [],
+      commands: submittedCommands ?? scenario.commands ?? [],
       ticks: scenario.ticks,
       setupStateHash,
     },
@@ -137,15 +174,21 @@ export function runScenario(scenario: Scenario): Verdict {
   };
 }
 
-/** Replay the given (seed, commands) against a fresh sim and compare the final state hash. */
+/**
+ * Replay the given (seed, commands) against a fresh sim and compare the
+ * final state hash. `commands` defaults to `scenario.commands` (existing
+ * callers unchanged); the CLI's --verify-replay passes a bot scenario's
+ * *recorded* command log instead, so replay never needs to run bot code.
+ */
 export function verifyReplay(
   scenario: Scenario,
-  expectedHash: number
+  expectedHash: number,
+  commands?: readonly Command[]
 ): { verified: boolean; expectedHash: number; actualHash: number } {
   const sim = new Sim(scenario.seed);
   scenario.setup(sim);
   const byTick = new Map<number, Command[]>();
-  for (const c of scenario.commands ?? []) {
+  for (const c of commands ?? scenario.commands ?? []) {
     const list = byTick.get(c.tick) ?? [];
     list.push(c);
     byTick.set(c.tick, list);
@@ -210,6 +253,86 @@ export function replayVerdict(scenario: Scenario, verdict: Verdict, source: stri
     for (const c of byTick.get(t) ?? []) sim.submit(c);
     sim.step();
     const expected = checkpointTicks.get(t);
+    if (expected) {
+      const actual = sim.stateHash();
+      checkpointResults.push({ tick: t, expected: expected.stateHash, actual, match: actual === expected.stateHash });
+    }
+  }
+
+  const actualFinalHash = sim.stateHash();
+  return {
+    source,
+    scenarioModule,
+    verified: actualFinalHash === verdict.finalStateHash && checkpointResults.every((c) => c.match),
+    expectedFinalHash: verdict.finalStateHash,
+    actualFinalHash,
+    setupDrift: false,
+    ...(checkpointResults.length > 0 ? { checkpointResults } : {}),
+  };
+}
+
+/**
+ * Like replayVerdict, but resumes from a checkpoint's v2 snapshot instead of
+ * replaying from tick 1 (Sim.restore(), Scope A). Still runs setup() first —
+ * systems are code and are never serialized — and still checks setupStateHash
+ * before restoring, so module drift is diagnosed the same way as full replay.
+ * Only commands after `fromTick` are injected; only checkpoints after
+ * `fromTick` are compared.
+ */
+export function replayVerdictFromCheckpoint(
+  scenario: Scenario,
+  verdict: Verdict,
+  fromTick: number,
+  source: string
+): ReplayVerdict {
+  const scenarioModule = verdict.replay.scenarioModule ?? "";
+  const checkpoint = (verdict.checkpoints ?? []).find((c) => c.tick === fromTick);
+  if (!checkpoint) {
+    throw new CheckpointError(`No checkpoint at tick ${fromTick} in this verdict`);
+  }
+  if (checkpoint.snapshot.v !== 2) {
+    throw new CheckpointError(
+      `Checkpoint at tick ${fromTick} is a v:${checkpoint.snapshot.v} snapshot (evidence-only, not restorable) — re-run without --from-checkpoint`
+    );
+  }
+
+  const sim = new Sim(verdict.replay.seed);
+  scenario.setup(sim);
+  const setupStateHash = sim.stateHash();
+
+  if (
+    verdict.replay.setupStateHash !== undefined &&
+    setupStateHash !== verdict.replay.setupStateHash
+  ) {
+    return {
+      source,
+      scenarioModule,
+      verified: false,
+      expectedFinalHash: verdict.finalStateHash,
+      actualFinalHash: setupStateHash,
+      setupDrift: true,
+    };
+  }
+
+  sim.restore(checkpoint.snapshot);
+
+  const byTick = new Map<number, Command[]>();
+  for (const c of verdict.replay.commands) {
+    if (c.tick <= fromTick) continue;
+    const list = byTick.get(c.tick) ?? [];
+    list.push(c);
+    byTick.set(c.tick, list);
+  }
+  const laterCheckpoints = new Map(
+    (verdict.checkpoints ?? []).filter((c) => c.tick > fromTick).map((c) => [c.tick, c])
+  );
+  const checkpointResults: { tick: number; expected: number; actual: number; match: boolean }[] = [];
+
+  const ticks = verdict.replay.ticks ?? verdict.ticks;
+  for (let t = fromTick + 1; t <= ticks; t++) {
+    for (const c of byTick.get(t) ?? []) sim.submit(c);
+    sim.step();
+    const expected = laterCheckpoints.get(t);
     if (expected) {
       const actual = sim.stateHash();
       checkpointResults.push({ tick: t, expected: expected.stateHash, actual, match: actual === expected.stateHash });

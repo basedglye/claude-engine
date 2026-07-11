@@ -1,0 +1,26 @@
+{
+  "name": "@claude-engine/net",
+  "version": "0.0.1",
+  "description": "Wire protocol + client session (prediction/reconciliation) — the multiplayer portability boundary; /web ships the real WebSocket transport",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web/index.d.ts",
+      "default": "./dist/web/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*"
+  }
+}

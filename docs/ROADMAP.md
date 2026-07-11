@@ -50,29 +50,29 @@ carried from Phase 0.
   [docs/reviews/phase-2.md](reviews/phase-2.md).**
 
 ## Phase 3 — Multiplayer + persistence (the Claudecraft critique, answered) (spec: [PHASE-3.md](PHASE-3.md))
-- [ ] `Sim.restore()` + tracked Rng forks (`Sim.forkRng`), snapshot v2,
+- [x] `Sim.restore()` + tracked Rng forks (`Sim.forkRng`), snapshot v2,
   `--replay --from-checkpoint` (the carryover deferred from Phases 1–2,
   co-designed with persistence per PHASE-2.md Scope D)
-- [ ] `@claude-engine/net`: versioned wire protocol (pure root, the
+- [x] `@claude-engine/net`: versioned wire protocol (pure root, the
   portability boundary) + client session with prediction/reconciliation
   and remote-entity interpolation data; browser WebSocket adapter
-- [ ] `@claude-engine/server`: authoritative Node host — pluggable
+- [x] `@claude-engine/server`: authoritative Node host — pluggable
   auth/session (HMAC tickets v0), input validation + rate limiting at the
   boundary, interest management, join/leave as replayable commands
-- [ ] `@claude-engine/persistence`: event-sourced GameStore (write-ahead
+- [x] `@claude-engine/persistence`: event-sourced GameStore (write-ahead
   command log + snapshots), SQLite dev / Postgres prod, hash-equivalent
   crash recovery via `recoverSim`
-- [ ] `@claude-engine/bots` + harness `Scenario.bots`; soak mode (`--soak`)
+- [x] `@claude-engine/bots` + harness `Scenario.bots`; soak mode (`--soak`)
   with structured `SoakReport` verdicts; committed net-walk / net-interest /
   net-abuse / soak scenarios
-- [ ] apps/demo net mode (server entry + `?net=` client); skill
+- [x] apps/demo net mode (server entry + `?net=` client); skill
   `references/net-api.md`; purity/CI coverage extended to the new packages
 - Exit criteria: a persisted multiplayer session survives a server restart
   with replay-equivalent state, abusive clients are rejected at the boundary
   without perturbing the sim, and a 50-bot soak passes its perf targets —
   all machine-verdicted. Full 13-item testable list in
-  [PHASE-3.md](PHASE-3.md). **Status: planned — spec committed,
-  implementation not started.**
+  [PHASE-3.md](PHASE-3.md). **Status: PASS — see
+  [docs/reviews/phase-3.md](reviews/phase-3.md).**
 
 ## Phase 4 — Flagship: the living world
 - `apps/living-world`: zones, quests, multiplayer on the engine

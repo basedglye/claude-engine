@@ -22,6 +22,15 @@ that idea applied to an entire engine.
    validation live in engine packages and are human-reviewed. Generated game
    code must not roll its own.
 
+## Development loop
+
+This project runs the tiered phase loop in [docs/WORKFLOW.md](docs/WORKFLOW.md):
+Fable 5 plans each phase → Sonnet 5 implements with Haiku 4.5 worker
+subagents → Fable 5 reviews the phase against the spec and these invariants
+(verdict committed to `docs/reviews/phase-N.md`) → Sonnet fixes until the
+review passes → merge, next phase. Invariant or public-contract changes are
+always escalated to a Fable planning turn.
+
 ## Working conventions
 
 - TypeScript strict mode everywhere; npm workspaces monorepo.

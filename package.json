@@ -11,9 +11,14 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "node scripts/smoke.mjs",
-    "harness": "npm run start --workspace @claude-engine/harness --"
+    "harness": "npm run start --workspace @claude-engine/harness --",
+    "lint": "eslint .",
+    "check:purity": "node scripts/check-purity.mjs"
   },
   "devDependencies": {
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "eslint": "^9.13.0",
+    "typescript-eslint": "^8.11.0",
+    "@types/node": "^22.9.0"
   }
 }

@@ -182,14 +182,25 @@ disposes GPU resources.
 Invocation (root script already exists and starts working):
 
 ```
-npm run harness -- <scenario> [--verify-replay] [--out <file>]
+npm run harness --silent -- <scenario> [--verify-replay] [--out <file>]
 ```
 
 - `<scenario>`: path to a scenario module (`.mjs`/`.js`) whose default export
   (or named export `scenario`) is a `Scenario`. A bare name `foo` resolves to
   `scenarios/foo.scenario.mjs` from the repo root.
+- **`--silent` is required for the stdout-purity guarantee below.** It is an
+  `npm run` flag (placed before `--`, not passed to the CLI) that suppresses
+  npm's own `> pkg@ver harness` banner lines, which npm otherwise prepends to
+  stdout for every `npm run` invocation — that banner, not the CLI, is what
+  would break machine parsing. Without `--silent` the command still exits
+  correctly and the JSON still prints (interactive/human use is fine); only
+  scripted/agent consumption of stdout requires it. `npm run start` inside
+  `packages/harness` (i.e. running `node dist/cli.js <scenario>` directly, or
+  via the package's `bin`) never has this issue since there's no wrapping
+  `npm run` banner.
 - **stdout** carries exactly one JSON document — the `Verdict` — and nothing
-  else. Human diagnostics go to **stderr**. `--out <file>` additionally
+  else (when invoked with `--silent`, or when invoking `dist/cli.js`
+  directly). Human diagnostics go to **stderr**. `--out <file>` additionally
   writes the JSON to a file.
 - `--verify-replay`: after the run, replays the verdict's own replay bundle
   (`seed` + command log) against a fresh sim and compares final state hashes;
@@ -236,14 +247,14 @@ human eyes needed.* Concretely:
    (`three` import, `node:` built-in import, `Math.random`).
    `packages/core/tsconfig.json` has no DOM lib and empty `types`, and
    `npm run build` still passes.
-3. **Harness CLI works**: `npm run harness -- smoke` (and the explicit-path
-   form) exits 0; stdout parses as a single JSON `Verdict` containing
-   `p95TickMs`, `maxTickMs`, and `entityCount`.
-4. **Failure is reproducible from the verdict alone**: `npm run harness --
-   failing-example` exits 1; its verdict names the failed assertion,
-   includes `eventsTail` and the replay bundle; and re-running with
-   `--verify-replay` shows `replayCheck.verified: true` with matching hashes
-   (deterministic failure, reproducible from seed+log — the roadmap
+3. **Harness CLI works**: `npm run harness --silent -- smoke` (and the
+   explicit-path form) exits 0; stdout parses as a single JSON `Verdict`
+   containing `p95TickMs`, `maxTickMs`, and `entityCount`.
+4. **Failure is reproducible from the verdict alone**: `npm run harness
+   --silent -- failing-example` exits 1; its verdict names the failed
+   assertion, includes `eventsTail` and the replay bundle; and re-running
+   with `--verify-replay` shows `replayCheck.verified: true` with matching
+   hashes (deterministic failure, reproducible from seed+log — the roadmap
    criterion, mechanically checked).
 5. **Replay divergence is detectable**: `--verify-replay` on `smoke` exits 0
    and `replayCheck.verified` is true.
@@ -252,12 +263,17 @@ human eyes needed.* Concretely:
    code: all input flows through `submit(Command)`; `apps/demo/src/game.ts`
    imports only `@claude-engine/core`; `packages/renderer-three` contains no
    game-specific component names.
-7. **Demo is agent-verifiable headless**: `npm run harness -- demo-walk`
-   exits 0 running the *same* `game.ts` module the browser demo uses.
+7. **Demo is agent-verifiable headless**: `npm run harness --silent --
+   demo-walk` exits 0 running the *same* `game.ts` module the browser demo
+   uses.
 8. **Contracts untouched**: zero diff to `IWorld`/`HostPort` in
-   `packages/core/src/types.ts` and zero diff to `CLAUDE.md`. `Verdict`/
-   `Scenario` changes are strictly additive (`scripts/smoke.mjs` still passes
-   unmodified, aside from any path move noted in the diff).
+   `packages/core/src/types.ts`. `CLAUDE.md`'s five numbered invariants are
+   byte-for-byte unchanged; the only permitted diff is the one documented
+   command-example correction above (see "Invariant/contract impact"),
+   explicitly flagged rather than snuck in. `Verdict`/`Scenario` changes are
+   strictly additive (`scripts/smoke.mjs` still passes unmodified, aside from
+   its pre-existing unused `Sim` import removed to satisfy the new lint
+   gate).
 
 ## Non-goals for this phase (explicitly deferred)
 
@@ -279,6 +295,17 @@ human eyes needed.* Concretely:
 
 ## Invariant / contract impact
 
+- **CLAUDE.md**: one non-invariant correction, flagged explicitly since exit
+  criterion 8 otherwise calls for zero diff. The "Verification loop" section
+  documented `npm run harness -- <scenario>` as the verification command;
+  implementation discovered `npm run` unconditionally prints its own
+  `> pkg@ver script` banner onto stdout ahead of the script's own output,
+  which breaks the harness CLI's stdout-is-pure-JSON contract (section C).
+  The fix is `npm run harness --silent -- <scenario>` (`--silent` suppresses
+  npm's banner; it is an `npm run` flag, not a harness CLI flag). This is a
+  correction to a broken example command, not a change to any of the five
+  numbered invariants — those are byte-for-byte unchanged. Reviewer should
+  diff CLAUDE.md and confirm the only change is that one command example.
 - **CLAUDE.md invariants**: none changed. Invariant #1 (sim purity) gains
   automated enforcement (lint + purity script + tsconfig hardening) — a
   strengthening of enforcement, not a change in meaning. Invariant #4 (hosts

@@ -6,8 +6,12 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "claude-engine-harness": "dist/cli.js"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js"
   },
   "dependencies": {
     "@claude-engine/core": "*"

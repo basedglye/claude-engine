@@ -61,6 +61,22 @@
 // point) is guaranteed to produce a stateHash mismatch rather than an
 // accidental match -- see "PROVING NON-VACUOUSNESS" below.
 //
+// REPLAY EQUIVALENCE DEPENDS ON THE PINNING (H1b review item 3, carried
+// forward): --verify-replay reconstructs a headless Sim from `seed` and
+// replays the CAPTURED command log start to finish; it never calls
+// Sim.restore(), so the moves recorded at ticks 43-80 (the ones F9's
+// in-browser quickLoad() discards from the LIVE sim) are still present in
+// that log and get APPLIED during replay. Assertion 3 above only holds
+// because those moves are state no-ops here -- the player is already
+// pinned against the wall by tick 10, so walking into a wall for 38 more
+// ticks changes nothing replay would diverge on. This is a coincidence of
+// this scenario's specific spawn/geometry, not a general property of
+// save-restore: any FUTURE save-restore-style scenario whose post-F5 input
+// has an actual effect (player free to move, a `desk.decision`, anything
+// that changes state) will see replay's reconstructed hash diverge from
+// the live browser hash and exit 3 with no warning why beyond "replay
+// mismatch" -- there is no assertion here that would explain it.
+//
 // F5 (tick 40) and F9 (tick 90) both land in a command-quiet window (KeyW
 // is released at tick 30 and not pressed again until tick 42; released
 // again at 80, not pressed again before 90) -- deliberately, so the pump's

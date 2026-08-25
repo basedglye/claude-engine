@@ -4,7 +4,7 @@
 import type { ScreenAppDef, ScreenEffect, ScreenWorldView } from "./app.js";
 import { hitRect } from "./app.js";
 import type { PaintNode, Rect } from "./types.js";
-import { SCREEN_H, SCREEN_W } from "./types.js";
+import { GLYPH_W, SCREEN_H, SCREEN_W } from "./types.js";
 
 export interface ShellState {
   openAppId: string;
@@ -25,6 +25,13 @@ const TASKBAR_BTN_Y = TASKBAR_Y + 4;
 export const CALIB_RECT: Rect = { x: SCREEN_W - 40, y: 4, w: 32, h: 8 };
 /** Where the reference glyph row is painted, directly below CALIB_RECT. */
 export const CALIB_GLYPH_Y = CALIB_RECT.y + CALIB_RECT.h;
+/** Reference glyph row text (H1b review item 2: painted at `CALIB_RECT.x`
+ *  = 600, 9 glyphs wide at GLYPH_W=8 runs to x=672 on a 640-wide surface —
+ *  32px off the edge, rendering as "AaBbC"). Right-aligned to the surface
+ *  edge instead of sharing CALIB_RECT's x, so its width is free to change
+ *  without silently overflowing again. */
+export const CALIB_GLYPH_TEXT = "AaBbCc123";
+export const CALIB_GLYPH_X = SCREEN_W - CALIB_GLYPH_TEXT.length * GLYPH_W;
 
 export function createShell(
   apps: readonly ScreenAppDef<unknown>[],
@@ -130,7 +137,7 @@ export function createShell(
       // Calibration strip — the shell chrome paints this on every app, per
       // docs/PHASE-H1.md "Readability as a gate".
       nodes.push({ kind: "calib", rect: CALIB_RECT });
-      nodes.push({ kind: "text", x: CALIB_RECT.x, y: CALIB_GLYPH_Y, text: "AaBbCc123", color: 15 });
+      nodes.push({ kind: "text", x: CALIB_GLYPH_X, y: CALIB_GLYPH_Y, text: CALIB_GLYPH_TEXT, color: 15 });
 
       return nodes;
     },

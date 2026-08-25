@@ -115,12 +115,6 @@ export function syncTerminalScreens(
       // with the desk's usable (counter-front) side instead of its
       // lengthwise axis.
       group.rotation.y = (yaw.mdeg / 1000) * (Math.PI / 180) - Math.PI / 2;
-      // Stand the monitor off the desk anchor along its own facing. The
-      // anchor sits against the lobby's west wall, and a monitor placed
-      // exactly on it has its far half buried in that wall — which reads as
-      // the screen being cropped by a hard vertical edge, because the wall
-      // is drawn in front of the half that is inside it. Offsetting along
-      // the group's local forward puts the whole panel in the room.
       ctx.scene.add(group);
       screen = { entity, group, screenMesh, surface };
       screensByEntity.set(entity, screen);

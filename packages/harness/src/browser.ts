@@ -346,6 +346,19 @@ export async function runBrowserScenario(
 
     // Drive the wall-clock input script in real time.
     const inputDone = runInputScript(page, spec.input ?? [], deadline, releaseBarrier);
+    // `inputDone` is only actually awaited below, AFTER the screenshot
+    // capture loop -- if it rejects (e.g. the new undrained-queue
+    // BrowserInfraError) while that loop is still polling for a LATER
+    // screenshot tick, Node considers it unhandled the instant it rejects
+    // and crashes the process before the `await inputDone` below ever
+    // runs, bypassing this function's own try/finally and cli.ts's catch
+    // entirely -- an uncaught exit 1 with no "Browser-mode infra failure"
+    // message instead of the clean exit 2 that error is supposed to
+    // produce. This no-op catch marks the rejection "handled" immediately;
+    // the real error is still surfaced (and still fails the run) by the
+    // `await inputDone` below, which rethrows it into the try this
+    // function already wraps everything in.
+    inputDone.catch(() => undefined);
 
     // Capture screenshots as the sim crosses each requested tick.
     let nextIdx = 0;
@@ -571,25 +584,22 @@ async function runInputScript(
     await dispatchEvent(page, ev);
   }
 
+  // Install the tick-gated queue BEFORE releasing the start barrier. The
+  // sim is free-running the instant release() returns, so installing the
+  // queue afterward (as a separate round trip) races a step gated on an
+  // early tick: that tick could pass, in-page, before
+  // __WORLDFORGE_TICK_QUEUE__ exists to catch it. Installation itself is
+  // inert while the sim is still paused at tick 0 — the app's tick pump
+  // doesn't drain it until the sim actually steps — so doing this before
+  // release is safe and independent of the tick-0 dispatch above. Every
+  // scenario in the repo currently gates no earlier than tick 16, which is
+  // exactly why this ordering bug had no observed trigger; it is not a
+  // design guarantee.
+  if (tickRest.length > 0) await installTickQueue();
+
   if (releaseBarrier) await releaseBarrier();
 
-  async function runMsEvents(): Promise<void> {
-    msEvents.sort((a, b) => a.at - b.at);
-    for (const ev of msEvents) {
-      const wait = start + ev.at - Date.now();
-      if (wait > 0) await page.waitForTimeout(Math.min(wait, Math.max(0, deadline - Date.now())));
-      if (Date.now() >= deadline) break;
-      await dispatchEvent(page, ev);
-    }
-  }
-
-  // Remaining tick-gated events run in declaration order (not sorted — a
-  // scenario may legitimately wait for the same tick twice, e.g. a look
-  // immediately following a key-up gated on the same tick), each waiting
-  // via the same pollUntilTick approach the harness already uses for
-  // screenshot capture.
-  async function runTickEvents(): Promise<void> {
-    if (tickRest.length === 0) return;
+  async function installTickQueue(): Promise<void> {
     // Install the whole queue in-page and let the app's own tick pump drain
     // it via hook.notifyTick, so each step fires synchronously ON its
     // declared tick. The previous approach — poll world.tick from out of
@@ -620,18 +630,49 @@ async function runInputScript(
       }
       w.__WORLDFORGE_TICK_QUEUE__ = queue;
     }, tickRest as unknown as { atTick: number; type: string; key?: string; dx?: number; dy?: number; u?: number; v?: number }[]);
+  }
 
-    // Wait for the queue to drain (or the deadline), then surface any error
-    // a step threw in-page rather than letting it vanish.
+  async function runMsEvents(): Promise<void> {
+    msEvents.sort((a, b) => a.at - b.at);
+    for (const ev of msEvents) {
+      const wait = start + ev.at - Date.now();
+      if (wait > 0) await page.waitForTimeout(Math.min(wait, Math.max(0, deadline - Date.now())));
+      if (Date.now() >= deadline) break;
+      await dispatchEvent(page, ev);
+    }
+  }
+
+  // Remaining tick-gated events run in declaration order (not sorted — a
+  // scenario may legitimately wait for the same tick twice, e.g. a look
+  // immediately following a key-up gated on the same tick), each waiting
+  // via the same pollUntilTick approach the harness already uses for
+  // screenshot capture.
+  async function runTickEvents(): Promise<void> {
+    if (tickRest.length === 0) return;
+    // The queue was already installed (before releaseBarrier(), above) —
+    // just wait for it to drain, then surface any error a step threw
+    // in-page rather than letting it vanish.
     const lastTick = Math.max(...tickRest.map((ev) => ev.atTick));
     await pollUntilTick(page, lastTick, deadline);
-    const errors = await page.evaluate(() => {
+    const status = await page.evaluate(() => {
       const w = window as unknown as { __WORLDFORGE_TICK_QUEUE__?: { done?: boolean; error?: string }[] };
       const q = w.__WORLDFORGE_TICK_QUEUE__ ?? [];
       return { pending: q.filter((e) => !e.done).length, errors: q.map((e) => e.error).filter(Boolean) };
     });
-    if (errors.errors.length > 0) {
-      throw new BrowserInfraError(`Tick-gated input step threw in-page: ${errors.errors.join("; ")}`);
+    if (status.errors.length > 0) {
+      throw new BrowserInfraError(`Tick-gated input step threw in-page: ${status.errors.join("; ")}`);
+    }
+    if (status.pending > 0) {
+      // A step never ran: either the deadline hit early, or (far more
+      // likely) the app never drains __WORLDFORGE_TICK_QUEUE__ via
+      // hook.notifyTick at all. Without this check that omission produces
+      // silently-undispatched input and a misdiagnosed assertion failure
+      // downstream — this names the actual cause instead.
+      throw new BrowserInfraError(
+        `${status.pending} tick-gated input step(s) never ran (queue still has undrained entries at tick ` +
+          `${lastTick}'s deadline). The app's tick pump likely never calls hook.notifyTick to drain ` +
+          `__WORLDFORGE_TICK_QUEUE__ — every app under --browser must wire that call once per sim step.`
+      );
     }
   }
 

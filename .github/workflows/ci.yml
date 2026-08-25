@@ -187,8 +187,8 @@ jobs:
           npm run harness --silent -- reserva-readability --browser --verify-replay
           npm run harness --silent -- reserva-readability --browser --browser-engine firefox --verify-replay
 
-      - name: Harness save-restore scenario (--browser, Chromium)
-        run: npm run harness --silent -- save-restore --browser
+      - name: Harness save-restore scenario (--browser --verify-replay, Chromium)
+        run: npm run harness --silent -- save-restore --browser --verify-replay
 
       - name: Upload browser-mode screenshots
         uses: actions/upload-artifact@v4

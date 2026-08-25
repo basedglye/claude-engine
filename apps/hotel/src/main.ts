@@ -150,6 +150,7 @@ async function quickLoad(): Promise<void> {
     const loadedGameId = await importSave(store, savedJson);
     const { sim: loaded } = await recoverSim(store, loadedGameId, setup);
     sim.restore(loaded.snapshot());
+    resetEntityKeyedHostState();
     restoredHash = sim.stateHash();
     // Carries {savedTick, savedHash, restoredHash} into sim-visible (and
     // therefore replay-visible) state -- see saveRestoreDebugCommand's doc
@@ -289,6 +290,27 @@ const DOOR_SWING_OPEN_RAD = Math.PI / 2;
 // to trigger "presenting". Registered once per entity (guarded by this
 // Set), the same create-once discipline as objectFor itself.
 const registeredGuestInteractables = new Set<EntityId>();
+
+/**
+ * Reset entity-keyed host state `Sim.restore()` can invalidate (H1b review
+ * item 6). `restore()` rewinds `nextEntity`, so a spawn after a quick-load
+ * can reuse an id this session already holds bookkeeping for.
+ * `rigsByEntity`/`heldDocs` (render/characters.ts, render/documents.ts) are
+ * safe without an entry here: they're only ever written inside
+ * `SceneContext.objectFor`'s create callback, so they self-heal on every
+ * frame's own live-entity prune. `registeredGuestInteractables` is a plain
+ * guard Set with no analogous prune -- once an id is marked registered it
+ * is never re-registered, even after the Object3D it named was disposed
+ * and a DIFFERENT (reused-id) guest now needs registering in its place, so
+ * the controller's raycast list keeps pointing at a pruned object and a
+ * real player cannot click the new guest. Named as its own step, not an
+ * ad-hoc line at the F9 call site, because this is a general seam: any
+ * future entity-keyed host registry that doesn't self-heal through
+ * objectFor belongs in this same function, and Phase 2's load menu will
+ * exercise it for real (docs/reviews/phase-H1b.md item 6). */
+function resetEntityKeyedHostState(): void {
+  registeredGuestInteractables.clear();
+}
 
 // -- Terminal focus / screen input (docs/PHASE-H1.md, "Host (main.ts)
 //    additions"): `interact` -> `terminal.focusedBy` (sim, via the normal

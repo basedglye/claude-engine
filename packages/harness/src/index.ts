@@ -183,7 +183,8 @@ export function runScenario(scenario: Scenario): Verdict {
 export function verifyReplay(
   scenario: Scenario,
   expectedHash: number,
-  commands?: readonly Command[]
+  commands?: readonly Command[],
+  ticks?: number
 ): { verified: boolean; expectedHash: number; actualHash: number } {
   const sim = new Sim(scenario.seed);
   scenario.setup(sim);
@@ -193,7 +194,13 @@ export function verifyReplay(
     list.push(c);
     byTick.set(c.tick, list);
   }
-  for (let t = 1; t <= scenario.ticks; t++) {
+  // Browser-mode runs land on a wall-clock-determined final tick that can
+  // differ from scenario.ticks (the static headless tick count) — the
+  // caller passes the run's actual final tick so replay covers exactly the
+  // ticks that were live. Headless callers omit `ticks` and keep the
+  // original scenario.ticks behaviour unchanged.
+  const tickCount = ticks ?? scenario.ticks;
+  for (let t = 1; t <= tickCount; t++) {
     for (const c of byTick.get(t) ?? []) sim.submit(c);
     sim.step();
   }

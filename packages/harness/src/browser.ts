@@ -32,12 +32,20 @@ const STATIC_MIME_TYPES: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
+export type InputStep =
+  | { key: string; downMs: number; upMs: number } // existing
+  | { pointer: "lock"; atMs: number }
+  | { pointer: "look"; atMs: number; dx: number; dy: number } // px deltas
+  | { pointer: "click"; atMs: number }
+  | { pointer: "screenClick"; atMs: number; u: number; v: number }; // RESERVED: exit 2 in H0
+
 export interface BrowserSpec {
   /** Workspace name (e.g. "@claude-engine/demo") — harness builds it and
    *  serves via vite preview — or an http(s):// URL to use as-is. */
   app: string;
-  /** Wall-clock keyboard script (KeyboardEvent.code), driven by Playwright. */
-  input?: readonly { key: string; downMs: number; upMs: number }[];
+  /** Wall-clock input script, driven by Playwright. Keyboard steps and
+   *  pointer steps share the same wall-clock scheduler (see runInputScript). */
+  input?: readonly InputStep[];
   /** Sim ticks (via the test hook) at which to capture screenshots. */
   screenshotAtTicks?: readonly number[];
   probes?: readonly ProbeSpec[];
@@ -47,7 +55,8 @@ export interface BrowserSpec {
 
 export type ProbeSpec =
   | { probe: "fps"; sampleMs?: number }
-  | { probe: "input-latency"; key: string; component: string; samples?: number };
+  | { probe: "input-latency"; key: string; component: string; samples?: number }
+  | { probe: "sim-tick-ms"; minSamples?: number };
 
 export interface BrowserRunReport {
   app: string;
@@ -75,14 +84,24 @@ export interface BrowserRunResult {
   passed: boolean;
 }
 
+export type BrowserEngine = "chromium" | "firefox";
+
 export async function runBrowserScenario(
   scenario: Scenario,
   repoRoot: string,
-  opts: { screenshotDir?: string } = {}
+  opts: { screenshotDir?: string; browserEngine?: BrowserEngine } = {}
 ): Promise<BrowserRunResult> {
   const spec = scenario.browser as BrowserSpec | undefined;
   if (!spec) {
     throw new BrowserInfraError(`Scenario "${scenario.name}" has no browser spec (scenario.browser is required for --browser).`);
+  }
+  const engine: BrowserEngine = opts.browserEngine ?? "chromium";
+
+  // screenClick is reserved, not implemented in H0 (docs/PHASE-H0.md).
+  for (const step of spec.input ?? []) {
+    if ("pointer" in step && step.pointer === "screenClick") {
+      throw new BrowserInfraError('"screenClick" input steps are not implemented in H0 (reserved for a later phase).');
+    }
   }
 
   let playwright: typeof import("playwright");
@@ -107,10 +126,25 @@ export async function runBrowserScenario(
   // shaders on many CI/sandboxed machines (shader VALIDATE_STATUS false ->
   // WebGL context loss -> a blank canvas with no console error to explain
   // it). ANGLE-over-SwiftShader is a reliable software rasterizer fallback.
-  const browser = await playwright.chromium.launch({
-    headless: true,
-    args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
-  });
+  // Firefox does not take these flags — they are Chromium-only.
+  let browser: import("playwright").Browser;
+  try {
+    browser =
+      engine === "firefox"
+        ? await playwright.firefox.launch({ headless: true })
+        : await playwright.chromium.launch({
+            headless: true,
+            args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
+          });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/Executable doesn't exist|browserType\.launch/.test(message)) {
+      throw new BrowserInfraError(
+        `Playwright's ${engine} browser binary is not installed. Run \`npx playwright install ${engine}\`.\n${message}`
+      );
+    }
+    throw err;
+  }
   try {
     const page = await browser.newPage();
 
@@ -135,6 +169,31 @@ export async function runBrowserScenario(
     const tickRateHz = await page.evaluate(
       () => (window as unknown as { __WORLDFORGE__: { info: { tickRateHz: number } } }).__WORLDFORGE__.info.tickRateHz
     );
+
+    const hasPointerStep = (spec.input ?? []).some((s) => "pointer" in s);
+    if (hasPointerStep) {
+      const hookHasPointer = await page.evaluate(
+        () => Boolean((window as unknown as { __WORLDFORGE__: { pointer?: unknown } }).__WORLDFORGE__.pointer)
+      );
+      if (!hookHasPointer) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" has pointer input steps, but the app's test hook exposes no ` +
+            `"pointer" (window.__WORLDFORGE__.pointer). The app must pass a SyntheticPointer to installTestHook.`
+        );
+      }
+    }
+    const wantsTickTimings = (spec.probes ?? []).some((p) => p.probe === "sim-tick-ms");
+    if (wantsTickTimings) {
+      const hookHasTickTimings = await page.evaluate(
+        () => typeof (window as unknown as { __WORLDFORGE__: { tickTimings?: unknown } }).__WORLDFORGE__.tickTimings === "function"
+      );
+      if (!hookHasTickTimings) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" requests the "sim-tick-ms" probe, but the app's test hook exposes no ` +
+            `"tickTimings" (window.__WORLDFORGE__.tickTimings). The app must pass a tickTimings() function to installTestHook.`
+        );
+      }
+    }
 
     const screenshots: { requestedTick: number; actualTick: number; path: string }[] = [];
     const requestedTicks = [...(spec.screenshotAtTicks ?? [])].sort((a, b) => a - b);
@@ -235,25 +294,60 @@ async function pollUntilTick(
   return last;
 }
 
-async function runInputScript(
-  page: import("playwright").Page,
-  input: readonly { key: string; downMs: number; upMs: number }[],
-  deadline: number
-): Promise<void> {
+type ScheduledEvent =
+  | { at: number; type: "down" | "up"; key: string }
+  | { at: number; type: "pointer-lock" }
+  | { at: number; type: "pointer-look"; dx: number; dy: number }
+  | { at: number; type: "pointer-click" };
+
+async function runInputScript(page: import("playwright").Page, input: readonly InputStep[], deadline: number): Promise<void> {
   if (input.length === 0) return;
   const start = Date.now();
-  const events: { at: number; type: "down" | "up"; key: string }[] = [];
+  const events: ScheduledEvent[] = [];
   for (const step of input) {
-    events.push({ at: step.downMs, type: "down", key: step.key });
-    events.push({ at: step.upMs, type: "up", key: step.key });
+    if ("pointer" in step) {
+      if (step.pointer === "lock") events.push({ at: step.atMs, type: "pointer-lock" });
+      else if (step.pointer === "look") events.push({ at: step.atMs, type: "pointer-look", dx: step.dx, dy: step.dy });
+      else if (step.pointer === "click") events.push({ at: step.atMs, type: "pointer-click" });
+      // screenClick is rejected before this function is ever called.
+    } else {
+      events.push({ at: step.downMs, type: "down", key: step.key });
+      events.push({ at: step.upMs, type: "up", key: step.key });
+    }
   }
   events.sort((a, b) => a.at - b.at);
   for (const ev of events) {
     const wait = start + ev.at - Date.now();
     if (wait > 0) await page.waitForTimeout(Math.min(wait, Math.max(0, deadline - Date.now())));
     if (Date.now() >= deadline) break;
-    if (ev.type === "down") await page.keyboard.down(ev.key);
-    else await page.keyboard.up(ev.key);
+    switch (ev.type) {
+      case "down":
+        await page.keyboard.down(ev.key);
+        break;
+      case "up":
+        await page.keyboard.up(ev.key);
+        break;
+      case "pointer-lock":
+        await page.evaluate(
+          () => (window as unknown as { __WORLDFORGE__: { pointer?: { lock(): void } } }).__WORLDFORGE__.pointer?.lock()
+        );
+        break;
+      case "pointer-look":
+        await page.evaluate(
+          ([dx, dy]) =>
+            (window as unknown as { __WORLDFORGE__: { pointer?: { look(dx: number, dy: number): void } } }).__WORLDFORGE__.pointer?.look(
+              dx as number,
+              dy as number
+            ),
+          [ev.dx, ev.dy]
+        );
+        break;
+      case "pointer-click":
+        await page.evaluate(
+          () => (window as unknown as { __WORLDFORGE__: { pointer?: { click(): void } } }).__WORLDFORGE__.pointer?.click()
+        );
+        break;
+    }
   }
 }
 
@@ -285,6 +379,30 @@ async function runProbe(
     const avg = deltas.reduce((s, v) => s + v, 0) / deltas.length;
     const p5 = sorted[Math.max(0, Math.floor(0.05 * sorted.length))]!;
     return { avg, p5, min: sorted[0]! };
+  }
+
+  if (spec.probe === "sim-tick-ms") {
+    const minSamples = spec.minSamples ?? 1;
+    const deadlineRemaining = Math.max(0, deadline - Date.now());
+    const timings = await page.evaluate(
+      async ([needed, waitBudgetMs]) => {
+        const hook = (window as unknown as { __WORLDFORGE__: { tickTimings?: () => readonly number[] } }).__WORLDFORGE__;
+        const start = performance.now();
+        let samples = hook.tickTimings?.() ?? [];
+        while (samples.length < (needed as number) && performance.now() - start < (waitBudgetMs as number)) {
+          await new Promise((r) => setTimeout(r, 16));
+          samples = hook.tickTimings?.() ?? [];
+        }
+        return samples;
+      },
+      [minSamples, deadlineRemaining]
+    );
+    if (timings.length === 0) return { avgMs: 0, p95Ms: 0, maxMs: 0 };
+    const sorted = [...timings].sort((a, b) => a - b);
+    const avgMs = timings.reduce((s, v) => s + v, 0) / timings.length;
+    const p95Ms = sorted[Math.min(sorted.length - 1, Math.floor(0.95 * sorted.length))]!;
+    const maxMs = sorted[sorted.length - 1]!;
+    return { avgMs, p95Ms, maxMs };
   }
 
   // input-latency
@@ -327,9 +445,9 @@ function readFirstComponentValue(component: string): unknown {
 }
 
 function lookupProbeValue(probes: Record<string, Record<string, number>>, key: string): number | undefined {
-  // Keys look like "fps.avg" or "inputLatency.avgMs" — map to our probe result names.
+  // Keys look like "fps.avg", "inputLatency.avgMs", or "simTickMs.avgMs" — map to our probe result names.
   const [probeKey, field] = key.split(".", 2);
-  const probeName = probeKey === "inputLatency" ? "input-latency" : probeKey;
+  const probeName = probeKey === "inputLatency" ? "input-latency" : probeKey === "simTickMs" ? "sim-tick-ms" : probeKey;
   return probeName && field ? probes[probeName]?.[field] : undefined;
 }
 

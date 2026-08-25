@@ -5,7 +5,8 @@
  * Contract (docs/PHASE-1.md, section C; extended by docs/PHASE-2.md Scope D/E
  * and docs/PHASE-3.md Scope A):
  *   npm run harness -- <scenario> [--verify-replay] [--out <file>]
- *                                 [--browser] [--screenshot-dir <dir>] [--soak]
+ *                                 [--browser] [--browser-engine <chromium|firefox>]
+ *                                 [--screenshot-dir <dir>] [--soak]
  *   npm run harness -- --replay <verdict.json> [--out <file>]
  *                                 [--from-checkpoint <tick>]
  *
@@ -39,6 +40,7 @@ function parseArgs(argv: readonly string[]): {
   verifyReplay: boolean;
   out: string | undefined;
   browser: boolean;
+  browserEngine: "chromium" | "firefox";
   soak: boolean;
   screenshotDir: string | undefined;
   fromCheckpoint: number | undefined;
@@ -48,6 +50,7 @@ function parseArgs(argv: readonly string[]): {
   let verifyReplayFlag = false;
   let out: string | undefined;
   let browser = false;
+  let browserEngine: "chromium" | "firefox" = "chromium";
   let soak = false;
   let screenshotDir: string | undefined;
   let fromCheckpoint: number | undefined;
@@ -58,6 +61,13 @@ function parseArgs(argv: readonly string[]): {
       verifyReplayFlag = true;
     } else if (arg === "--browser") {
       browser = true;
+    } else if (arg === "--browser-engine") {
+      const raw = argv[++i];
+      if (raw !== "chromium" && raw !== "firefox") {
+        console.error('--browser-engine requires "chromium" or "firefox"');
+        process.exit(2);
+      }
+      browserEngine = raw;
     } else if (arg === "--soak") {
       soak = true;
     } else if (arg === "--out") {
@@ -96,7 +106,7 @@ function parseArgs(argv: readonly string[]): {
 
   if (!scenario && !replay) {
     console.error(
-      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--screenshot-dir <dir>] [--soak]\n" +
+      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--browser-engine <chromium|firefox>] [--screenshot-dir <dir>] [--soak]\n" +
         "       npm run harness -- --replay <verdict.json> [--out <file>] [--from-checkpoint <tick>]"
     );
     process.exit(2);
@@ -106,7 +116,7 @@ function parseArgs(argv: readonly string[]): {
     process.exit(2);
   }
 
-  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, soak, screenshotDir, fromCheckpoint };
+  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, browserEngine, soak, screenshotDir, fromCheckpoint };
 }
 
 /** Repo-relative path with forward slashes, for portable storage in a verdict. */
@@ -214,13 +224,18 @@ async function runBrowserMode(
   scenario: Scenario,
   scenarioPath: string,
   screenshotDir: string | undefined,
+  browserEngine: "chromium" | "firefox",
+  shouldVerifyReplay: boolean,
   out: string | undefined
 ): Promise<void> {
   const { runBrowserScenario, BrowserInfraError } = await import("./browser.js");
 
   let result;
   try {
-    result = await runBrowserScenario(scenario, repoRoot, screenshotDir === undefined ? {} : { screenshotDir });
+    result = await runBrowserScenario(scenario, repoRoot, {
+      ...(screenshotDir === undefined ? {} : { screenshotDir }),
+      browserEngine,
+    });
   } catch (err) {
     if (err instanceof BrowserInfraError) {
       console.error(`Browser-mode infra failure for "${scenario.name}": ${err.message}`);
@@ -257,10 +272,18 @@ async function runBrowserMode(
     browser: result.browser,
   };
 
+  if (shouldVerifyReplay) {
+    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands, result.browser.finalTick);
+  }
+
   const json = JSON.stringify(verdict, null, 2);
   console.log(json);
   if (out) {
     writeFileSync(out, json, "utf8");
+  }
+
+  if (shouldVerifyReplay && !verdict.replayCheck?.verified) {
+    process.exit(3);
   }
   process.exit(verdict.passed ? 0 : 1);
 }
@@ -322,6 +345,7 @@ async function main(): Promise<void> {
     verifyReplay: shouldVerifyReplay,
     out,
     browser,
+    browserEngine,
     soak,
     screenshotDir,
     fromCheckpoint,
@@ -345,7 +369,7 @@ async function main(): Promise<void> {
   }
 
   if (browser) {
-    await runBrowserMode(scenario, scenarioPath, screenshotDir, out);
+    await runBrowserMode(scenario, scenarioPath, screenshotDir, browserEngine, shouldVerifyReplay, out);
     return;
   }
 

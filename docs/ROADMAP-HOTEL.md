@@ -47,9 +47,16 @@ desk state machine, ledger, day clock, `clerkBot`, articulated characters and
 the held-document view. Gates live: `corridor-headon`, `checkin-rush`,
 `fraud-catch` (A and B).
 
-**H1b — in progress.** `surface-ui`, the HOTELSOFT shell, RESERVA and AUDIT,
-`save-web`, `screenClick` and the readability probe. Start from the H1a
-review's consolidated deferral list.
+**H1b — DONE** (merged 2026-08-25). Review: [reviews/phase-H1b.md](reviews/phase-H1b.md) — PASS at round 2.
+`@claude-engine/surface-ui` (pure integer layout shared between hit-testing
+and painting, committed bitmap font, the calibration strip), the HOTELSOFT
+shell with RESERVA and AUDIT, in-world screen focus and click routing,
+`@claude-engine/save-web` (IndexedDB behind the existing `GameStore`), the
+harness `screenClick` step and the `screen-readability` probe. Gates live:
+`reserva-readability` (both engines) and `save-restore`.
+
+**Phase 1 is complete.** Next: Phase 2, the One-Man Show vertical slice.
+Start from the H1b review's consolidated deferral list.
 
 
 `surface-ui` + HOTELSOFT shell + RESERVA (rule-table driven from day one);

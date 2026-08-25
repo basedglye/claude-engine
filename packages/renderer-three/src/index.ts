@@ -7,4 +7,4 @@ export {
   type ThreeHostOptions,
   type PointerHandlers,
 } from "./three-host.js";
-export { installTestHook, type WorldforgeHook, type SyntheticPointer } from "./test-hook.js";
+export { installTestHook, type WorldforgeHook, type SyntheticPointer, type StartBarrier } from "./test-hook.js";

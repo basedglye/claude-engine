@@ -20,6 +20,24 @@ export interface SyntheticPointer {
   click(): void;
 }
 
+/**
+ * A game-agnostic "start paused / release" slot (phase-H0 round-2 review,
+ * blocking item 1). `installTestHook({ startPaused: true })` creates one;
+ * the app itself is what must honour it by not stepping the sim until
+ * `release()` is called — this interface only exposes the control, it has
+ * no opinion on what "stepping" means for a given app/host loop. Exists so
+ * a harness-driven tick-gated input step (e.g. `downAtTick: 0`) can mean
+ * the literal sim tick 0 on every engine/machine, instead of "whatever
+ * tick the world has already reached by the time the input script starts"
+ * (browser startup latency varies 0-6+ ticks across engines).
+ */
+export interface StartBarrier {
+  /** True once release() has been called. */
+  readonly released: boolean;
+  /** Release the barrier — the app should now begin stepping the sim. */
+  release(): void;
+}
+
 export interface WorldforgeHook {
   world: IWorld;
   /** The ONLY sim-affecting capability — standard command ingress. */
@@ -31,6 +49,8 @@ export interface WorldforgeHook {
   pointer?: SyntheticPointer;
   /** Present iff the app wired tick timing (see sim-tick-ms probe). */
   tickTimings?(): readonly number[];
+  /** Present iff `installTestHook` was called with `startPaused: true`. */
+  startBarrier?: StartBarrier;
 }
 
 declare global {
@@ -52,6 +72,10 @@ export function installTestHook(opts: {
   tickRateHz?: number;
   pointer?: SyntheticPointer;
   tickTimings?: () => readonly number[];
+  /** Create a `startBarrier` the app must honour (see `StartBarrier`).
+   *  Opt-in and false by default — a scenario with no tick-gated input
+   *  steps never sets this, so the app's step loop is never touched. */
+  startPaused?: boolean;
 }): WorldforgeHook {
   const log: Command[] = [];
   const hook: WorldforgeHook = {
@@ -67,6 +91,17 @@ export function installTestHook(opts: {
   };
   if (opts.pointer) hook.pointer = opts.pointer;
   if (opts.tickTimings) hook.tickTimings = opts.tickTimings;
+  if (opts.startPaused) {
+    let released = false;
+    hook.startBarrier = {
+      get released(): boolean {
+        return released;
+      },
+      release(): void {
+        released = true;
+      },
+    };
+  }
   window.__WORLDFORGE__ = hook;
   return hook;
 }

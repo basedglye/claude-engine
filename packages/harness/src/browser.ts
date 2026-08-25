@@ -139,6 +139,16 @@ export async function runBrowserScenario(
 
   const { url, cleanup } = await resolveAppUrl(spec.app, repoRoot);
 
+  // A start barrier (phase-H0 round-2 review, blocking item 1) is needed
+  // whenever the scenario has any tick-gated input step: those steps
+  // (downAtTick/upAtTick, atTick) only mean a deterministic sim tick if
+  // the app hasn't already stepped past it before the input script gets a
+  // chance to poll for it. Wall-clock-only scenarios (demo-visual,
+  // demo-walk) never set this, so the app is never asked to pause and
+  // behaves exactly as before this change.
+  const needsStartBarrier = (spec.input ?? []).some((step) => "downAtTick" in step || "atTick" in step);
+  const navUrl = needsStartBarrier ? withQueryParam(url, "worldforgeStartPaused", "1") : url;
+
   // Headless Chromium's default GL backend fails to compile Three.js's
   // shaders on many CI/sandboxed machines (shader VALIDATE_STATUS false ->
   // WebGL context loss -> a blank canvas with no console error to explain
@@ -173,7 +183,7 @@ export async function runBrowserScenario(
     page.on("pageerror", (err) => pageErrors.push(err.message));
 
     const deadline = Date.now() + timeoutMs;
-    await page.goto(url, { timeout: timeoutMs });
+    await page.goto(navUrl, { timeout: timeoutMs });
 
     try {
       await page.waitForFunction(() => Boolean((window as unknown as { __WORLDFORGE__?: unknown }).__WORLDFORGE__), {
@@ -212,12 +222,56 @@ export async function runBrowserScenario(
       }
     }
 
+    if (needsStartBarrier) {
+      const hookHasBarrier = await page.evaluate(
+        () => Boolean((window as unknown as { __WORLDFORGE__: { startBarrier?: unknown } }).__WORLDFORGE__.startBarrier)
+      );
+      if (!hookHasBarrier) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" has tick-gated input steps, but the app's test hook exposes no ` +
+            `"startBarrier" (window.__WORLDFORGE__.startBarrier) even though the harness navigated with ` +
+            `?worldforgeStartPaused=1. The app must read that query flag and pass startPaused: true to installTestHook.`
+        );
+      }
+    }
+
     const screenshots: { requestedTick: number; actualTick: number; path: string }[] = [];
     const requestedTicks = [...(spec.screenshotAtTicks ?? [])].sort((a, b) => a - b);
     const targetTick = requestedTicks.length > 0 ? requestedTicks[requestedTicks.length - 1]! : undefined;
 
+    // Release the start barrier is handed to runInputScript rather than
+    // called here, and NOT called before the tick-0-gated steps are
+    // dispatched. An earlier version released here, before runInputScript
+    // even started: that leaves a race between "release() resolves" and
+    // "the tick-0 keydown/pointer step's page.evaluate round-trip actually
+    // lands" -- the sim is free-running as soon as it's released, so on a
+    // slower round-trip (observed on Firefox, not Chromium) the sim can
+    // take its first step BEFORE the tick-0 dispatch arrives, and the
+    // first move command lands on tick 2 instead of tick 1. A keydown /
+    // pointer-lock / look / click is a state change, not a tick-bound
+    // event, so it is correct AND safe to apply it while the sim is still
+    // paused at tick 0 -- runInputScript now does exactly that: dispatch
+    // every atTick/downAtTick === 0 step synchronously while paused, THEN
+    // release, THEN run the remaining wall-clock/tick queues as before. If
+    // release itself fails, that is an infra failure, not a scenario
+    // failure -- runInputScript surfaces it as a BrowserInfraError rather
+    // than leaving the sim hung paused forever.
+    const releaseBarrier = needsStartBarrier
+      ? async (): Promise<void> => {
+          try {
+            await page.evaluate(() => {
+              const hook = (window as unknown as { __WORLDFORGE__: { startBarrier?: { release(): void } } }).__WORLDFORGE__;
+              hook.startBarrier?.release();
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            throw new BrowserInfraError(`Failed to release the start barrier for scenario "${scenario.name}": ${message}`);
+          }
+        }
+      : undefined;
+
     // Drive the wall-clock input script in real time.
-    const inputDone = runInputScript(page, spec.input ?? [], deadline);
+    const inputDone = runInputScript(page, spec.input ?? [], deadline, releaseBarrier);
 
     // Capture screenshots as the sim crosses each requested tick.
     let nextIdx = 0;
@@ -295,6 +349,14 @@ export async function runBrowserScenario(
   }
 }
 
+/** Append (or overwrite) a query param on a URL string, whether or not it
+ *  already has a query string. */
+function withQueryParam(url: string, key: string, value: string): string {
+  const u = new URL(url);
+  u.searchParams.set(key, value);
+  return u.toString();
+}
+
 async function pollUntilTick(
   page: import("playwright").Page,
   tick: number,
@@ -357,8 +419,16 @@ async function dispatchEvent(
   }
 }
 
-async function runInputScript(page: import("playwright").Page, input: readonly InputStep[], deadline: number): Promise<void> {
-  if (input.length === 0) return;
+async function runInputScript(
+  page: import("playwright").Page,
+  input: readonly InputStep[],
+  deadline: number,
+  releaseBarrier?: () => Promise<void>
+): Promise<void> {
+  if (input.length === 0) {
+    if (releaseBarrier) await releaseBarrier();
+    return;
+  }
   const start = Date.now();
   const msEvents: ScheduledEvent[] = [];
   const tickEvents: TickScheduledEvent[] = [];
@@ -387,6 +457,29 @@ async function runInputScript(page: import("playwright").Page, input: readonly I
     }
   }
 
+  // Tick-0 events are dispatched synchronously, in declaration order,
+  // BEFORE the start barrier is released. This is the fix for the race
+  // the round-2 barrier still had: releasing first and then relying on
+  // pollUntilTick(0) + dispatch to "catch" tick 0 does not work, because
+  // pollUntilTick(0) resolves the instant it's called (0 >= 0 is already
+  // true) regardless of whether the sim has since taken a step — once
+  // released, the sim is free-running, and a slow page.evaluate round-trip
+  // (observed on Firefox, not Chromium) can let the sim's first real step
+  // land before the tick-0 dispatch does, silently starting the hold on
+  // tick 2 instead of tick 1. A keydown / pointer-lock / look / click is a
+  // state change, not a tick-bound event — applying it while the sim is
+  // still genuinely paused at tick 0 is both safe and exactly what
+  // "downAtTick: 0" / "atTick: 0" mean: the very first tick the sim takes
+  // already observes it.
+  const tickZero = tickEvents.filter((ev) => ev.atTick === 0);
+  const tickRest = tickEvents.filter((ev) => ev.atTick !== 0);
+  for (const ev of tickZero) {
+    if (Date.now() >= deadline) break;
+    await dispatchEvent(page, ev);
+  }
+
+  if (releaseBarrier) await releaseBarrier();
+
   async function runMsEvents(): Promise<void> {
     msEvents.sort((a, b) => a.at - b.at);
     for (const ev of msEvents) {
@@ -397,12 +490,13 @@ async function runInputScript(page: import("playwright").Page, input: readonly I
     }
   }
 
-  // Tick-gated events run in declaration order (not sorted — a scenario
-  // may legitimately wait for the same tick twice, e.g. a look immediately
-  // following a key-up gated on the same tick), each waiting via the same
-  // pollUntilTick approach the harness already uses for screenshot capture.
+  // Remaining tick-gated events run in declaration order (not sorted — a
+  // scenario may legitimately wait for the same tick twice, e.g. a look
+  // immediately following a key-up gated on the same tick), each waiting
+  // via the same pollUntilTick approach the harness already uses for
+  // screenshot capture.
   async function runTickEvents(): Promise<void> {
-    for (const ev of tickEvents) {
+    for (const ev of tickRest) {
       if (Date.now() >= deadline) break;
       await pollUntilTick(page, ev.atTick, deadline);
       if (Date.now() >= deadline) break;

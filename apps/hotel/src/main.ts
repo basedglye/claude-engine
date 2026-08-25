@@ -53,12 +53,22 @@ const controller = createFpsController({
   makeInteract: (tick, target) => interactCommand(tick, target),
 });
 
+// Opt-in start barrier (phase-H0 round-2 review, blocking item 1): only
+// present when the harness navigates here with ?worldforgeStartPaused=1,
+// which it only does for scenarios with tick-gated input steps
+// (packages/harness/src/browser.ts). Every other caller of this page
+// (production, demo-visual, demo-walk, a plain browser visit) gets
+// startPaused: false, hook.startBarrier stays undefined, and tickSim below
+// behaves exactly as it always has.
+const startPaused = new URLSearchParams(window.location.search).has("worldforgeStartPaused");
+
 const hook = installTestHook({
   world: sim,
   submit: (command) => sim.submit(command),
   app: "@claude-engine/hotel",
   pointer: controller.syntheticPointer,
   tickTimings: () => tickTimings,
+  startPaused,
 });
 
 // -- Per-tick timing, recorded for the sim-tick-ms probe / tickTimings(). --
@@ -69,6 +79,15 @@ const MAX_TICK_TIMINGS = 600;
  *  before stepping (per docs/PHASE-H0.md host module wiring), then records
  *  the tick's wall-clock duration for tickTimings()/the sim-tick-ms probe. */
 function tickSim(): void {
+  // Honour the start barrier: while it exists and hasn't been released,
+  // the sim takes zero steps — world.tick stays genuinely 0, so a
+  // harness `downAtTick: 0` step fires at the real tick 0 on every engine
+  // instead of racing page-load latency (phase-H0 round-2 review item 1).
+  // The host loop's fixed-tick accumulator (packages/renderer-three/src/
+  // host-loop.ts) keeps draining normally either way -- returning here
+  // early just means each drained tick did no work, so there is no
+  // spiral-of-death and no special-casing needed in the host loop itself.
+  if (hook.startBarrier && !hook.startBarrier.released) return;
   controller.onTick(sim, (command) => hook.submit(command));
   const start = performance.now();
   sim.step();

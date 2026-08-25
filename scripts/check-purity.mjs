@@ -207,6 +207,16 @@ const PURITY_ROOTS = [
     excludeDirNames: new Set(),
     banTranscendentals: true,
   },
+  // H1b: surface-ui's src/host ships the DOM/Three.js-touching canvas
+  // painter and screen-quad — excluded exactly like net's and assets'
+  // /web adapters. The pure root computes sim-side layout, so (unlike
+  // assets) it DOES opt into banTranscendentals.
+  {
+    name: 'packages/surface-ui/src (excluding src/host)',
+    dir: path.join(REPO_ROOT, 'packages', 'surface-ui', 'src'),
+    excludeDirNames: new Set(['host']),
+    banTranscendentals: true,
+  },
 ];
 
 function runSelfTest() {
@@ -257,11 +267,11 @@ function runSelfTest() {
     // in web/ — exercised through the real scanDirectory()/PURITY_ROOTS
     // machinery (not scanFile() in isolation), confirming both that the
     // root is actually scanned AND that its web/ exclusion actually excludes.
-    function testWebExclusion(rootNamePrefix) {
+    function testWebExclusion(rootNamePrefix, excludedDirName = 'web') {
       const root = PURITY_ROOTS.find((r) => r.name.startsWith(rootNamePrefix));
       if (!root || !fs.existsSync(root.dir)) return { hasPathViolation: false, webCorrectlyExcluded: true, ran: false };
       const rootSelfTestDir = path.join(root.dir, '.tmp-purity-selftest');
-      const webSelfTestDir = path.join(root.dir, 'web', '.tmp-purity-selftest');
+      const webSelfTestDir = path.join(root.dir, excludedDirName, '.tmp-purity-selftest');
       fs.mkdirSync(rootSelfTestDir, { recursive: true });
       fs.mkdirSync(webSelfTestDir, { recursive: true });
       const rootBadFile = path.join(rootSelfTestDir, 'bad.ts');
@@ -349,6 +359,7 @@ function runSelfTest() {
     const assetsCheck = testWebExclusion('packages/assets');
     const netCheck = testWebExclusion('packages/net');
     const botsCheck = testPlainRoot('packages/bots');
+    const surfaceUiCheck = testWebExclusion('packages/surface-ui', 'host');
     const trigBanCheck = testTranscendentalBan('packages/space/src');
     const trigNotBannedCheck = testTranscendentalNotBanned('packages/assets/src (excluding');
 
@@ -362,6 +373,8 @@ function runSelfTest() {
       netCheck.hasPathViolation &&
       netCheck.webCorrectlyExcluded &&
       botsCheck.hasPathViolation &&
+      surfaceUiCheck.hasPathViolation &&
+      surfaceUiCheck.webCorrectlyExcluded &&
       trigBanCheck.hasAtan2Violation &&
       trigBanCheck.floorNotFlagged &&
       trigNotBannedCheck.cosNotFlagged;
@@ -377,6 +390,8 @@ function runSelfTest() {
       console.log(`  - Math.random planted in packages/net/src: CAUGHT`);
       console.log(`  - three import planted in packages/net/src/web: correctly EXCLUDED`);
       console.log(`  - Math.random planted in packages/bots/src: CAUGHT`);
+      console.log(`  - Math.random planted in packages/surface-ui/src: CAUGHT`);
+      console.log(`  - three import planted in packages/surface-ui/src/host: correctly EXCLUDED`);
       console.log(`  - Math.atan2 planted in packages/space/src: CAUGHT`);
       console.log(`  - Math.floor planted in packages/space/src: correctly NOT flagged`);
       console.log(`  - Math.cos planted in packages/assets/src: correctly NOT flagged`);
@@ -392,6 +407,8 @@ function runSelfTest() {
       if (!netCheck.hasPathViolation) console.error('  - Math.random planted in packages/net/src: NOT CAUGHT');
       if (!netCheck.webCorrectlyExcluded) console.error('  - packages/net/src/web exclusion: NOT WORKING (false positive)');
       if (!botsCheck.hasPathViolation) console.error('  - Math.random planted in packages/bots/src: NOT CAUGHT');
+      if (!surfaceUiCheck.hasPathViolation) console.error('  - Math.random planted in packages/surface-ui/src: NOT CAUGHT');
+      if (!surfaceUiCheck.webCorrectlyExcluded) console.error('  - packages/surface-ui/src/host exclusion: NOT WORKING (false positive)');
       if (!trigBanCheck.hasAtan2Violation) console.error('  - Math.atan2 planted in packages/space/src: NOT CAUGHT');
       if (!trigBanCheck.floorNotFlagged) console.error('  - Math.floor planted in packages/space/src: FALSE POSITIVE');
       if (!trigNotBannedCheck.cosNotFlagged) console.error('  - Math.cos planted in packages/assets/src: FALSE POSITIVE');

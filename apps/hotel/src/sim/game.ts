@@ -57,10 +57,13 @@ import type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  SaveRestoreDebug,
 } from "./components.js";
 import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
 import { H1_RULES, plantViolation, type RuleDoc, type ResFields } from "./rules.js";
 import { pickArchetype, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
+import { hotelShell, buildScreenWorldView } from "./screen.js";
+import type { ScreenInput, ScreenEffect } from "@claude-engine/surface-ui";
 
 export type {
   Pos,
@@ -83,6 +86,7 @@ export type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  SaveRestoreDebug,
 } from "./components.js";
 
 export const PLAYER_ENTITY: EntityId = 1;
@@ -153,7 +157,6 @@ export type InteractDeniedReason =
 export interface ScenarioConfig {
   guestCount: number;
   spawnTickMin: number;
-  spawnTickMax: number;
   /** Per-mille (0..1000) chance a spawned guest's documents are planted
    *  with exactly one violation via rules.ts's plantViolation. */
   fraudRatePermille: number;
@@ -167,10 +170,18 @@ export interface ScenarioConfig {
   fixture: "normal" | "headon";
 }
 
+// H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
+// read it (the actual spawn cadence is `nextGuestAtTick`, advanced each
+// spawn by `50 + guestSpawnRng.int(0, 100)`, seeded only from
+// `spawnTickMin`). Phase-H1a review deferral item 3 ("enforce or delete")
+// — deleted here rather than enforced: nothing in the H1a gates asserts an
+// upper bound on spawn timing (checkin-rush only counts `guest.checkedIn`
+// and checks final occupancy), so wiring it in would change the spawn
+// stream those gates already golden-verify, which the same review flagged
+// as the thing to avoid ("if a gate's behaviour changes, stop").
 export const DEFAULTS: ScenarioConfig = {
   guestCount: 8,
   spawnTickMin: 100,
-  spawnTickMax: 900,
   fraudRatePermille: 0,
   fixture: "normal",
 };
@@ -284,7 +295,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.setComponent<Pos>(terminal, "pos", { xMm: floor.desk.xMm, zMm: floor.desk.zMm });
   sim.setComponent<Yaw>(terminal, "yaw", { mdeg: wrapMdeg(floor.desk.yawMdeg) });
   sim.setComponent<Terminal>(terminal, "terminal", { station: "frontdesk", focusedBy: "" });
-  sim.setComponent<ScreenApp>(terminal, "screenApp", { state: {}, paintSeq: 0 });
+  sim.setComponent<ScreenApp>(terminal, "screenApp", { state: hotelShell.init(), paintSeq: 0 });
   sim.setComponent<Interactable>(terminal, "interactable", {
     kind: "terminal",
     xMm: floor.desk.xMm,
@@ -948,77 +959,180 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
   // 8. deskSystem — validate + apply desk.decision; fraud/econ events;
   //    assign roomUnit; paired double-entry ledgerEntry.
-  function deskSystem(s: Sim): void {
-    for (const c of s.commands()) {
-      if (c.type !== "desk.decision") continue;
-      const { reservationEntity, accept, roomEntity } = c.payload as {
-        reservationEntity: EntityId;
-        accept: boolean;
-        roomEntity?: EntityId;
-      };
+  //
+  //    The per-decision body is factored into `applyDeskDecision` so
+  //    screenSystem (9, below) can call the SAME validated path when
+  //    RESERVA's `reduce` returns a `desk.decision` effect. It cannot just
+  //    `s.submit()` that effect and rely on this system to pick it up: Sim
+  //    (packages/core) drains `pendingCommands` unconditionally at the end
+  //    of every `step()`, and `commands()` returns that live array with no
+  //    per-tick filtering — a command pushed by a system that runs AFTER
+  //    this one (screenSystem is #9) is simply gone before it is ever
+  //    iterated. Calling `applyDeskDecision` directly is same-tick, exact
+  //    (no queueing hazard), and is still "the one validated decision path"
+  //    per docs/PHASE-H1.md: same function, same checks, whether the caller
+  //    is this loop (a real `desk.decision` command from `clerkBot` or a
+  //    temp key) or screenSystem's effect re-application.
+  function applyDeskDecision(
+    s: Sim,
+    actor: string,
+    payload: { reservationEntity: EntityId; accept: boolean; roomEntity?: EntityId }
+  ): void {
+    const { reservationEntity, accept, roomEntity } = payload;
 
-      const actorEntity = findActorEntity(s, c.actor);
-      if (actorEntity === undefined) continue;
-      const actorPos = s.getComponent<Pos>(actorEntity, "pos");
-      if (!actorPos) continue;
-      const dxMm = floor.desk.xMm - actorPos.xMm;
-      const dzMm = floor.desk.zMm - actorPos.zMm;
-      if (dxMm * dxMm + dzMm * dzMm > DESK_RADIUS_MM * DESK_RADIUS_MM) {
-        s.emit("screen.denied", { reason: "out-of-range" });
-        continue;
-      }
+    const actorEntity = findActorEntity(s, actor);
+    if (actorEntity === undefined) return;
+    const actorPos = s.getComponent<Pos>(actorEntity, "pos");
+    if (!actorPos) return;
+    const dxMm = floor.desk.xMm - actorPos.xMm;
+    const dzMm = floor.desk.zMm - actorPos.zMm;
+    if (dxMm * dxMm + dzMm * dzMm > DESK_RADIUS_MM * DESK_RADIUS_MM) {
+      s.emit("screen.denied", { reason: "out-of-range" });
+      return;
+    }
 
-      const res = s.getComponent<Reservation>(reservationEntity, "reservation");
-      if (!res || res.decided) continue;
-      const guest = s.getComponent<Guest>(res.guestEntity, "guest");
-      if (!guest || guest.state !== "presenting") continue;
+    const res = s.getComponent<Reservation>(reservationEntity, "reservation");
+    if (!res || res.decided) return;
+    const guest = s.getComponent<Guest>(res.guestEntity, "guest");
+    if (!guest || guest.state !== "presenting") return;
 
-      const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
-      if (!hotel) continue;
-      const wasPlanted = res.plantedViolations.length > 0;
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    const wasPlanted = res.plantedViolations.length > 0;
 
-      if (accept) {
-        if (roomEntity === undefined) continue;
-        const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
-        if (!room || room.occupantEntity !== 0) continue; // not vacant: no-op, retry later
-        s.setComponent<RoomUnit>(roomEntity, "roomUnit", { ...room, occupantEntity: res.guestEntity });
-        s.setComponent<Reservation>(reservationEntity, "reservation", {
-          ...res,
-          decided: true,
-          accepted: true,
-          roomEntity,
-        });
-        const rate = ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
-        s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash + rate });
-        const ledger = s.spawn();
-        s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
-          day: hotel.day,
-          debitAccount: "cash",
-          creditAccount: "revenue:rooms",
-          amountMinor: rate,
-          memo: `room charge guest ${res.guestEntity}`,
-        });
-        s.emit("guest.checkedIn", { guestEntity: res.guestEntity, roomEntity });
-        if (wasPlanted) s.emit("desk.fraudMissed", { reservationEntity, violations: res.plantedViolations });
-      } else {
-        s.setComponent<Reservation>(reservationEntity, "reservation", {
-          ...res,
-          decided: true,
-          accepted: false,
-          roomEntity: 0,
-        });
-        s.emit("guest.denied", { guestEntity: res.guestEntity });
-        if (wasPlanted) s.emit("desk.fraudCaught", { reservationEntity, violations: res.plantedViolations });
-        else s.emit("desk.falseDeny", { reservationEntity });
-      }
+    if (accept) {
+      if (roomEntity === undefined) return;
+      const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+      if (!room || room.occupantEntity !== 0) return; // not vacant: no-op, retry later
+      s.setComponent<RoomUnit>(roomEntity, "roomUnit", { ...room, occupantEntity: res.guestEntity });
+      s.setComponent<Reservation>(reservationEntity, "reservation", {
+        ...res,
+        decided: true,
+        accepted: true,
+        roomEntity,
+      });
+      const rate = ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
+      s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash + rate });
+      const ledger = s.spawn();
+      s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
+        day: hotel.day,
+        debitAccount: "cash",
+        creditAccount: "revenue:rooms",
+        amountMinor: rate,
+        memo: `room charge guest ${res.guestEntity}`,
+      });
+      s.emit("guest.checkedIn", { guestEntity: res.guestEntity, roomEntity });
+      if (wasPlanted) s.emit("desk.fraudMissed", { reservationEntity, violations: res.plantedViolations });
+    } else {
+      s.setComponent<Reservation>(reservationEntity, "reservation", {
+        ...res,
+        decided: true,
+        accepted: false,
+        roomEntity: 0,
+      });
+      s.emit("guest.denied", { guestEntity: res.guestEntity });
+      if (wasPlanted) s.emit("desk.fraudCaught", { reservationEntity, violations: res.plantedViolations });
+      else s.emit("desk.falseDeny", { reservationEntity });
     }
   }
 
-  // 9. screenSystem — H1b. Slot reserved; not implemented in H1a (see
-  //    docs/PHASE-H1.md, implementation-order lane 10). H1b's reviewer:
-  //    this comment marks the reservation, delete it once screenSystem
-  //    lands.
-  // function screenSystem(s: Sim): void { /* H1b */ }
+  function deskSystem(s: Sim): void {
+    for (const c of s.commands()) {
+      if (c.type !== "desk.decision") continue;
+      applyDeskDecision(
+        s,
+        c.actor,
+        c.payload as { reservationEntity: EntityId; accept: boolean; roomEntity?: EntityId }
+      );
+    }
+  }
+
+  // 9. screenSystem — routes validated `screen.*` to the shell's `reduce`
+  //    with a fresh `ScreenWorldView` (built by the same exported pure
+  //    `buildScreenWorldView` main.ts's host-side repaint uses); on a state
+  //    reference change bumps `paintSeq`; re-applies app effects via
+  //    `applyDeskDecision` (see the comment on that function for why this
+  //    is a direct call rather than a re-queued command).
+  //
+  //    Validation (docs/PHASE-H1.md, H0 anti-cheat posture applied to
+  //    screens): applies only if `terminal.focusedBy === c.actor` AND that
+  //    actor's entity is still in range of the terminal's `interactable`.
+  //    Otherwise emits `screen.denied { reason }` — the host's UV mapping
+  //    proposes `screen.click{px,py}`/`screen.key{code}`, the sim
+  //    revalidates focus and proximity on every single command.
+  function screenSystem(s: Sim): void {
+    const terminalInteractable = s.getComponent<Interactable>(terminal, "interactable");
+
+    // The screen's visible content (RESERVA's queue head, room vacancy,
+    // AUDIT's ledger figures) is derived from the WORLD every call, not
+    // from `screenApp.state` alone -- a newly-presenting guest or a room
+    // that just vacated is real content the screen must show even though
+    // nobody clicked anything. `paintSeq` only means "the host should
+    // repaint" (a counter, never a content hash -- determinism rules), so
+    // bumping it once per tick while a human is actually looking at the
+    // terminal is cheap and correct; it stays untouched (no repaint work)
+    // whenever nobody is focused.
+    const focusedTerminalComp = s.getComponent<Terminal>(terminal, "terminal");
+    if (focusedTerminalComp && focusedTerminalComp.focusedBy !== "") {
+      const liveScreenApp = s.getComponent<ScreenApp>(terminal, "screenApp");
+      if (liveScreenApp) {
+        s.setComponent<ScreenApp>(terminal, "screenApp", { ...liveScreenApp, paintSeq: liveScreenApp.paintSeq + 1 });
+      }
+    }
+
+    for (const c of s.commands()) {
+      if (c.type !== "screen.key" && c.type !== "screen.click") continue;
+
+      const terminalComp = s.getComponent<Terminal>(terminal, "terminal");
+      if (!terminalComp || terminalComp.focusedBy !== c.actor) {
+        s.emit("screen.denied", { reason: "not-focused" });
+        continue;
+      }
+      const actorEntity = findActorEntity(s, c.actor);
+      const actorPos = actorEntity !== undefined ? s.getComponent<Pos>(actorEntity, "pos") : undefined;
+      if (!actorPos || !terminalInteractable) {
+        s.emit("screen.denied", { reason: "no-interactable" satisfies InteractDeniedReason });
+        continue;
+      }
+      const dxMm = terminalInteractable.xMm - actorPos.xMm;
+      const dzMm = terminalInteractable.zMm - actorPos.zMm;
+      if (dxMm * dxMm + dzMm * dzMm > terminalInteractable.radiusMm * terminalInteractable.radiusMm) {
+        s.emit("screen.denied", { reason: "out-of-range" satisfies InteractDeniedReason });
+        continue;
+      }
+
+      const screenApp = s.getComponent<ScreenApp>(terminal, "screenApp");
+      if (!screenApp) continue;
+
+      const input: ScreenInput =
+        c.type === "screen.key"
+          ? { kind: "key", code: (c.payload as { code: string }).code }
+          : { kind: "click", px: (c.payload as { px: number; py: number }).px, py: (c.payload as { px: number; py: number }).py };
+
+      const view = buildScreenWorldView(s);
+      const result = hotelShell.reduce(screenApp.state, input, view);
+      const isTagged = result !== null && typeof result === "object" && "state" in result;
+      const nextState = isTagged ? (result as { state: typeof screenApp.state }).state : (result as typeof screenApp.state);
+      const effect: ScreenEffect | undefined = isTagged ? (result as { effect?: ScreenEffect }).effect : undefined;
+      const openAppChanged = nextState.openAppId !== screenApp.state.openAppId;
+      const changed = nextState !== screenApp.state;
+
+      s.setComponent<ScreenApp>(terminal, "screenApp", {
+        state: nextState,
+        paintSeq: changed ? screenApp.paintSeq + 1 : screenApp.paintSeq,
+      });
+      if (openAppChanged) s.emit("screen.appOpened", { actor: c.actor, appId: nextState.openAppId });
+      else if (changed) s.emit("screen.actionTaken", { actor: c.actor });
+
+      if (effect && effect.type === "desk.decision") {
+        applyDeskDecision(
+          s,
+          c.actor,
+          effect.payload as { reservationEntity: EntityId; accept: boolean; roomEntity?: EntityId }
+        );
+      }
+    }
+  }
 
   // 10. economySystem — daily flat expenses at the rollover into audit.
   function economySystem(s: Sim): void {
@@ -1095,6 +1209,29 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  /** H1b save-restore gate wiring (docs/PHASE-H1.md gate 4; see
+   *  SaveRestoreDebug's doc comment in components.ts). Lazily creates one
+   *  singleton entity only if `debug.saveRestoreRecord` is ever submitted —
+   *  every scenario that never presses F5/F9 has zero extra entities and an
+   *  unchanged stateHash. */
+  function saveRestoreDebugSystem(s: Sim): void {
+    for (const c of s.commands()) {
+      if (c.type !== "debug.saveRestoreRecord") continue;
+      const payload = c.payload as { savedTick: number; savedHash: number; restoredHash: number };
+      let target: EntityId | undefined;
+      for (const [entity] of s.withComponent<SaveRestoreDebug>("saveRestoreDebug")) {
+        target = entity;
+        break;
+      }
+      const entity = target ?? s.spawn();
+      s.setComponent<SaveRestoreDebug>(entity, "saveRestoreDebug", {
+        savedTick: payload.savedTick,
+        savedHash: payload.savedHash,
+        restoredHash: payload.restoredHash,
+      });
+    }
+  }
+
   sim.addSystem(snapshotPrevSystem);
   sim.addSystem(faceSystem);
   sim.addSystem(guestSpawnSystem);
@@ -1103,10 +1240,11 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.addSystem(moveSystem);
   sim.addSystem(interactSystem);
   sim.addSystem(deskSystem);
-  // sim.addSystem(screenSystem); -- H1b (see the reservation comment above)
+  sim.addSystem(screenSystem);
   sim.addSystem(economySystem);
   sim.addSystem(dayPhaseSystem);
   sim.addSystem(cleanupSystem);
+  sim.addSystem(saveRestoreDebugSystem);
 }
 
 // -- Command factories -------------------------------------------------
@@ -1132,16 +1270,41 @@ export function screenBlurCommand(tick: number, actor: string = PLAYER_ACTOR): C
   return { tick, actor, type: "screen.blur", payload: {} };
 }
 
+export function screenKeyCommand(tick: number, code: string, actor: string = PLAYER_ACTOR): Command {
+  return { tick, actor, type: "screen.key", payload: { code } };
+}
+
+export function screenClickCommand(tick: number, px: number, py: number, actor: string = PLAYER_ACTOR): Command {
+  return { tick, actor, type: "screen.click", payload: { px, py } };
+}
+
 /**
  * `desk.decision` factory — actor-bound (B9: never "the player" as a
- * singleton). H1a has no terminal UI yet, so this is what temporary
- * accept/deny key bindings (main.ts, host wiring — out of this lane's
- * scope) must submit; H1b's RESERVA `reduce` emits the same command shape
- * as an app effect that screenSystem re-submits. Same validated path
- * either way (docs/PHASE-H1.md, "desk.decision"). H1B REVIEWER: grep
- * "TEMP DESK KEY" in main.ts once wired — those bindings must be deleted
- * when the terminal ships.
+ * singleton). H1a shipped with no terminal UI and (per the H1a review's
+ * deferral item 2) no temp desk keys either — this factory existed purely
+ * so headless scenarios/bots (`clerkBot`) could drive the one validated
+ * path directly. As of H1b, RESERVA's `reduce` emits the same command
+ * shape as a `desk.decision` `ScreenEffect`, which `screenSystem` applies
+ * via `applyDeskDecision` — the SAME validation this factory's command
+ * ultimately reaches through `deskSystem`. This is the first and only
+ * player-facing decision input (docs/PHASE-H1.md): a human accepts/denies
+ * exclusively through RESERVA's ACCEPT/DENY buttons.
  */
+/** H1b save-restore gate (docs/PHASE-H1.md gate 4). Submitted once by
+ *  apps/hotel/src/main.ts's quickLoad(), right after a quick-load
+ *  completes, carrying the facts the scenario's assertion needs into
+ *  sim-visible (and therefore replay-visible) state -- see
+ *  SaveRestoreDebug's doc comment in components.ts for why. */
+export function saveRestoreDebugCommand(
+  tick: number,
+  savedTick: number,
+  savedHash: number,
+  restoredHash: number,
+  actor: string = PLAYER_ACTOR
+): Command {
+  return { tick, actor, type: "debug.saveRestoreRecord", payload: { savedTick, savedHash, restoredHash } };
+}
+
 export function deskDecisionCommand(
   tick: number,
   reservationEntity: EntityId,
@@ -1153,3 +1316,8 @@ export function deskDecisionCommand(
 }
 
 export { cellAt, cellOfMm, CELL };
+// Re-exported so main.ts imports the terminal's screen wiring from the same
+// module it already imports everything else from; `screenSystem` (above)
+// and `syncScene`'s repaint call the exact same `buildScreenWorldView` —
+// two view-builders that can disagree is the bug this avoids.
+export { hotelShell, buildScreenWorldView } from "./screen.js";

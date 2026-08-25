@@ -4,12 +4,19 @@
 // (PASS:/FAIL: lines, process.exit(1) on any failure) rather than pulling in
 // a test framework.
 import { Rng, Sim } from "@claude-engine/core";
+import { findOverflowingNodes } from "@claude-engine/surface-ui";
 import { H1_RULES, evaluateRules, plantViolation, rulesForStars, describeRule } from "../dist-game/sim/rules.js";
+import { ARCHETYPES } from "../dist-game/sim/guests.js";
+import { reservaApp } from "../dist-game/sim/reserva-app.js";
+import { auditApp } from "../dist-game/sim/audit-app.js";
 import {
   setupWithConfig,
   PLAYER_ENTITY,
   interactCommand,
   deskDecisionCommand,
+  screenClickCommand,
+  hotelShell,
+  buildScreenWorldView,
 } from "../dist-game/sim/game.js";
 import { jitter } from "../dist-game/sim/nav.js";
 
@@ -567,6 +574,272 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
   check(
     "despawn: total entity count returns to baseline (guest + its documents + reservation, minus the ledger/hotel/etc. entities that persist regardless)",
     !finalEntities.has(guestEntity) && [...baseline].every((e) => finalEntities.has(e)),
+  );
+}
+
+// --- RESERVA's decision path: room click -> ACCEPT/DENY -> desk.decision
+// effect -> check-in (docs/reviews/phase-H1b.md item 1, BLOCKING) --------
+//
+// The phase's headline feature — click a room, click ACCEPT, guest checks
+// in — had zero test coverage anywhere: every other exercise of
+// `applyDeskDecision` in this file goes in through `deskDecisionCommand`
+// (the `deskSystem` command form), bypassing the shell, RESERVA's hit
+// rects, and `screenSystem`'s effect-application branch entirely. This
+// block drives the SAME path a real player does: focus the terminal via
+// `interact`, then submit `screen.click` commands at rects taken from
+// `hotelShell.layout()` at runtime — never hardcoded pixel literals, since
+// the whole point of the shared-layout design is that hit rects cannot
+// drift from what is painted.
+function findTerminalEntity(sim) {
+  for (const [e] of sim.withComponent("terminal")) return e;
+  return undefined;
+}
+
+/** Click point inside `rect` — its own center, so a click is unambiguously
+ *  a hit regardless of rect size/rounding, without hand-picking a pixel. */
+function rectClickPoint(rect) {
+  return { px: rect.x + Math.floor(rect.w / 2), py: rect.y + Math.floor(rect.h / 2) };
+}
+
+function reservaRects(sim, terminalEntity) {
+  const screenApp = sim.getComponent(terminalEntity, "screenApp");
+  const view = buildScreenWorldView(sim);
+  return hotelShell.layout(screenApp.state, view);
+}
+
+function focusTerminal(sim, terminalEntity) {
+  teleportPlayerNextTo(sim, terminalEntity);
+  sim.submit(interactCommand(sim.tick + 1, terminalEntity));
+  sim.step();
+}
+
+// --- ACCEPT branch: room + ACCEPT clicks check the guest in end to end ---
+{
+  const sim = new Sim("hotel-h1b-decision-accept-1");
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+  check("decision(accept): guest reaches presenting", sim.getComponent(guestEntity, "guest").state === "presenting");
+
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const [roomEntity] = findVacantRoom(sim);
+  const terminalEntity = findTerminalEntity(sim);
+
+  focusTerminal(sim, terminalEntity);
+  check(
+    "decision(accept): interact focuses the terminal for the player actor",
+    sim.getComponent(terminalEntity, "terminal").focusedBy === "player",
+  );
+
+  let rects = reservaRects(sim, terminalEntity);
+  const roomKey = `app:room:${roomEntity}`;
+  check("decision(accept): layout() exposes a hit rect for the vacant room", rects[roomKey] !== undefined);
+  let click = rectClickPoint(rects[roomKey]);
+  sim.submit(screenClickCommand(sim.tick + 1, click.px, click.py));
+  sim.step();
+
+  rects = reservaRects(sim, terminalEntity);
+  check("decision(accept): layout() exposes a hit rect for ACCEPT", rects["app:accept"] !== undefined);
+  click = rectClickPoint(rects["app:accept"]);
+  sim.submit(screenClickCommand(sim.tick + 1, click.px, click.py));
+  sim.step();
+
+  const checkedInEvents = sim.eventsSince(0).filter((e) => e.type === "guest.checkedIn" && e.payload?.guestEntity === guestEntity);
+  check("decision(accept): guest.checkedIn fired for this guest", checkedInEvents.length === 1);
+
+  const resAfter = sim.getComponent(resEntity, "reservation");
+  check(
+    "decision(accept): reservation reads {decided:true, accepted:true, room assigned}",
+    resAfter.decided === true && resAfter.accepted === true && resAfter.roomEntity === roomEntity,
+  );
+
+  const roomAfter = sim.getComponent(roomEntity, "roomUnit");
+  check("decision(accept): the room's occupantEntity is set to the guest", roomAfter.occupantEntity === guestEntity);
+}
+
+// --- Guard: clicking ACCEPT with no room selected does not decide -------
+{
+  const sim = new Sim("hotel-h1b-decision-guard-1");
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const terminalEntity = findTerminalEntity(sim);
+  focusTerminal(sim, terminalEntity);
+
+  // No room click submitted -- go straight for ACCEPT.
+  const rects = reservaRects(sim, terminalEntity);
+  const click = rectClickPoint(rects["app:accept"]);
+  sim.submit(screenClickCommand(sim.tick + 1, click.px, click.py));
+  sim.step();
+
+  const resAfter = sim.getComponent(resEntity, "reservation");
+  check(
+    "decision(guard): ACCEPT with no room selected does not decide the reservation",
+    resAfter.decided === false,
+  );
+}
+
+// --- DENY branch: a planted violation is caught and the guest leaves ----
+{
+  const sim = new Sim("hotel-h1b-decision-deny-1");
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal" });
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+
+  const [resEntity, resBefore] = findReservationForGuest(sim, guestEntity);
+  check("decision(deny): the presenting guest's reservation carries a planted violation", resBefore.plantedViolations.length > 0);
+
+  const terminalEntity = findTerminalEntity(sim);
+  focusTerminal(sim, terminalEntity);
+
+  const rects = reservaRects(sim, terminalEntity);
+  check("decision(deny): layout() exposes a hit rect for DENY", rects["app:deny"] !== undefined);
+  const click = rectClickPoint(rects["app:deny"]);
+  sim.submit(screenClickCommand(sim.tick + 1, click.px, click.py));
+  sim.step();
+
+  const fraudCaught = sim.eventsSince(0).filter((e) => e.type === "desk.fraudCaught" && e.payload?.reservationEntity === resEntity);
+  check("decision(deny): desk.fraudCaught fired for this reservation", fraudCaught.length === 1);
+
+  const resAfter = sim.getComponent(resEntity, "reservation");
+  check(
+    "decision(deny): reservation reads {decided:true, accepted:false}",
+    resAfter.decided === true && resAfter.accepted === false,
+  );
+
+  // deskSystem sets `reservation.decided` this tick; guestBrainSystem
+  // reacts on the NEXT tick (system order, same as the FSM(deny) block
+  // above) -- one more step() before the guest's FSM has moved.
+  sim.step();
+  check("decision(deny): the guest ends up leaving", sim.getComponent(guestEntity, "guest").state === "leaving");
+}
+
+// --- Screen overflow gate (surface-ui's findOverflowingNodes) ------------
+//
+// H1b review round 3: a clipped guest name and a crowded, dropped-looking
+// PROCEDURES wrap got past eyeballing a screenshot -- the front-desk loop
+// is entirely "the player reads a field and compares it by eye" (rules.ts's
+// header), so a field the surface cannot display is a fraud the player
+// cannot catch. This block is the mechanical gate: it builds RESERVA's and
+// AUDIT's worst-case `ScreenWorldView.data` from the ACTUAL generator/rule
+// data (never a hand-picked string) and asserts `findOverflowingNodes`
+// returns zero violations against that worst case, then proves the checker
+// is not a no-op by widening a string past the surface and asserting it
+// DOES flag it.
+{
+  const allNames = ARCHETYPES.flatMap((a) => a.names);
+  const longestName = allNames.reduce((a, b) => (b.length > a.length ? b : a));
+  check("overflow-gate setup: longest guest name is non-trivial (>= 10 chars)", longestName.length >= 10);
+
+  // Widest star tier H1_RULES ships -- if a later phase appends a higher
+  // tier, this picks it up automatically rather than staying pinned at 1.
+  const maxStars = Math.max(...H1_RULES.map((r) => r.minStars));
+  const widestRules = rulesForStars(H1_RULES, maxStars);
+  check("overflow-gate setup: widest star tier includes every H1 rule", widestRules.length === H1_RULES.length);
+
+  // Reservation code / doc number are fixed-width by construction
+  // (makeResCode/makeDocNumber in guests.js always emit a 4-digit / 6-digit
+  // number), so their worst case is their format's max width, not a
+  // hand-picked example.
+  const worstResCode = "RC-9999";
+  const worstDocNumber = "X999999";
+  const worstExpiresDay = "99999";
+
+  // The generator ships exactly 4 bedrooms per floor (layout.ts's
+  // ROOM_1..ROOM_4), tiers 1-2 -- a full vacant-room list is all 4 at once.
+  const worstRooms = [
+    { roomEntity: 3, roomId: 3, tier: 1 },
+    { roomEntity: 4, roomId: 4, tier: 2 },
+    { roomEntity: 5, roomId: 5, tier: 1 },
+    { roomEntity: 6, roomId: 6, tier: 2 },
+  ];
+
+  function worstCaseView(guestName) {
+    return {
+      tick: 1,
+      data: {
+        queue: {
+          reservationEntity: 1,
+          guestEntity: 2,
+          docFields: {
+            id: { name: guestName, docNumber: worstDocNumber, expiresDay: worstExpiresDay },
+            resSlip: { guestName, resCode: worstResCode },
+          },
+          resFields: { guestName, resCode: worstResCode },
+        },
+        rooms: worstRooms,
+        ledger: { day: 99999, revenueMinor: 999999999, expenseMinor: 999999999, closingCashMinor: -999999999 },
+      },
+    };
+  }
+
+  const view = worstCaseView(longestName);
+  const reservaNodes = reservaApp.paintSpec(reservaApp.init(), view);
+  const reservaViolations = findOverflowingNodes(reservaNodes);
+  check(
+    `RESERVA: worst-case data (name=${JSON.stringify(longestName)}, all ${widestRules.length} rules, 4 vacant rooms) has zero surface overflows`,
+    reservaViolations.length === 0,
+  );
+  if (reservaViolations.length > 0) console.log(JSON.stringify(reservaViolations, null, 2));
+
+  const auditNodes = auditApp.paintSpec(auditApp.init(), view);
+  const auditViolations = findOverflowingNodes(auditNodes);
+  check("AUDIT: worst-case ledger figures have zero surface overflows", auditViolations.length === 0);
+  if (auditViolations.length > 0) console.log(JSON.stringify(auditViolations, null, 2));
+
+  // Negative control: the checker must actually be capable of catching an
+  // overflow, not just passing because it never fires. Widen the guest
+  // name well past anything the surface can hold and confirm it's flagged.
+  const absurdName = "X".repeat(200);
+  const absurdView = worstCaseView(absurdName);
+  const absurdNodes = reservaApp.paintSpec(reservaApp.init(), absurdView);
+  const absurdViolations = findOverflowingNodes(absurdNodes);
+  check(
+    "overflow gate is not a no-op: a 200-char guest name IS flagged as overflowing",
+    absurdViolations.length > 0,
+  );
+
+  // --- Composed shell tree overflow (H1b review item 2) -------------------
+  // findOverflowingNodes above only ever ran over each APP's own worst-case
+  // nodes -- shell chrome (taskbar, the calibration strip, the reference
+  // glyph row) exists ONLY in the composed `hotelShell.paintSpec` tree,
+  // which is exactly why the glyph row (painted at CALIB_RECT.x=600, 9
+  // glyphs wide at GLYPH_W=8 -> x=672 on a 640-wide surface) ran 32px off
+  // the edge and rendered as "AaBbC" without this gate ever seeing it. Run
+  // the gate over the real composed tree, for every registered app, at the
+  // same worst-case data the app-level checks above use.
+  for (const appId of ["reserva", "audit"]) {
+    const shellState = { openAppId: appId, appStates: {} };
+    const nodes = hotelShell.paintSpec(shellState, view);
+    const violations = findOverflowingNodes(nodes);
+    check(`composed shell tree (${appId} focused, worst-case data) has zero surface overflows`, violations.length === 0);
+    if (violations.length > 0) console.log(JSON.stringify(violations, null, 2));
+  }
+
+  // Negative control: the gate must actually be capable of catching shell
+  // CHROME overflowing (not just app content). Reconstructs the exact
+  // pre-fix glyph-row node -- painted at CALIB_RECT.x=600 -- and confirms
+  // findOverflowingNodes flags it; this does not depend on shell.ts still
+  // having the bug, so it stays a real negative control after the fix.
+  const preFixGlyphRow = { kind: "text", x: 600, y: 12, text: "AaBbCc123", color: 15 };
+  const preFixViolations = findOverflowingNodes([preFixGlyphRow]);
+  check(
+    "overflow gate is not a no-op on shell chrome: the pre-fix glyph-row position IS flagged",
+    preFixViolations.length > 0,
   );
 }
 

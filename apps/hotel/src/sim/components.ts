@@ -11,6 +11,7 @@
  * `exactOptionalPropertyTypes` friction, and no ambiguity between "not yet
  * computed" and "computed as absent").
  */
+import type { ShellState } from "@claude-engine/surface-ui";
 
 // -- H0 (unchanged) ----------------------------------------------------
 
@@ -115,11 +116,14 @@ export interface Terminal {
   focusedBy: string;
 }
 
-/** H1a stub: screenSystem/reduce land in H1b. The component exists now
- *  (on the terminal entity) so H1b's addition is purely additive to state
- *  that already round-trips through snapshot/restore. */
+/** The terminal's diegetic-shell state (H1b): the shell's `ShellState` is
+ *  JSON-plain (`{ openAppId, appStates }`, surface-ui/shell.ts) so it lives
+ *  verbatim here and is hashed like any other component. `paintSeq` is a
+ *  counter bumped by `screenSystem` on state-reference change — never a
+ *  content hash (hashing paint output would smuggle presentation into
+ *  `stateHash`, docs/PHASE-H1.md determinism rules). */
 export interface ScreenApp {
-  state: Record<string, never>;
+  state: ShellState;
   paintSeq: number;
 }
 
@@ -143,6 +147,23 @@ export interface LedgerEntry {
   creditAccount: string;
   amountMinor: number;
   memo: string;
+}
+
+/** H1b save-restore gate (docs/PHASE-H1.md gate 4, apps/hotel/src/main.ts's
+ *  quickLoad()): the browser scenario needs `savedHash === restoredHash` to
+ *  be assertable by `--browser`'s replay-based assertion evaluation
+ *  (packages/harness/src/cli.ts's runBrowserMode replays the captured
+ *  command log through a headless Sim and runs `assertions` against THAT
+ *  Sim — a host-only value like a stateHash comparison is otherwise
+ *  invisible to it). main.ts submits one `debug.saveRestoreRecord` command
+ *  right after a quick-load completes; this component is created lazily
+ *  (never spawned by setup()) so every OTHER scenario — none of which ever
+ *  submit that command — has zero extra entities and an unchanged
+ *  stateHash. Singleton, created on first use. */
+export interface SaveRestoreDebug {
+  savedTick: number;
+  savedHash: number;
+  restoredHash: number;
 }
 
 /** Singleton — the repath round-robin cursor. A component, never a closure

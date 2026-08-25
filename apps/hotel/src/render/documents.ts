@@ -7,11 +7,15 @@
  * reservation *is* the gameplay this phase (rules.ts's fraud table).
  *
  * Host-only, presentation-only (invariant 4): reads `document`/`reservation`
- * via `IWorld`, never writes sim state. The text painter itself lives in
- * `./temp-font-painter.ts` — a small canvas-2D painter that stands in for
- * H1b's `@claude-engine/surface-ui/host` `paintScreen` (committed bitmap
- * font). See that file's header comment: H1b should delete it and repaint
- * through the real painter instead of keeping two font paths.
+ * via `IWorld`, never writes sim state. Text is painted via
+ * `@claude-engine/surface-ui/host`'s `paintScreen` + committed bitmap font —
+ * the SAME painter the terminal screen uses (render/screens.ts) — per the
+ * H1a review's mandatory deferral item 1: `render/temp-font-painter.ts`
+ * (a throwaway `ctx.fillText` stand-in) is deleted; one font path now
+ * exists for every piece of in-game text. The 8px glyph atlas is native at
+ * `SCALE=1`, so this canvas is drawn at a small logical size and then
+ * `ctx.scale()`d up so the glyphs stay crisp (nearest, no blur) rather than
+ * stretched.
  *
  * A document is not a UI framework — it's a textured quad with a few lines
  * of text, raised and tilted toward the camera each frame; no new
@@ -21,10 +25,50 @@ import * as THREE from "three";
 import type { EntityId, IWorld } from "@claude-engine/core";
 import type { SceneContext } from "@claude-engine/renderer-three";
 import type { DocumentComp } from "../sim/components.js";
-import { paintDocument, DOC_CANVAS_W, DOC_CANVAS_H, type DocumentPaintLine } from "./temp-font-painter.js";
+import { GLYPH_H, type PaintNode } from "@claude-engine/surface-ui";
+import { paintScreen } from "@claude-engine/surface-ui/host";
+
+/** Actual backing canvas size (physical pixels for the CanvasTexture). */
+const DOC_CANVAS_W = 512;
+const DOC_CANVAS_H = 384;
+/** Logical (surface-pixel) size the PaintNode tree is authored against —
+ *  matches the 8px glyph atlas's native scale, then blown up by SCALE. */
+const DOC_SCALE = 2;
+const DOC_LOGICAL_W = DOC_CANVAS_W / DOC_SCALE;
+const DOC_LOGICAL_H = DOC_CANVAS_H / DOC_SCALE;
 
 const DOC_W_M = 0.34;
 const DOC_H_M = DOC_W_M * (DOC_CANVAS_H / DOC_CANVAS_W);
+
+export interface DocumentPaintLine {
+  label: string;
+  value: string;
+}
+
+/** Paints a simple paper-like document — title + label/value lines — via
+ *  the shared HOTELSOFT painter, onto a fixed-size canvas 2D context. Pure
+ *  function of its inputs; caller decides when to invoke it (dirty-checked
+ *  against the last-painted field set in `syncHeldDocuments`, so this never
+ *  runs unnecessarily in the render loop). */
+export function paintDocument(ctx: CanvasRenderingContext2D, title: string, lines: readonly DocumentPaintLine[]): void {
+  ctx.save();
+  ctx.setTransform(DOC_SCALE, 0, 0, DOC_SCALE, 0, 0);
+  ctx.clearRect(0, 0, DOC_LOGICAL_W, DOC_LOGICAL_H);
+
+  const nodes: PaintNode[] = [
+    { kind: "panel", rect: { x: 0, y: 0, w: DOC_LOGICAL_W, h: DOC_LOGICAL_H }, fill: 8, border: 0 },
+    { kind: "text", x: 4, y: 4, text: title, color: 0 },
+    { kind: "hline", x: 4, y: 4 + GLYPH_H + 2, w: DOC_LOGICAL_W - 8, color: 14 },
+  ];
+  let y = 4 + GLYPH_H + 6;
+  for (const line of lines) {
+    nodes.push({ kind: "text", x: 4, y, text: `${line.label}: ${line.value}`, color: 0 });
+    y += GLYPH_H + 2;
+  }
+
+  paintScreen(ctx, nodes);
+  ctx.restore();
+}
 
 /** Local (camera-space) offsets for up to two simultaneously held documents
  *  (ID + reservation slip, per the guest-presenting flow) — fanned out so

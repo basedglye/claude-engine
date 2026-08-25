@@ -16,7 +16,14 @@ if (netUrl) {
 
 /** The Phase 1 offline demo: a local Sim, WASD input, no networking. */
 function runOfflineMode(canvas: HTMLCanvasElement): void {
-  const sim = new Sim("claude-engine-demo-1");
+  // The harness passes the running scenario's seed as ?worldforgeSeed=... so a
+// browser run and the headless replay of its command log describe the same
+// world. Without this the two silently diverge: demo-visual declares
+// "claude-engine-demo-visual-1" while this app hardcoded "claude-engine-demo-1", which
+// went unnoticed only because that scenario never ran --verify-replay.
+const DEFAULT_SEED = "claude-engine-demo-1";
+const seedParam = new URLSearchParams(window.location.search).get("worldforgeSeed");
+const sim = new Sim(seedParam ?? DEFAULT_SEED);
   setup(sim);
 
   const hook = installTestHook({

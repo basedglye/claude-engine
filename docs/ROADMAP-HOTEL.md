@@ -37,6 +37,21 @@ determinism gate; `walk-collide` headless (bot walks a scripted path,
 
 ## Phase 1 — "Front Desk & The Terminal" (~1–2 wk) [F]
 
+Split into **H1a "The Queue"** (sim substance, headless-verifiable) and
+**H1b "The Terminal"** (surfaces and persistence, browser-verified), each with
+its own review gate — see [PHASE-H1.md](PHASE-H1.md) for the split ruling.
+
+**H1a — DONE** (merged 2026-08-25). Review: [reviews/phase-H1a.md](reviews/phase-H1a.md) — PASS, zero blocking.
+Guests, deterministic nav with the yield rule, the RESERVA rule table, the
+desk state machine, ledger, day clock, `clerkBot`, articulated characters and
+the held-document view. Gates live: `corridor-headon`, `checkin-rush`,
+`fraud-catch` (A and B).
+
+**H1b — in progress.** `surface-ui`, the HOTELSOFT shell, RESERVA and AUDIT,
+`save-web`, `screenClick` and the readability probe. Start from the H1a
+review's consolidated deferral list.
+
+
 `surface-ui` + HOTELSOFT shell + RESERVA (rule-table driven from day one);
 document entities and held-item inspect; guest NPCs with portal+grid nav,
 **stable-ID yield rule + RNG cell-cost jitter**, and explicit desk queue;

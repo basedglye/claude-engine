@@ -19,6 +19,27 @@ export interface FpsControllerOptions {
   thirdPersonBoomM?: number; // default 3.5
   /** KeyboardEvent.code that toggles first/third person. Default "KeyV". */
   toggleViewKey?: string;
+  /** H1b screen-focus support (docs/PHASE-H1.md "The screen contract").
+   *  Optional and additive: a game with no in-world screens never sets
+   *  this, and `syntheticPointer.screenClick` is simply absent (matching
+   *  how `pointer` itself is absent for a game with no controller at all).
+   *  When present, this is THE shared uv -> command path: both a real
+   *  click while a screen is focused and `syntheticPointer.screenClick`
+   *  must route through the exact same `uvToPixel` + `makeScreenClick`
+   *  call this controller makes internally (see `applyScreenClick` below)
+   *  — that sharing is the whole reason a green synthetic screenClick gate
+   *  says anything about the real mouse path (docs/PHASE-H0.md's
+   *  synthetic-input contract, restated for screens). */
+  screen?: {
+    /** The currently-focused screen's surface-UV -> integer surface-pixel
+     *  mapping (the app's `createScreenSurface().uvToPixel`, per-terminal),
+     *  or undefined when no screen is focused right now. Read fresh on
+     *  every click/screenClick — never cached, since focus can change
+     *  tick to tick. */
+    uvToPixel(u: number, v: number): { px: number; py: number } | undefined;
+    /** Command factory for a resolved screen click — mirrors makeInteract. */
+    makeScreenClick(tick: number, px: number, py: number): Command;
+  };
 }
 
 export interface FpsController {
@@ -30,6 +51,13 @@ export interface FpsController {
   onTick(world: IWorld, submit: (c: Command) => void): void;
   /** The synthetic pointer implementation for installTestHook. */
   syntheticPointer: SyntheticPointer;
+  /** THE shared uv -> command path (present only when `screen` was
+   *  configured). The app's own real-click handling for a focused screen
+   *  (raycast the quad, get a uv hit) must call this exact function rather
+   *  than reimplementing uvToPixel + submit — that is what makes a green
+   *  synthetic `screenClick` gate certify the real mouse path too, per the
+   *  H0 synthetic-input contract this restates for screens. */
+  applyScreenClick?(u: number, v: number): void;
   /** Reticle target resolution: raycast from camera center against the
    *  registered interactable objects; returns the sim entity or undefined.
    *  Presentation-side suggestion only — the sim revalidates. */
@@ -44,7 +72,8 @@ export type InputTraceEntry =
   | { atMs: number; kind: "lock"; locked: boolean }
   | { atMs: number; kind: "look"; dxPx: number; dyPx: number }
   | { atMs: number; kind: "click" }
-  | { atMs: number; kind: "key"; code: string; down: boolean };
+  | { atMs: number; kind: "key"; code: string; down: boolean }
+  | { atMs: number; kind: "screenClick"; u: number; v: number; resolved: boolean };
 
 const DEFAULT_YAW_DRIFT_THRESHOLD_MDEG = 500;
 const DEFAULT_SENSITIVITY_MDEG_PER_PX = 220;
@@ -80,6 +109,13 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
 
   let pendingClickTarget: EntityId | undefined;
   let clickRequested = false;
+
+  // H1b screen-focus queue — mirrors pendingClickTarget/clickRequested's
+  // shape exactly, so a resolved screen click rides the same per-tick
+  // cadence (submitted from onTick, not synchronously) as every other
+  // command this controller produces.
+  let pendingScreenClickPx: { px: number; py: number } | undefined;
+  let screenClickRequested = false;
 
   function nowMs(): number {
     return Date.now();
@@ -135,6 +171,23 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
       pendingClickTarget = target;
       clickRequested = true;
     }
+  }
+
+  // THE H1b screen-click seam. `syntheticPointer.screenClick(u, v)` calls
+  // this directly; the app's real screen-click handling (raycasting its own
+  // focused quad while unlocked, since screen focus exits pointer lock —
+  // see docs/PHASE-H1.md "The screen contract") must call this SAME
+  // function with the uv it resolved, rather than computing uvToPixel and
+  // submitting a command itself. If real and synthetic clicks diverge here,
+  // the readability and check-in browser gates stop meaning anything: they
+  // would only ever prove the synthetic path works, never the mouse a
+  // player actually uses (docs/PHASE-H0.md's synthetic-input contract).
+  function applyScreenClick(u: number, v: number): void {
+    const resolved = opts.screen?.uvToPixel(u, v);
+    trace.push({ atMs: nowMs(), kind: "screenClick", u, v, resolved: resolved !== undefined });
+    if (!resolved) return;
+    pendingScreenClickPx = resolved;
+    screenClickRequested = true;
   }
 
   function applyLockChange(isLocked: boolean): void {
@@ -197,6 +250,16 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
       applyClick();
     },
   };
+  // `screenClick` is attached only when the game configured `screen`
+  // support — additive, exactly like `pointer` itself being absent for a
+  // game with no controller. A scenario that declares a screenClick step
+  // against a hook whose pointer has no `screenClick` fails fast with
+  // BrowserInfraError (packages/harness/src/browser.ts), naming this.
+  if (opts.screen) {
+    syntheticPointer.screenClick = (u: number, v: number): void => {
+      applyScreenClick(u, v);
+    };
+  }
 
   function resolveTarget(): EntityId | undefined {
     if (!raycastCamera) return undefined;
@@ -247,6 +310,26 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
       submit(opts.makeFace(world.tick + 1, camYawMdeg));
     }
 
+    // screen.click{px,py} — resolved uv->pixel, queued by applyScreenClick,
+    // submitted here so it rides the same per-tick cadence as face/move/
+    // interact below rather than firing mid-tick. Deliberately handled
+    // BEFORE the `!locked` gate below: focusing a screen is precisely what
+    // exits pointer lock (see docs/PHASE-H1.md "The screen contract" —
+    // "pointer exits lock but stays captured"), so gating screen clicks on
+    // `locked` the same way WASD movement is gated made every screen click
+    // a silent no-op the instant a screen was actually focused (caught by
+    // the H1b review's synthetic-vs-real seam check: a synthetic
+    // `screenClick` produced zero commands even though `uvToPixel`
+    // resolved a valid pixel).
+    if (screenClickRequested) {
+      screenClickRequested = false;
+      const px = pendingScreenClickPx;
+      pendingScreenClickPx = undefined;
+      if (px && opts.screen) {
+        submit(opts.screen.makeScreenClick(world.tick + 1, px.px, px.py));
+      }
+    }
+
     // move{} — held WASD relative to the current SIM yaw; sim does the trig.
     // Gated on pointer lock: without lock there is no live look/movement
     // session, so held keys (e.g. stale from before a lock loss) submit
@@ -264,6 +347,8 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
 
     // interact{} — proposed by the click seam, consumed here so it rides
     // the same per-tick cadence as everything else the sim revalidates.
+    // Stays gated on `locked` (unlike screenClick above): a world-click
+    // interact only ever happens during a normal locked FPS session.
     if (clickRequested) {
       clickRequested = false;
       if (pendingClickTarget !== undefined) {
@@ -346,7 +431,7 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     return trace;
   }
 
-  return {
+  const controller: FpsController = {
     pointerHandlers,
     onFrame,
     onTick,
@@ -355,4 +440,6 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     registerInteractable,
     inputTrace,
   };
+  if (opts.screen) controller.applyScreenClick = applyScreenClick;
+  return controller;
 }

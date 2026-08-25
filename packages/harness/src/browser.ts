@@ -15,7 +15,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { extname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { CALIB_RECT } from "@claude-engine/surface-ui";
 import type { Scenario } from "./index.js";
+import { analyzeReadability, decodePng } from "./screen-readability.js";
 
 const STATIC_MIME_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -48,7 +50,11 @@ export type InputStep =
   | { pointer: "look"; atTick: number; dx: number; dy: number }
   | { pointer: "click"; atMs: number }
   | { pointer: "click"; atTick: number }
-  | { pointer: "screenClick"; atMs: number; u: number; v: number }; // RESERVED: exit 2 in H0
+  // screenClick (docs/PHASE-H1.md Scope D): tick-gated form only. The
+  // wall-clock form stays RESERVED/exit 2 — H0 deferral rule 6 bans new
+  // wall-clock steps, and H1 restates it explicitly for this one.
+  | { pointer: "screenClick"; atMs: number; u: number; v: number } // RESERVED: exit 2
+  | { pointer: "screenClick"; atTick: number; u: number; v: number };
 
 export interface BrowserSpec {
   /** Workspace name (e.g. "@claude-engine/demo") — harness builds it and
@@ -73,7 +79,13 @@ export interface BrowserSpec {
 export type ProbeSpec =
   | { probe: "fps"; sampleMs?: number }
   | { probe: "input-latency"; key: string; component: string; samples?: number }
-  | { probe: "sim-tick-ms"; minSamples?: number };
+  | { probe: "sim-tick-ms"; minSamples?: number }
+  // docs/PHASE-H1.md "Readability as a gate": analyses the already-captured
+  // screenshot (the most recently captured one, per screenshotAtTicks — no
+  // second capture) at the focused screen's projected pose. `appId` is
+  // carried for report/debugging symmetry with other probes; the analysis
+  // itself only needs the hook's screenRect() and the screenshot bytes.
+  | { probe: "screen-readability"; appId: string };
 
 export interface BrowserRunReport {
   app: string;
@@ -114,10 +126,14 @@ export async function runBrowserScenario(
   }
   const engine: BrowserEngine = opts.browserEngine ?? "chromium";
 
-  // screenClick is reserved, not implemented in H0 (docs/PHASE-H0.md).
+  // screenClick's wall-clock form stays reserved (H0 deferral rule 6 bans
+  // new wall-clock steps; docs/PHASE-H1.md restates it for this one). The
+  // tick-gated form is implemented below.
   for (const step of spec.input ?? []) {
-    if ("pointer" in step && step.pointer === "screenClick") {
-      throw new BrowserInfraError('"screenClick" input steps are not implemented in H0 (reserved for a later phase).');
+    if ("pointer" in step && step.pointer === "screenClick" && "atMs" in step) {
+      throw new BrowserInfraError(
+        '"screenClick" input steps only support the tick-gated form ({ atTick, u, v }) — the wall-clock form stays reserved.'
+      );
     }
   }
 
@@ -147,7 +163,14 @@ export async function runBrowserScenario(
   // demo-walk) never set this, so the app is never asked to pause and
   // behaves exactly as before this change.
   const needsStartBarrier = (spec.input ?? []).some((step) => "downAtTick" in step || "atTick" in step);
-  const navUrl = needsStartBarrier ? withQueryParam(url, "worldforgeStartPaused", "1") : url;
+  // Always hand the app the scenario's seed. Without this the app runs
+  // whatever seed it hardcodes while the headless replay uses the
+  // scenario's, so the two run DIFFERENT WORLDS and the only symptom is
+  // exit 3 (replay divergence) with nothing pointing at the cause. That
+  // cost a full debugging session once; the guard below makes a mismatch
+  // impossible to ship silently.
+  let navUrl = withQueryParam(url, "worldforgeSeed", scenario.seed);
+  if (needsStartBarrier) navUrl = withQueryParam(navUrl, "worldforgeStartPaused", "1");
 
   // Headless Chromium's default GL backend fails to compile Three.js's
   // shaders on many CI/sandboxed machines (shader VALIDATE_STATUS false ->
@@ -209,6 +232,38 @@ export async function runBrowserScenario(
         );
       }
     }
+    // Matches the pointer precedent exactly: a specific slot check (not just
+    // the generic hookHasPointer above) for screenClick, since a hook can
+    // have a pointer with click/look/lock but no screenClick.
+    const hasScreenClickStep = (spec.input ?? []).some((s) => "pointer" in s && s.pointer === "screenClick");
+    if (hasScreenClickStep) {
+      const hookHasScreenClick = await page.evaluate(
+        () =>
+          typeof (window as unknown as { __WORLDFORGE__: { pointer?: { screenClick?: unknown } } }).__WORLDFORGE__.pointer
+            ?.screenClick === "function"
+      );
+      if (!hookHasScreenClick) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" has screenClick input steps, but the app's test hook's pointer exposes no ` +
+            `"screenClick" (window.__WORLDFORGE__.pointer.screenClick). The app must pass a SyntheticPointer with a ` +
+            `screenClick slot to installTestHook (see @claude-engine/player-fps's "screen" controller option).`
+        );
+      }
+    }
+
+    const wantsScreenReadability = (spec.probes ?? []).some((p) => p.probe === "screen-readability");
+    if (wantsScreenReadability) {
+      const hookHasScreenRect = await page.evaluate(
+        () => typeof (window as unknown as { __WORLDFORGE__: { screenRect?: unknown } }).__WORLDFORGE__.screenRect === "function"
+      );
+      if (!hookHasScreenRect) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" requests the "screen-readability" probe, but the app's test hook exposes no ` +
+            `"screenRect" (window.__WORLDFORGE__.screenRect). The app must pass a screenRect() function to installTestHook.`
+        );
+      }
+    }
+
     const wantsTickTimings = (spec.probes ?? []).some((p) => p.probe === "sim-tick-ms");
     if (wantsTickTimings) {
       const hookHasTickTimings = await page.evaluate(
@@ -218,6 +273,25 @@ export async function runBrowserScenario(
         throw new BrowserInfraError(
           `Scenario "${scenario.name}" requests the "sim-tick-ms" probe, but the app's test hook exposes no ` +
             `"tickTimings" (window.__WORLDFORGE__.tickTimings). The app must pass a tickTimings() function to installTestHook.`
+        );
+      }
+    }
+
+    // The app must actually be running the scenario's world. If it ignored
+    // ?worldforgeSeed the browser run and the headless replay describe
+    // different worlds, and the only symptom would be exit 3 with no cause
+    // named — a silent trap that has already cost one long debugging
+    // session. Fail loudly and say exactly what to wire instead.
+    {
+      const liveSeed = await page.evaluate(
+        () => (window as unknown as { __WORLDFORGE__: { world: { seed: string } } }).__WORLDFORGE__.world.seed
+      );
+      if (liveSeed !== scenario.seed) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" declares seed "${scenario.seed}" but the app is running seed ` +
+            `"${liveSeed}". The harness navigated with ?worldforgeSeed=${scenario.seed}; the app must read ` +
+            `that query parameter and construct its Sim with it. Left unfixed, the browser run and the ` +
+            `headless replay of its command log are different worlds and the run fails as a replay divergence.`
         );
       }
     }
@@ -272,6 +346,19 @@ export async function runBrowserScenario(
 
     // Drive the wall-clock input script in real time.
     const inputDone = runInputScript(page, spec.input ?? [], deadline, releaseBarrier);
+    // `inputDone` is only actually awaited below, AFTER the screenshot
+    // capture loop -- if it rejects (e.g. the new undrained-queue
+    // BrowserInfraError) while that loop is still polling for a LATER
+    // screenshot tick, Node considers it unhandled the instant it rejects
+    // and crashes the process before the `await inputDone` below ever
+    // runs, bypassing this function's own try/finally and cli.ts's catch
+    // entirely -- an uncaught exit 1 with no "Browser-mode infra failure"
+    // message instead of the clean exit 2 that error is supposed to
+    // produce. This no-op catch marks the rejection "handled" immediately;
+    // the real error is still surfaced (and still fails the run) by the
+    // `await inputDone` below, which rethrows it into the try this
+    // function already wraps everything in.
+    inputDone.catch(() => undefined);
 
     // Capture screenshots as the sim crosses each requested tick.
     let nextIdx = 0;
@@ -293,7 +380,7 @@ export async function runBrowserScenario(
 
     const probeResults: Record<string, Record<string, number>> = {};
     for (const p of spec.probes ?? []) {
-      probeResults[p.probe] = await runProbe(page, p, tickRateHz, deadline);
+      probeResults[p.probe] = await runProbe(page, p, tickRateHz, deadline, screenshots);
     }
 
     const feelChecks: { target: string; value: number; passed: boolean }[] = [];
@@ -383,11 +470,19 @@ type TickScheduledEvent =
   | { atTick: number; type: "down" | "up"; key: string }
   | { atTick: number; type: "pointer-lock" }
   | { atTick: number; type: "pointer-look"; dx: number; dy: number }
-  | { atTick: number; type: "pointer-click" };
+  | { atTick: number; type: "pointer-click" }
+  | { atTick: number; type: "pointer-screen-click"; u: number; v: number };
 
 async function dispatchEvent(
   page: import("playwright").Page,
-  ev: { type: "down" | "up" | "pointer-lock" | "pointer-look" | "pointer-click"; key?: string; dx?: number; dy?: number }
+  ev: {
+    type: "down" | "up" | "pointer-lock" | "pointer-look" | "pointer-click" | "pointer-screen-click";
+    key?: string;
+    dx?: number;
+    dy?: number;
+    u?: number;
+    v?: number;
+  }
 ): Promise<void> {
   switch (ev.type) {
     case "down":
@@ -414,6 +509,15 @@ async function dispatchEvent(
     case "pointer-click":
       await page.evaluate(
         () => (window as unknown as { __WORLDFORGE__: { pointer?: { click(): void } } }).__WORLDFORGE__.pointer?.click()
+      );
+      break;
+    case "pointer-screen-click":
+      await page.evaluate(
+        ([u, v]) =>
+          (
+            window as unknown as { __WORLDFORGE__: { pointer?: { screenClick?(u: number, v: number): void } } }
+          ).__WORLDFORGE__.pointer?.screenClick?.(u as number, v as number),
+        [ev.u, ev.v]
       );
       break;
   }
@@ -443,6 +547,8 @@ async function runInputScript(
         if (step.pointer === "lock") tickEvents.push({ atTick: step.atTick, type: "pointer-lock" });
         else if (step.pointer === "look") tickEvents.push({ atTick: step.atTick, type: "pointer-look", dx: step.dx, dy: step.dy });
         else if (step.pointer === "click") tickEvents.push({ atTick: step.atTick, type: "pointer-click" });
+        else if (step.pointer === "screenClick")
+          tickEvents.push({ atTick: step.atTick, type: "pointer-screen-click", u: step.u, v: step.v });
       }
     } else if ("downMs" in step) {
       msEvents.push({ at: step.downMs, type: "down", key: step.key });
@@ -478,7 +584,53 @@ async function runInputScript(
     await dispatchEvent(page, ev);
   }
 
+  // Install the tick-gated queue BEFORE releasing the start barrier. The
+  // sim is free-running the instant release() returns, so installing the
+  // queue afterward (as a separate round trip) races a step gated on an
+  // early tick: that tick could pass, in-page, before
+  // __WORLDFORGE_TICK_QUEUE__ exists to catch it. Installation itself is
+  // inert while the sim is still paused at tick 0 — the app's tick pump
+  // doesn't drain it until the sim actually steps — so doing this before
+  // release is safe and independent of the tick-0 dispatch above. Every
+  // scenario in the repo currently gates no earlier than tick 16, which is
+  // exactly why this ordering bug had no observed trigger; it is not a
+  // design guarantee.
+  if (tickRest.length > 0) await installTickQueue();
+
   if (releaseBarrier) await releaseBarrier();
+
+  async function installTickQueue(): Promise<void> {
+    // Install the whole queue in-page and let the app's own tick pump drain
+    // it via hook.notifyTick, so each step fires synchronously ON its
+    // declared tick. The previous approach — poll world.tick from out of
+    // process, then dispatch over a round trip — is bounded-late: a key-up
+    // gated on tick N could land on N+1, which silently changed the move
+    // count between runs. docs/reviews/phase-H0.md round 3 recorded that as
+    // debt with exactly this trigger, and it fired in save-restore.
+    await page.evaluate((events) => {
+      const w = window as unknown as {
+        __WORLDFORGE_TICK_QUEUE__?: { atTick: number; run(): void; done?: boolean; error?: string }[];
+        __WORLDFORGE__: { pointer?: Record<string, (...a: number[]) => void> };
+      };
+      const queue: { atTick: number; run(): void; done?: boolean; error?: string }[] = [];
+      for (const ev of events) {
+        queue.push({
+          atTick: ev.atTick,
+          run(): void {
+            const p = w.__WORLDFORGE__.pointer;
+            if (ev.type === "down" || ev.type === "up") {
+              const type = ev.type === "down" ? "keydown" : "keyup";
+              window.dispatchEvent(new KeyboardEvent(type, { code: ev.key ?? "", bubbles: true }));
+            } else if (ev.type === "pointer-lock") p?.lock?.();
+            else if (ev.type === "pointer-look") p?.look?.(ev.dx ?? 0, ev.dy ?? 0);
+            else if (ev.type === "pointer-click") p?.click?.();
+            else if (ev.type === "pointer-screen-click") p?.screenClick?.(ev.u ?? 0, ev.v ?? 0);
+          },
+        });
+      }
+      w.__WORLDFORGE_TICK_QUEUE__ = queue;
+    }, tickRest as unknown as { atTick: number; type: string; key?: string; dx?: number; dy?: number; u?: number; v?: number }[]);
+  }
 
   async function runMsEvents(): Promise<void> {
     msEvents.sort((a, b) => a.at - b.at);
@@ -496,11 +648,31 @@ async function runInputScript(
   // via the same pollUntilTick approach the harness already uses for
   // screenshot capture.
   async function runTickEvents(): Promise<void> {
-    for (const ev of tickRest) {
-      if (Date.now() >= deadline) break;
-      await pollUntilTick(page, ev.atTick, deadline);
-      if (Date.now() >= deadline) break;
-      await dispatchEvent(page, ev);
+    if (tickRest.length === 0) return;
+    // The queue was already installed (before releaseBarrier(), above) —
+    // just wait for it to drain, then surface any error a step threw
+    // in-page rather than letting it vanish.
+    const lastTick = Math.max(...tickRest.map((ev) => ev.atTick));
+    await pollUntilTick(page, lastTick, deadline);
+    const status = await page.evaluate(() => {
+      const w = window as unknown as { __WORLDFORGE_TICK_QUEUE__?: { done?: boolean; error?: string }[] };
+      const q = w.__WORLDFORGE_TICK_QUEUE__ ?? [];
+      return { pending: q.filter((e) => !e.done).length, errors: q.map((e) => e.error).filter(Boolean) };
+    });
+    if (status.errors.length > 0) {
+      throw new BrowserInfraError(`Tick-gated input step threw in-page: ${status.errors.join("; ")}`);
+    }
+    if (status.pending > 0) {
+      // A step never ran: either the deadline hit early, or (far more
+      // likely) the app never drains __WORLDFORGE_TICK_QUEUE__ via
+      // hook.notifyTick at all. Without this check that omission produces
+      // silently-undispatched input and a misdiagnosed assertion failure
+      // downstream — this names the actual cause instead.
+      throw new BrowserInfraError(
+        `${status.pending} tick-gated input step(s) never ran (queue still has undrained entries at tick ` +
+          `${lastTick}'s deadline). The app's tick pump likely never calls hook.notifyTick to drain ` +
+          `__WORLDFORGE_TICK_QUEUE__ — every app under --browser must wire that call once per sim step.`
+      );
     }
   }
 
@@ -511,8 +683,37 @@ async function runProbe(
   page: import("playwright").Page,
   spec: ProbeSpec,
   tickRateHz: number,
-  deadline: number
+  deadline: number,
+  screenshots: readonly { requestedTick: number; actualTick: number; path: string }[]
 ): Promise<Record<string, number>> {
+  if (spec.probe === "screen-readability") {
+    // Reuse the already-captured screenshot (the harness's existing
+    // screenshotAtTicks capture path) rather than taking a second one — the
+    // most recently requested one is "the declared tick" per
+    // docs/PHASE-H1.md Scope D.
+    const shot = screenshots[screenshots.length - 1];
+    if (!shot) {
+      throw new BrowserInfraError(
+        `The "screen-readability" probe requires at least one screenshotAtTicks capture; scenario declared none.`
+      );
+    }
+    const screenRect = await page.evaluate(
+      () =>
+        (
+          window as unknown as { __WORLDFORGE__: { screenRect?(): { x: number; y: number; w: number; h: number; texelScale: number } | undefined } }
+        ).__WORLDFORGE__.screenRect?.()
+    );
+    if (!screenRect) {
+      throw new BrowserInfraError(
+        `The "screen-readability" probe's screenRect() returned undefined at tick ${shot.actualTick} — no screen is ` +
+          `focused. The scenario must focus a screen (interact + screenClick) before the probe's screenshot tick.`
+      );
+    }
+    const image = decodePng(readFileSync(shot.path));
+    const result = analyzeReadability(image, screenRect, CALIB_RECT);
+    return { texelScale: result.texelScale, calibContrast: result.calibContrast, calibPitchErr: result.calibPitchErr };
+  }
+
   if (spec.probe === "fps") {
     const sampleMs = Math.min(spec.sampleMs ?? 1000, Math.max(0, deadline - Date.now()));
     const samples = await page.evaluate(async (ms) => {
@@ -601,9 +802,17 @@ function readFirstComponentValue(component: string): unknown {
 }
 
 function lookupProbeValue(probes: Record<string, Record<string, number>>, key: string): number | undefined {
-  // Keys look like "fps.avg", "inputLatency.avgMs", or "simTickMs.avgMs" — map to our probe result names.
+  // Keys look like "fps.avg", "inputLatency.avgMs", "simTickMs.avgMs", or
+  // "screenReadability.texelScale" — map to our probe result names.
   const [probeKey, field] = key.split(".", 2);
-  const probeName = probeKey === "inputLatency" ? "input-latency" : probeKey === "simTickMs" ? "sim-tick-ms" : probeKey;
+  const probeName =
+    probeKey === "inputLatency"
+      ? "input-latency"
+      : probeKey === "simTickMs"
+        ? "sim-tick-ms"
+        : probeKey === "screenReadability"
+          ? "screen-readability"
+          : probeKey;
   return probeName && field ? probes[probeName]?.[field] : undefined;
 }
 

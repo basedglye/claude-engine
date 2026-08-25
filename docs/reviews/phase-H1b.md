@@ -106,3 +106,79 @@ Defect 5's failure mode — a `screenRect` reporting a texelScale the pixels con
 ## Resubmission
 
 Land item 1's headless decision-path test (assert both ACCEPT and DENY branches, coordinates derived from `layout()`), plus whichever of items 2–7 land cheaply in the same pass. Re-run: the hotel suite, `npm test`, one `reserva-readability --browser --verify-replay` per engine, one `save-restore --browser --verify-replay`. Items not landed carry to the Phase 2 list.
+
+---
+
+## Round 2
+
+Reviewer: Fable 5. Resubmission reviewed: `5f7c82c`, diffed against `07932d7` (the round-1 verdict commit). 7 files, +295/−32. All verification re-run by the reviewer; nothing taken from the implementer's claims. Perturbations applied to gitignored build outputs only, all reversed; `git status --porcelain` empty at review end.
+
+### Verdict: PASS
+
+The blocking item is closed with a test that survives three reviewer-chosen mutations it was never tuned against, items 2/4/6/7 are closed as claimed and verified from first principles, and the full regression battery — package suites, every headless scenario, and the browser gates at ≥3 runs each on both engines — is green with byte-constant command streams. **The phase is clear to merge to `main`.**
+
+### Item 1 (blocking) — CONFIRMED CLOSED, and the test bites from multiple directions
+
+The three new blocks in `apps/hotel/scripts/test.mjs` drive the real path: `interact` → `terminal.focusedBy === "player"` → `screen.click` at coordinates from `rectClickPoint(hotelShell.layout(screenApp.state, buildScreenWorldView(sim)))`. Verified in source that `reservaRects()` calls `layout()` **fresh before every click**, so a layout shift between the room click and the ACCEPT click is tracked rather than baked. No pixel literals anywhere.
+
+The implementer proved it against one mutation (removing the effect emission). I broke it three *different* ways, each against the built dist, each restored and re-verified green:
+
+| Reviewer mutation | Result |
+|---|---|
+| `hitRect` → always `undefined` | exit 1, **exactly the 6 decision-path checks red**; the layout()-existence checks correctly stay green — they test a different link |
+| Accept-guard broken realistically: ACCEPT with no selection auto-picks `data.rooms[0]` | exit 1, **exactly and only** `decision(guard)` red — the guard check is not riding on downstream validation |
+| `applyDeskDecision` → no-op | exit 1, 18 checks red including all 6 decision-path checks |
+
+Note on the guard block: it has no explicit `rects["app:accept"] !== undefined` check, but `rectClickPoint(undefined)` throws and fails the suite, so a vanished ACCEPT rect cannot pass silently. Adequate.
+
+### Item 2 — CONFIRMED. The composed-tree gate catches the old bug, not just blesses the new row
+
+The gate runs `findOverflowingNodes(hotelShell.paintSpec(...))` for both registered apps at the same worst-case data as the app-level checks. I reintroduced the defect myself — `CALIB_GLYPH_X` forced back to 600 in the built shell — and **both** composed-tree checks went red. The in-suite negative control (reconstructing the pre-fix node at x=600) passes independent of shell state, so it remains a live control after the fix. The fix is right-aligned from `SCREEN_W − text.length·GLYPH_W`, so the row's width can change without silently overflowing again.
+
+### Item 4 — CONFIRMED. Ordering correct on every path; the throw fires with the right message; the rejection fix swallows nothing
+
+Path audit of `runInputScript`: empty input → release only; tick-0-only → dispatch before release, no queue, early return, no spurious throw; ms-only → no queue, no throw; mixed → `installTickQueue()` **before** `releaseBarrier()`, and installation is inert while paused because only the app's `notifyTick` drains it. The `pending > 0` throw can fire only when `pollUntilTick` deadline-times-out with undrained entries — i.e. input that would previously have been *silently dropped*.
+
+I verified the throw differently from the implementer: broke the drain in `renderer-three`'s built `test-hook.js` (the package dist survives the harness's app rebuild, which the app-bundle route does not). Result: **exit 2**, message naming `hook.notifyTick` and the 4 undrained steps, cleanly routed through "Browser-mode infra failure" — which also exercises the unhandled-rejection fix, since that rejection lands while the screenshot loop is polling. The fix cannot swallow errors: `inputDone.catch(() => undefined)` only marks the rejection handled; the later `await inputDone` rethrows inside the existing try.
+
+### Item 6 — the self-heal argument VERIFIED, not accepted
+
+`rigsByEntity` and `heldDocs` are written only inside `objectFor`'s create callback, and both have per-frame prunes against the live-entity set. The reuse hazard requires an id live across the restore boundary without an absent frame — but such an id existed at the save tick, and both branches share identical history up to that tick, so it is the *same* entity with the same create-time appearance; per-frame state is re-read live. An id absent in the restored state is pruned before any reuse. The argument holds.
+
+`registeredGuestInteractables` is correctly the odd one out (no prune, register-once), and the Set-clear suffices because `player-fps`'s `interactables` is a Map keyed by entity — re-registration **overwrites** the stale `Object3D`. The lingering reverse-map entry for a disposed object is a bounded leak, not a correctness issue; noted for Phase 2. `doorGroups`/`screensByEntity` key setup-time static entities with restore-stable ids — correctly outside the reset.
+
+### Item 7 + carries
+
+Confirmed in the diff: the stale `screens.ts` paragraph is deleted; `save-restore.scenario.mjs` states the pinned-pose no-op dependency in full, including the exit-3-with-no-warning failure mode; CI's save-restore line is `--browser --verify-replay`, which I ran green three times.
+
+### Regression battery (all reviewer-executed, post-fix tree)
+
+| Command | Result |
+|---|---|
+| `npm run build` / `npx eslint .` / `check-purity` | exit 0, eight roots clean |
+| `npm test` (smoke) | exit 0, hash **919868270** unchanged, replay PASS |
+| all package suites | exit 0, **349 PASS / 0 FAIL** |
+| hotel suite | exit 0 incl. 13 new decision checks + 3 new overflow checks |
+| every headless scenario, `--verify-replay` | all exit 0 |
+| `soak-ci --soak` | exit 0 |
+| `reserva-readability --browser --verify-replay` ×3 Chromium + ×1 Firefox | all pass, replay-verified; **20-command stream, identical sha256 all four runs, both engines**; probe 1.3800 / 241.3 / pitchErr 0 |
+| `save-restore --browser --verify-replay` ×3 | all pass, replay-verified, constant 69-command stream |
+| `fps-look-interact --browser --verify-replay` ×3 | all pass, replay-verified, constant 12-command stream |
+| `demo-visual --browser --verify-replay` | exit 0 |
+
+### What I tried to break and could not
+
+- The decision test, three ways — red on the right checks every time, never all-green, never red on unrelated checks.
+- The composed overflow gate, by reintroducing the actual historical defect in the built shell — caught on both app states.
+- The tick-queue drain, by severing it at the package-dist level — clean exit-2 infra error with the correct diagnosis, no unhandled-rejection crash.
+- Command-stream drift across 10 browser runs and two engines — none.
+
+### Consolidated deferral list for Phase 2 (final — start from this)
+
+1. **Quick-load persistence semantics** (round-1 item 3): before any load-on-boot or save UI — switch the live game id on quick-load (or truncate the abandoned branch), add `listGames()`/`deleteGame()` (⚠ additive, review turn), add an `"./recover"` exports subpath to `persistence`. The CI hardening and scenario documentation landed this round; the branch-mixing fix remains, latent until `recoverSim` is called at boot.
+2. **`resetEntityKeyedHostState()` is the seam — exercise it for real** the first time a load menu exists; any new entity-keyed host registry that does not self-heal through `objectFor` belongs in it. Minor: `player-fps`'s `objectToEntity` reverse map accumulates entries for disposed objects across restores.
+3. **`debug.*` command rejection in server validation** (round-1 item 5). Hard trigger: MP wiring, Phase-5 preconditions — must land before any remote actor exists.
+4. **Carried from H1a unchanged:** `space` clearance-aware A* extraction; sidestep-branch assertion before crowd density rises; `indexSystem` per-tick scan / A*-allocation refactor (`checkin-rush` avgTickMs 0.030 at ~60 entities remains the number to beat); `plantViolation` `listed` branch before MAILBOX; guests-never-close-doors; boom clip.
+5. **Pattern obligations for new work:** every new screen app gets decision-path coverage in the shape of this round's test (layout()-derived clicks, both branches, the guard); every new app registered with the shell gets a composed-tree overflow entry (the loop currently hardcodes `["reserva", "audit"]` — extend it, or derive from the registry, when app three arrives); the first scenario gating input at tick ≤ 5 validates the queue-before-barrier ordering under real pressure.
+
+**Phase H1b is clear to merge to `main`.**

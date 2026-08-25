@@ -80,6 +80,12 @@ carried from Phase 0.
 - Autonomous improvement loop: feedback intake → harness-verified PRs
 - Public plugin release + marketplace listing; announce
 
+## Active application track: `apps/hotel` (GRAND FOYER)
+A first-person hotel simulation, alongside the unstarted `apps/living-world`
+Phase 4 flagship above. Runs its own phased roadmap in
+[docs/ROADMAP-HOTEL.md](ROADMAP-HOTEL.md); design bible and architecture
+live in `apps/hotel/docs/DESIGN.md` and `apps/hotel/docs/ARCHITECTURE.md`.
+
 ## Later / stretch
 - Godot host bridge (WASM sim or sidecar protocol), native (Tauri) host
 - Game-feel analyzer maturity; visual asset quality scoring (Claude Vision)

@@ -17,6 +17,14 @@ export class RestoreError extends Error {}
  * - Component stores are Maps keyed by numeric EntityId; iteration order is
  *   insertion order, which is deterministic given deterministic logic.
  */
+export interface SimOptions {
+  /** Retain events for at most this many most-recent ticks (default:
+   *  unbounded, preserving current behaviour for all existing callers).
+   *  Trimming happens at the start of step(). eventsSince(t) for a t older
+   *  than the retained window returns only retained events. */
+  eventRetentionTicks?: number;
+}
+
 export class Sim implements IWorld {
   readonly seed: string;
   readonly rng: Rng;
@@ -29,10 +37,12 @@ export class Sim implements IWorld {
   private readonly eventLog: GameEvent[] = [];
   private readonly forks = new Map<string, Rng>();
   private stepped = false;
+  private readonly eventRetentionTicks: number | undefined;
 
-  constructor(seed: string) {
+  constructor(seed: string, opts?: SimOptions) {
     this.seed = seed;
     this.rng = new Rng(seed);
+    this.eventRetentionTicks = opts?.eventRetentionTicks;
   }
 
   // --- setup ---------------------------------------------------------------
@@ -100,6 +110,28 @@ export class Sim implements IWorld {
         }
   }
 
+  /**
+   * Remove an entity: deletes it from every component store. Emits nothing —
+   * callers emit their own events. Entity ids are never reused (nextEntity
+   * is monotonic), so a despawned id appearing in an older event stays
+   * unambiguous.
+   */
+  despawn(entity: EntityId): void {
+    for (const store of this.components.values()) store.delete(entity);
+  }
+
+  /**
+   * All components currently attached to an entity, as [name, value] pairs,
+   * in component-store registration order (the same order `stateHash()` and
+   * `snapshot()` iterate `this.components` in) so iteration is deterministic.
+   * Read-only view; O(#component types).
+   */
+  *componentsOf(entity: EntityId): Iterable<[string, unknown]> {
+    for (const [name, store] of this.components) {
+      if (store.has(entity)) yield [name, store.get(entity)];
+    }
+  }
+
   // --- commands & events ---------------------------------------------------
 
   submit(command: Command): void {
@@ -115,8 +147,24 @@ export class Sim implements IWorld {
     this.eventLog.push({ tick: this.tick, type, payload });
   }
 
+  /**
+   * Events with tick >= the given tick. The event log is append-only with
+   * monotonically non-decreasing `tick`, so this binary-searches for the
+   * first qualifying index rather than filtering the whole log (O(log n)
+   * vs. O(total events), forever). If `eventRetentionTicks` is set, older
+   * events have already been trimmed at the start of step() — a `tick`
+   * older than the retained window returns only what survived trimming.
+   */
   eventsSince(tick: number): readonly GameEvent[] {
-    return this.eventLog.filter((e) => e.tick >= tick);
+    let lo = 0;
+    let hi = this.eventLog.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const e = this.eventLog[mid];
+      if (e !== undefined && e.tick >= tick) hi = mid;
+      else lo = mid + 1;
+    }
+    return this.eventLog.slice(lo);
   }
 
   // --- the loop --------------------------------------------------------------
@@ -125,6 +173,18 @@ export class Sim implements IWorld {
   step(): void {
     this.stepped = true;
     this.tick++;
+    if (this.eventRetentionTicks !== undefined) {
+      const minTick = this.tick - this.eventRetentionTicks + 1;
+      let lo = 0;
+      let hi = this.eventLog.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        const e = this.eventLog[mid];
+        if (e !== undefined && e.tick >= minTick) hi = mid;
+        else lo = mid + 1;
+      }
+      if (lo > 0) this.eventLog.splice(0, lo);
+    }
     for (const system of this.systems) system(this);
     this.pendingCommands.length = 0;
   }

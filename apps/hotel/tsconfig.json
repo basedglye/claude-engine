@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": ["ES2022", "DOM"],
+    "types": []
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/assets" },
+    { "path": "../../packages/renderer-three" },
+    { "path": "../../packages/space" },
+    { "path": "../../packages/interiors" },
+    { "path": "../../packages/player-fps" }
+  ]
+}

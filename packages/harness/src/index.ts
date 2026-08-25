@@ -183,22 +183,54 @@ export function runScenario(scenario: Scenario): Verdict {
 export function verifyReplay(
   scenario: Scenario,
   expectedHash: number,
-  commands?: readonly Command[]
+  commands?: readonly Command[],
+  ticks?: number
 ): { verified: boolean; expectedHash: number; actualHash: number } {
+  // Browser-mode runs land on a wall-clock-determined final tick that can
+  // differ from scenario.ticks (the static headless tick count) — the
+  // caller passes the run's actual final tick so replay covers exactly the
+  // ticks that were live. Headless callers omit `ticks` and keep the
+  // original scenario.ticks behaviour unchanged.
+  const tickCount = ticks ?? scenario.ticks;
+  const sim = replayToSim(scenario, commands ?? scenario.commands ?? [], tickCount);
+  const actualHash = sim.stateHash();
+  return { verified: actualHash === expectedHash, expectedHash, actualHash };
+}
+
+/**
+ * Replay (seed, commands) against a fresh sim for `ticks` ticks and return
+ * the resulting Sim — the shared core behind verifyReplay's hash comparison
+ * and browser-mode's assertion evaluation (see cli.ts's runBrowserMode).
+ * setup() always runs first, same as every other replay path in this file.
+ */
+export function replayToSim(scenario: Scenario, commands: readonly Command[], ticks: number): Sim {
   const sim = new Sim(scenario.seed);
   scenario.setup(sim);
   const byTick = new Map<number, Command[]>();
-  for (const c of commands ?? scenario.commands ?? []) {
+  for (const c of commands) {
     const list = byTick.get(c.tick) ?? [];
     list.push(c);
     byTick.set(c.tick, list);
   }
-  for (let t = 1; t <= scenario.ticks; t++) {
+  for (let t = 1; t <= ticks; t++) {
     for (const c of byTick.get(t) ?? []) sim.submit(c);
     sim.step();
   }
-  const actualHash = sim.stateHash();
-  return { verified: actualHash === expectedHash, expectedHash, actualHash };
+  return sim;
+}
+
+/** Evaluate a scenario's declared assertions against a sim's final state —
+ *  the same shape runScenario produces, reused by browser mode's replay. */
+export function evaluateAssertions(
+  scenario: Scenario,
+  sim: Sim
+): { description: string; passed: boolean; error?: string }[] {
+  return scenario.assertions.map((a) => {
+    const outcome = safeCheck(a, sim);
+    return outcome.error === undefined
+      ? { description: a.description, passed: outcome.passed }
+      : { description: a.description, passed: outcome.passed, error: outcome.error };
+  });
 }
 
 export interface ReplayVerdict {

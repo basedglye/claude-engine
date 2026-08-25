@@ -11,6 +11,7 @@ export {
   generateCreatureMesh,
   generatePropMesh,
   type MeshData,
+  type MeshDataWithColors,
   type CreatureOptions,
   type PropOptions,
 } from "./mesh.js";

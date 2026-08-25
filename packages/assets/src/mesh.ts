@@ -9,6 +9,13 @@ export interface MeshData {
   triCount: number;
 }
 
+/** `MeshData` with `colors` required rather than optional — the shape
+ *  `@claude-engine/interiors` produces for wall/door geometry (per-vertex
+ *  RGB, 0..1, length = 3 * vertex count). A derived (not separately
+ *  constructed) type so every `MeshData` consumer keeps working unchanged;
+ *  only producers that guarantee colors opt into the stricter type. */
+export type MeshDataWithColors = MeshData & { colors: Float32Array };
+
 export interface CreatureOptions {
   /** Approximate body radius, world units. Default 0.5. */
   radius?: number;

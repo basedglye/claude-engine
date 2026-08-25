@@ -1,0 +1,25 @@
+{
+  "name": "@claude-engine/hotel",
+  "version": "0.0.1",
+  "description": "ClaudeEngine hotel game — Phase H0 'Walk the Lobby'.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:game": "tsc -p tsconfig.game.json",
+    "build": "npm run build:game && vite build"
+  },
+  "dependencies": {
+    "@claude-engine/assets": "*",
+    "@claude-engine/core": "*",
+    "@claude-engine/interiors": "*",
+    "@claude-engine/player-fps": "*",
+    "@claude-engine/renderer-three": "*",
+    "@claude-engine/space": "*",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

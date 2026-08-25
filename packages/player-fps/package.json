@@ -1,0 +1,21 @@
+{
+  "name": "@claude-engine/player-fps",
+  "version": "0.0.1",
+  "description": "First/third-person controller host layer: pointer lock, mouse look, reticle raycast, input-to-CommandIntent, replayable input traces",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "@claude-engine/renderer-three": "*",
+    "@claude-engine/space": "*",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.169.0"
+  }
+}

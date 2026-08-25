@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist-game",
+    "rootDir": "src",
+    "lib": ["ES2022"],
+    "types": []
+  },
+  "include": ["src/sim/game.ts"],
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/assets" },
+    { "path": "../../packages/space" },
+    { "path": "../../packages/interiors" }
+  ]
+}

@@ -5,7 +5,8 @@
  * Contract (docs/PHASE-1.md, section C; extended by docs/PHASE-2.md Scope D/E
  * and docs/PHASE-3.md Scope A):
  *   npm run harness -- <scenario> [--verify-replay] [--out <file>]
- *                                 [--browser] [--screenshot-dir <dir>] [--soak]
+ *                                 [--browser] [--browser-engine <chromium|firefox>]
+ *                                 [--screenshot-dir <dir>] [--soak]
  *   npm run harness -- --replay <verdict.json> [--out <file>]
  *                                 [--from-checkpoint <tick>]
  *
@@ -27,7 +28,15 @@ import { resolve, isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Sim, RestoreError } from "@claude-engine/core";
 import type { Scenario, Verdict } from "./index.js";
-import { runScenario, verifyReplay, replayVerdict, replayVerdictFromCheckpoint, CheckpointError } from "./index.js";
+import {
+  runScenario,
+  verifyReplay,
+  replayVerdict,
+  replayVerdictFromCheckpoint,
+  replayToSim,
+  evaluateAssertions,
+  CheckpointError,
+} from "./index.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 // dist/cli.js -> packages/harness/dist -> packages/harness -> packages -> repo root
@@ -39,6 +48,7 @@ function parseArgs(argv: readonly string[]): {
   verifyReplay: boolean;
   out: string | undefined;
   browser: boolean;
+  browserEngine: "chromium" | "firefox";
   soak: boolean;
   screenshotDir: string | undefined;
   fromCheckpoint: number | undefined;
@@ -48,6 +58,7 @@ function parseArgs(argv: readonly string[]): {
   let verifyReplayFlag = false;
   let out: string | undefined;
   let browser = false;
+  let browserEngine: "chromium" | "firefox" = "chromium";
   let soak = false;
   let screenshotDir: string | undefined;
   let fromCheckpoint: number | undefined;
@@ -58,6 +69,13 @@ function parseArgs(argv: readonly string[]): {
       verifyReplayFlag = true;
     } else if (arg === "--browser") {
       browser = true;
+    } else if (arg === "--browser-engine") {
+      const raw = argv[++i];
+      if (raw !== "chromium" && raw !== "firefox") {
+        console.error('--browser-engine requires "chromium" or "firefox"');
+        process.exit(2);
+      }
+      browserEngine = raw;
     } else if (arg === "--soak") {
       soak = true;
     } else if (arg === "--out") {
@@ -96,7 +114,7 @@ function parseArgs(argv: readonly string[]): {
 
   if (!scenario && !replay) {
     console.error(
-      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--screenshot-dir <dir>] [--soak]\n" +
+      "Usage: npm run harness -- <scenario> [--verify-replay] [--out <file>] [--browser] [--browser-engine <chromium|firefox>] [--screenshot-dir <dir>] [--soak]\n" +
         "       npm run harness -- --replay <verdict.json> [--out <file>] [--from-checkpoint <tick>]"
     );
     process.exit(2);
@@ -106,7 +124,7 @@ function parseArgs(argv: readonly string[]): {
     process.exit(2);
   }
 
-  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, soak, screenshotDir, fromCheckpoint };
+  return { scenario, replay, verifyReplay: verifyReplayFlag, out, browser, browserEngine, soak, screenshotDir, fromCheckpoint };
 }
 
 /** Repo-relative path with forward slashes, for portable storage in a verdict. */
@@ -214,13 +232,18 @@ async function runBrowserMode(
   scenario: Scenario,
   scenarioPath: string,
   screenshotDir: string | undefined,
+  browserEngine: "chromium" | "firefox",
+  shouldVerifyReplay: boolean,
   out: string | undefined
 ): Promise<void> {
   const { runBrowserScenario, BrowserInfraError } = await import("./browser.js");
 
   let result;
   try {
-    result = await runBrowserScenario(scenario, repoRoot, screenshotDir === undefined ? {} : { screenshotDir });
+    result = await runBrowserScenario(scenario, repoRoot, {
+      ...(screenshotDir === undefined ? {} : { screenshotDir }),
+      browserEngine,
+    });
   } catch (err) {
     if (err instanceof BrowserInfraError) {
       console.error(`Browser-mode infra failure for "${scenario.name}": ${err.message}`);
@@ -237,12 +260,29 @@ async function runBrowserMode(
   scenario.setup(sim);
   const setupStateHash = sim.stateHash();
 
+  // Browser mode captures a command log but never runs the sim itself, so
+  // scenario.assertions (which check final sim state / events) can only be
+  // evaluated against a headlessly-replayed sim built from that log — the
+  // same mechanism --verify-replay already uses for its hash check. This
+  // replay happens whenever the scenario declares assertions, independent
+  // of whether --verify-replay was also passed: an assertion result must
+  // never be silently reported as `[]`, and gating it behind an opt-in flag
+  // would let a plain `--browser` run pass vacuously exactly like the bug
+  // this fixes. (A scenario with an empty `assertions: []` array, e.g.
+  // demo-visual, is unaffected — replaySim below is skipped and the verdict
+  // keeps an honest empty array, not a "not evaluated" one either way.)
+  const assertionResults =
+    scenario.assertions.length > 0
+      ? evaluateAssertions(scenario, replayToSim(scenario, result.commands, result.browser.finalTick))
+      : [];
+  const assertionsPassed = assertionResults.every((r) => r.passed);
+
   const verdict: Verdict = {
     scenario: scenario.name,
     seed: scenario.seed,
     ticks: result.browser.finalTick,
-    passed: result.passed,
-    assertions: [],
+    passed: result.passed && assertionsPassed,
+    assertions: assertionResults,
     finalStateHash: result.browser.finalStateHash,
     eventCount: result.eventCount,
     entityCount: result.entityCount,
@@ -257,10 +297,18 @@ async function runBrowserMode(
     browser: result.browser,
   };
 
+  if (shouldVerifyReplay) {
+    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands, result.browser.finalTick);
+  }
+
   const json = JSON.stringify(verdict, null, 2);
   console.log(json);
   if (out) {
     writeFileSync(out, json, "utf8");
+  }
+
+  if (shouldVerifyReplay && !verdict.replayCheck?.verified) {
+    process.exit(3);
   }
   process.exit(verdict.passed ? 0 : 1);
 }
@@ -322,6 +370,7 @@ async function main(): Promise<void> {
     verifyReplay: shouldVerifyReplay,
     out,
     browser,
+    browserEngine,
     soak,
     screenshotDir,
     fromCheckpoint,
@@ -345,7 +394,7 @@ async function main(): Promise<void> {
   }
 
   if (browser) {
-    await runBrowserMode(scenario, scenarioPath, screenshotDir, out);
+    await runBrowserMode(scenario, scenarioPath, screenshotDir, browserEngine, shouldVerifyReplay, out);
     return;
   }
 

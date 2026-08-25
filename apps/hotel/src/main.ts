@@ -38,7 +38,13 @@ if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
 // seed, headless replay diverges from the browser session on the very
 // first tick (different spawn point, different door layout), independent
 // of any command-log or trig determinism issue.
-const sim = new Sim("hotel-h0-look-1", { eventRetentionTicks: 600 });
+// The harness passes the scenario's seed as ?worldforgeSeed=... so the
+// browser run and the headless replay of its command log describe the same
+// world. A scenario whose seed differs from the app's would otherwise
+// diverge with no symptom beyond exit 3.
+const DEFAULT_SEED = "hotel-h0-look-1";
+const seedParam = new URLSearchParams(window.location.search).get("worldforgeSeed");
+const sim = new Sim(seedParam ?? DEFAULT_SEED, { eventRetentionTicks: 600 });
 setup(sim);
 
 // Re-derive the same pure GroundFloor from the seed for meshes. Deliberately

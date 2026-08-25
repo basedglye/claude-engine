@@ -163,7 +163,14 @@ export async function runBrowserScenario(
   // demo-walk) never set this, so the app is never asked to pause and
   // behaves exactly as before this change.
   const needsStartBarrier = (spec.input ?? []).some((step) => "downAtTick" in step || "atTick" in step);
-  const navUrl = needsStartBarrier ? withQueryParam(url, "worldforgeStartPaused", "1") : url;
+  // Always hand the app the scenario's seed. Without this the app runs
+  // whatever seed it hardcodes while the headless replay uses the
+  // scenario's, so the two run DIFFERENT WORLDS and the only symptom is
+  // exit 3 (replay divergence) with nothing pointing at the cause. That
+  // cost a full debugging session once; the guard below makes a mismatch
+  // impossible to ship silently.
+  let navUrl = withQueryParam(url, "worldforgeSeed", scenario.seed);
+  if (needsStartBarrier) navUrl = withQueryParam(navUrl, "worldforgeStartPaused", "1");
 
   // Headless Chromium's default GL backend fails to compile Three.js's
   // shaders on many CI/sandboxed machines (shader VALIDATE_STATUS false ->
@@ -266,6 +273,25 @@ export async function runBrowserScenario(
         throw new BrowserInfraError(
           `Scenario "${scenario.name}" requests the "sim-tick-ms" probe, but the app's test hook exposes no ` +
             `"tickTimings" (window.__WORLDFORGE__.tickTimings). The app must pass a tickTimings() function to installTestHook.`
+        );
+      }
+    }
+
+    // The app must actually be running the scenario's world. If it ignored
+    // ?worldforgeSeed the browser run and the headless replay describe
+    // different worlds, and the only symptom would be exit 3 with no cause
+    // named — a silent trap that has already cost one long debugging
+    // session. Fail loudly and say exactly what to wire instead.
+    {
+      const liveSeed = await page.evaluate(
+        () => (window as unknown as { __WORLDFORGE__: { world: { seed: string } } }).__WORLDFORGE__.world.seed
+      );
+      if (liveSeed !== scenario.seed) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" declares seed "${scenario.seed}" but the app is running seed ` +
+            `"${liveSeed}". The harness navigated with ?worldforgeSeed=${scenario.seed}; the app must read ` +
+            `that query parameter and construct its Sim with it. Left unfixed, the browser run and the ` +
+            `headless replay of its command log are different worlds and the run fails as a replay divergence.`
         );
       }
     }

@@ -314,9 +314,14 @@ export function generateLayout(seed: string): Layout {
     rooms[idx] = ROOM_LOBBY;
   }
 
-  // Terminal: clerk side (south of the desk row), centered on the desk span.
+  // Terminal: clerk side (south of the desk row), centered on the desk span,
+  // TWO cells clear of it rather than one. At one cell the monitor's own
+  // body overlaps the desk furniture, which occluded roughly a quarter of
+  // the rendered screen and — worse — meant the mesh had to be nudged in
+  // the renderer to look right, so the sim's interactable and the thing the
+  // player's reticle actually hits sat ~0.5m apart. One position, here.
   const termLx = deskLx + Math.floor(DESK_WIDTH_CELLS / 2);
-  const termLz = deskLz + 1;
+  const termLz = deskLz + 2;
   const termGx = termLx + margin;
   const termGz = termLz + marginZ;
   const desk = {

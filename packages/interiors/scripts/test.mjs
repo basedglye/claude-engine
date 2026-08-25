@@ -72,7 +72,7 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // row north and one column east so a 300mm-radius guest can actually
 // stand on a slot. No grid cell, portal, door or mesh vertex changed --
 // only the serialized `desk` block, which this hash covers.
-const GOLDEN_HASH = 0x132c99ef;
+const GOLDEN_HASH = 0x752bc750;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {
@@ -496,20 +496,34 @@ const GOLDEN_HASH = 0x132c99ef;
     }
     if (qOk) queueOk++;
 
-    // 2. Terminal anchor: walkable, adjacent to a desk FURNITURE cell (by
-    // design -- the clerk stands right up against the desk, so the side
-    // facing the desk is expected to be blocked), and clear on its other
-    // three sides for a 300mm-radius agent to occupy the cell.
+    // 2. Terminal anchor: walkable, AT the desk but not inside it, and
+    // fully clear on all four sides.
+    //
+    // The anchor used to be required to sit cardinally adjacent to a desk
+    // FURNITURE cell. That is what put the monitor's body inside the desk:
+    // roughly a quarter of the rendered screen was occluded, and the fix
+    // attempted in the renderer (nudging the mesh so it looked right) left
+    // the sim's interactable and the mesh the player's reticle actually
+    // hits about half a metre apart -- two sources of truth for one object.
+    // So the anchor now stands two cells clear, and the property asserts
+    // what actually matters: it is at the desk (within DESK_NEAR_CELLS),
+    // it is not itself furniture, and a 300mm agent can occupy it with no
+    // blocked neighbour at all.
+    const DESK_NEAR_CELLS = 3;
     const termC = cellOfMm(grid, desk.xMm, desk.zMm);
     const termCell = cellAt(grid, termC.cx, termC.cz);
     let tOk = isWalkableCell(termCell);
     const neighbourDirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-    const deskNeighbours = neighbourDirs.map(([dx, dz]) => cellAt(grid, termC.cx + dx, termC.cz + dz));
-    if (!deskNeighbours.some((c) => (c & CELL.FURNITURE) !== 0)) tOk = false;
+    let nearDesk = false;
+    for (let dx = -DESK_NEAR_CELLS; dx <= DESK_NEAR_CELLS && !nearDesk; dx++) {
+      for (let dz = -DESK_NEAR_CELLS; dz <= DESK_NEAR_CELLS && !nearDesk; dz++) {
+        if ((cellAt(grid, termC.cx + dx, termC.cz + dz) & CELL.FURNITURE) !== 0) nearDesk = true;
+      }
+    }
+    if (!nearDesk) tOk = false;
     for (const [dx, dz] of neighbourDirs) {
       const nb = cellAt(grid, termC.cx + dx, termC.cz + dz);
-      if ((nb & CELL.FURNITURE) !== 0) continue; // the desk side -- expected
-      if ((nb & CELL.SOLID) !== 0) tOk = false;
+      if ((nb & CELL.SOLID) !== 0 || (nb & CELL.FURNITURE) !== 0) tOk = false;
     }
     if (tOk) terminalOk++;
 
@@ -593,7 +607,7 @@ const GOLDEN_HASH = 0x132c99ef;
   check(`H1a: queue chain is walkable/non-door, adjacent, unique, clear for a 300mm collider, length>=8 across all ${N} seeds`, queueOk === N);
 
   console.log(`  H1a terminal anchor: ${terminalOk}/${N} seeds passed`);
-  check(`H1a: terminal anchor has clearance and is adjacent to a desk FURNITURE cell across all ${N} seeds`, terminalOk === N);
+  check(`H1a: terminal anchor is walkable, at the desk, and clear on all four sides across all ${N} seeds`, terminalOk === N);
 
   console.log(`  H1a bedrooms: ${bedroomsOk}/${N} seeds passed`);
   check(`H1a: every bedroom goal is walkable, clear, in-room, and reachable from the desk head across all ${N} seeds`, bedroomsOk === N);

@@ -1,0 +1,16 @@
+{
+  "name": "@claude-engine/space",
+  "version": "0.0.1",
+  "description": "Deterministic spatial layer: fixed-point sim math, integer grid collision, portal graph, routing, LOS",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*"
+  }
+}

@@ -41,7 +41,8 @@ const NODE_BUILTINS = new Set([
   'module',
 ]);
 
-function scanFile(filePath) {
+function scanFile(filePath, opts = {}) {
+  const banTranscendentals = opts.banTranscendentals ?? false;
   const content = fs.readFileSync(filePath, 'utf-8');
   const lines = content.split('\n');
   const violations = [];
@@ -96,6 +97,22 @@ function scanFile(filePath) {
           message: `Math.random() call detected`,
         });
       }
+
+      // Check for banned transcendental Math.* calls (opt-in per root via
+      // banTranscendentals). float sin/cos/etc drift across platforms/engine
+      // versions, which breaks cross-machine replay determinism; longest-first
+      // alternation so atan2/log2 match before atan/log.
+      if (
+        banTranscendentals &&
+        /\bMath\.(sin|cos|tan|asin|acos|atan2|atan|exp|log2|log10|log|pow|hypot|cbrt)\s*\(/.test(line)
+      ) {
+        violations.push({
+          file: filePath,
+          line: lineNum,
+          type: 'math-transcendental',
+          message: `Banned transcendental Math.* call detected (use the seeded LUT/integer math instead)`,
+        });
+      }
     }
   });
 
@@ -104,12 +121,15 @@ function scanFile(filePath) {
 
 /**
  * @param {string} dir
- * @param {{ excludeDirNames?: Set<string> }} [opts] Directory basenames to
- *   skip entirely while walking (e.g. a package's DOM/Three.js-touching web
- *   adapter, which is intentionally exempt from purity rules).
+ * @param {{ excludeDirNames?: Set<string>, banTranscendentals?: boolean }} [opts]
+ *   `excludeDirNames`: directory basenames to skip entirely while walking
+ *   (e.g. a package's DOM/Three.js-touching web adapter, which is
+ *   intentionally exempt from purity rules). `banTranscendentals`: opt-in
+ *   flag propagated to `scanFile` for the `math-transcendental` check.
  */
 function scanDirectory(dir, opts = {}) {
   const excludeDirNames = opts.excludeDirNames ?? new Set();
+  const banTranscendentals = opts.banTranscendentals ?? false;
   const violations = [];
 
   function walk(currentPath) {
@@ -121,7 +141,7 @@ function scanDirectory(dir, opts = {}) {
       if (entry.isDirectory()) {
         walk(fullPath);
       } else if (entry.isFile() && entry.name.endsWith('.ts')) {
-        const fileViolations = scanFile(fullPath);
+        const fileViolations = scanFile(fullPath, { banTranscendentals });
         violations.push(...fileViolations);
       }
     }
@@ -136,7 +156,17 @@ function scanDirectory(dir, opts = {}) {
 // Three.js / Node imports, no Math.random. packages/assets ships a /web
 // subpath adapter that's exempt by design (docs/PHASE-2.md Scope B).
 const PURITY_ROOTS = [
-  { name: 'packages/core/src', dir: path.join(REPO_ROOT, 'packages', 'core', 'src'), excludeDirNames: new Set() },
+  {
+    name: 'packages/core/src',
+    dir: path.join(REPO_ROOT, 'packages', 'core', 'src'),
+    excludeDirNames: new Set(),
+    banTranscendentals: true,
+  },
+  // packages/assets' Math.sin/cos uses (mesh.ts, icon.ts) are legitimate:
+  // asset-synthesis output (meshes, icons, terrain heightfields, music) is
+  // presentation data, never hashed into sim state or reasoned about by the
+  // sim with float precision (see CLAUDE.md invariant 2) — so this root does
+  // NOT opt into banTranscendentals.
   {
     name: 'packages/assets/src (excluding src/web)',
     dir: path.join(REPO_ROOT, 'packages', 'assets', 'src'),
@@ -146,11 +176,25 @@ const PURITY_ROOTS = [
     name: 'packages/net/src (excluding src/web)',
     dir: path.join(REPO_ROOT, 'packages', 'net', 'src'),
     excludeDirNames: new Set(['web']),
+    banTranscendentals: true,
   },
   {
     name: 'packages/bots/src',
     dir: path.join(REPO_ROOT, 'packages', 'bots', 'src'),
     excludeDirNames: new Set(),
+    banTranscendentals: true,
+  },
+  {
+    name: 'packages/space/src',
+    dir: path.join(REPO_ROOT, 'packages', 'space', 'src'),
+    excludeDirNames: new Set(),
+    banTranscendentals: true,
+  },
+  {
+    name: 'packages/interiors/src',
+    dir: path.join(REPO_ROOT, 'packages', 'interiors', 'src'),
+    excludeDirNames: new Set(),
+    banTranscendentals: true,
   },
 ];
 
@@ -243,9 +287,59 @@ function runSelfTest() {
       }
     }
 
+    // Test: math-transcendental, planted through the real
+    // scanDirectory()/PURITY_ROOTS machinery (not scanFile() in isolation).
+    // Proves both directions: CAUGHT in a banTranscendentals root, and
+    // correctly NOT flagged in packages/assets/src (carve-out) — plus a
+    // Math.floor() control in a banned root, which must stay legal (floor/
+    // round/abs/min/max/sign/trunc are exactly specified by ECMAScript).
+    function testTranscendentalBan(rootNamePrefix) {
+      const root = PURITY_ROOTS.find((r) => r.name.startsWith(rootNamePrefix));
+      if (!root || !fs.existsSync(root.dir)) return { hasAtan2Violation: false, floorNotFlagged: true, ran: false };
+      const selfTestDir = path.join(root.dir, '.tmp-purity-selftest-trig');
+      fs.mkdirSync(selfTestDir, { recursive: true });
+      const atan2File = path.join(selfTestDir, 'bad-atan2.ts');
+      const floorFile = path.join(selfTestDir, 'ok-floor.ts');
+      fs.writeFileSync(atan2File, "const a = Math.atan2(1, 2);\n");
+      fs.writeFileSync(floorFile, "const b = Math.floor(1.5);\n");
+      try {
+        const scan = scanDirectory(root.dir, {
+          excludeDirNames: root.excludeDirNames,
+          banTranscendentals: root.banTranscendentals,
+        });
+        return {
+          hasAtan2Violation: scan.some((v) => v.file === atan2File && v.type === 'math-transcendental'),
+          floorNotFlagged: !scan.some((v) => v.file === floorFile),
+          ran: true,
+        };
+      } finally {
+        fs.rmSync(selfTestDir, { recursive: true, force: true });
+      }
+    }
+
+    function testTranscendentalNotBanned(rootNamePrefix) {
+      const root = PURITY_ROOTS.find((r) => r.name.startsWith(rootNamePrefix));
+      if (!root || !fs.existsSync(root.dir)) return { cosNotFlagged: true, ran: false };
+      const selfTestDir = path.join(root.dir, '.tmp-purity-selftest-trig');
+      fs.mkdirSync(selfTestDir, { recursive: true });
+      const cosFile = path.join(selfTestDir, 'ok-cos.ts');
+      fs.writeFileSync(cosFile, "const c = Math.cos(1);\n");
+      try {
+        const scan = scanDirectory(root.dir, {
+          excludeDirNames: root.excludeDirNames,
+          banTranscendentals: root.banTranscendentals,
+        });
+        return { cosNotFlagged: !scan.some((v) => v.file === cosFile), ran: true };
+      } finally {
+        fs.rmSync(selfTestDir, { recursive: true, force: true });
+      }
+    }
+
     const assetsCheck = testWebExclusion('packages/assets');
     const netCheck = testWebExclusion('packages/net');
     const botsCheck = testPlainRoot('packages/bots');
+    const trigBanCheck = testTranscendentalBan('packages/core/src');
+    const trigNotBannedCheck = testTranscendentalNotBanned('packages/assets/src (excluding');
 
     const allPass =
       hasThreeViolation &&
@@ -256,7 +350,10 @@ function runSelfTest() {
       assetsCheck.webCorrectlyExcluded &&
       netCheck.hasPathViolation &&
       netCheck.webCorrectlyExcluded &&
-      botsCheck.hasPathViolation;
+      botsCheck.hasPathViolation &&
+      trigBanCheck.hasAtan2Violation &&
+      trigBanCheck.floorNotFlagged &&
+      trigNotBannedCheck.cosNotFlagged;
 
     if (allPass) {
       console.log('PASS: Self-test detected all violation classes');
@@ -269,6 +366,9 @@ function runSelfTest() {
       console.log(`  - Math.random planted in packages/net/src: CAUGHT`);
       console.log(`  - three import planted in packages/net/src/web: correctly EXCLUDED`);
       console.log(`  - Math.random planted in packages/bots/src: CAUGHT`);
+      console.log(`  - Math.atan2 planted in packages/core/src: CAUGHT`);
+      console.log(`  - Math.floor planted in packages/core/src: correctly NOT flagged`);
+      console.log(`  - Math.cos planted in packages/assets/src: correctly NOT flagged`);
       return 0;
     } else {
       console.error('FAIL: Self-test did not detect all violations');
@@ -281,6 +381,9 @@ function runSelfTest() {
       if (!netCheck.hasPathViolation) console.error('  - Math.random planted in packages/net/src: NOT CAUGHT');
       if (!netCheck.webCorrectlyExcluded) console.error('  - packages/net/src/web exclusion: NOT WORKING (false positive)');
       if (!botsCheck.hasPathViolation) console.error('  - Math.random planted in packages/bots/src: NOT CAUGHT');
+      if (!trigBanCheck.hasAtan2Violation) console.error('  - Math.atan2 planted in packages/core/src: NOT CAUGHT');
+      if (!trigBanCheck.floorNotFlagged) console.error('  - Math.floor planted in packages/core/src: FALSE POSITIVE');
+      if (!trigNotBannedCheck.cosNotFlagged) console.error('  - Math.cos planted in packages/assets/src: FALSE POSITIVE');
       return 1;
     }
   } finally {
@@ -310,10 +413,16 @@ function main() {
   const allViolations = [];
   for (const root of PURITY_ROOTS) {
     if (!fs.existsSync(root.dir)) {
-      console.error(`${root.name} directory not found at ${root.dir}`);
-      return 2;
+      // Concurrently-developed roots (packages/space/src,
+      // packages/interiors/src during Phase H0) may not exist yet on a
+      // given checkout — skip gracefully rather than failing the whole
+      // check, matching the self-test helpers' existsSync guard below.
+      console.log(`(skip) ${root.name} not found at ${root.dir} yet`);
+      continue;
     }
-    allViolations.push(...scanDirectory(root.dir, { excludeDirNames: root.excludeDirNames }));
+    allViolations.push(
+      ...scanDirectory(root.dir, { excludeDirNames: root.excludeDirNames, banTranscendentals: root.banTranscendentals })
+    );
   }
 
   if (allViolations.length === 0) {

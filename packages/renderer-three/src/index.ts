@@ -5,5 +5,6 @@ export {
   type SceneContext,
   type ThreeHost,
   type ThreeHostOptions,
+  type PointerHandlers,
 } from "./three-host.js";
-export { installTestHook, type WorldforgeHook } from "./test-hook.js";
+export { installTestHook, type WorldforgeHook, type SyntheticPointer } from "./test-hook.js";

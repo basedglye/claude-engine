@@ -19,6 +19,20 @@ export interface SceneContext {
   scenery(key: string, create: () => THREE.Object3D): THREE.Object3D;
 }
 
+/**
+ * Pointer input, alongside the existing keyboard `keymap`. The host owns
+ * listener lifecycle (added on start, removed on stop) and requests pointer
+ * lock on canvas click when handlers are present.
+ */
+export interface PointerHandlers {
+  /** Normalized relative look deltas (movementX/Y px). Called from the real
+   *  mousemove listener only while pointer-locked. */
+  onLook?(dxPx: number, dyPx: number): void;
+  /** Button 0 down while pointer-locked. */
+  onClick?(): void;
+  onPointerLockChange?(locked: boolean): void;
+}
+
 export interface ThreeHostOptions {
   canvas: HTMLCanvasElement;
   /** Advance the sim exactly one tick. Host owns timing; sim owns logic. */
@@ -35,6 +49,13 @@ export interface ThreeHostOptions {
    *  a top-down game). Defaults to a standard PerspectiveCamera — existing
    *  callers are unaffected. */
   camera?: THREE.Camera;
+  /** Pointer input, alongside the existing keyboard `keymap`. The host owns
+   *  listener lifecycle (added on start, removed on stop) and requests
+   *  pointer lock on canvas click when handlers are present. */
+  pointerHandlers?: PointerHandlers;
+  /** Called once per animation frame after syncScene, before render — the
+   *  hook player-fps uses to drive the camera at refresh rate. */
+  onFrame?(camera: THREE.Camera, world: IWorld, alpha: number): void;
 }
 
 export interface ThreeHost {
@@ -56,7 +77,7 @@ export function createOrthographicCamera(viewHeight: number, near = 0.1, far = 1
  * knowledge: entity->visual mapping is entirely the game's `syncScene`.
  */
 export function createThreeHost(world: IWorld, options: ThreeHostOptions): ThreeHost {
-  const { canvas, stepSim, submit, syncScene, keymap } = options;
+  const { canvas, stepSim, submit, syncScene, keymap, pointerHandlers, onFrame } = options;
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -146,6 +167,30 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
 
+  function isPointerLocked(): boolean {
+    return document.pointerLockElement === canvas;
+  }
+  function onCanvasClick(): void {
+    canvas.requestPointerLock();
+  }
+  function onMouseMove(e: MouseEvent): void {
+    if (!isPointerLocked()) return;
+    pointerHandlers?.onLook?.(e.movementX, e.movementY);
+  }
+  function onMouseDown(e: MouseEvent): void {
+    if (!isPointerLocked() || e.button !== 0) return;
+    pointerHandlers?.onClick?.();
+  }
+  function onPointerLockChange(): void {
+    pointerHandlers?.onPointerLockChange?.(isPointerLocked());
+  }
+  if (pointerHandlers) {
+    canvas.addEventListener("click", onCanvasClick);
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("pointerlockchange", onPointerLockChange);
+  }
+
   function pumpInput(): void {
     if (!keymap) return;
     for (const code of heldKeys) {
@@ -164,6 +209,7 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     onRender: (w, alpha) => {
       pruneStaleObjects();
       syncScene(ctx, w, alpha);
+      onFrame?.(camera, w, alpha);
       renderer.render(scene, camera);
     },
   });
@@ -174,6 +220,12 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
       window.removeEventListener("resize", resize);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      if (pointerHandlers) {
+        canvas.removeEventListener("click", onCanvasClick);
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mousedown", onMouseDown);
+        document.removeEventListener("pointerlockchange", onPointerLockChange);
+      }
       for (const obj of objects.values()) disposeObject(obj);
       objects.clear();
       for (const obj of scenery.values()) disposeObject(obj);

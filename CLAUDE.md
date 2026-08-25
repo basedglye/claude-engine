@@ -13,6 +13,14 @@ that idea applied to an entire engine.
    goes through the seeded `Rng` class — `Math.random()` is banned in
    `packages/core` and in game sim code. Iteration order over collections
    must be deterministic (no bare object-key iteration in sim logic).
+   Transcendental `Math.*` (`sin`/`cos`/`tan`/`atan2`/`exp`/`log`/`pow`/etc.)
+   is likewise banned in sim-side code, checked per-root by
+   `scripts/check-purity.mjs`, because float trig drifts across
+   platforms/engine versions and breaks cross-machine replay — use the
+   seeded integer/LUT math instead. Asset-synthesis output (meshes, icons,
+   terrain heightfields, music) must never be hashed into sim state or used
+   in sim-side decisions with float precision; any generated data the sim
+   reasons about must arrive as integers on the sim's grid.
 3. **Replayability.** Any sim run is fully described by (seed, input log).
    If a change breaks replay equivalence, it is a bug even if the game looks
    fine.

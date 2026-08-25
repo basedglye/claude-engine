@@ -1,0 +1,16 @@
+# The repo stores and checks out text as LF on every platform.
+#
+# This is load-bearing, not cosmetic: packages/space commits a generated
+# sin-lut.ts and its test asserts the file is byte-identical to what the
+# generator produces. Without this, a checkout under core.autocrlf=true
+# rewrites the committed LF file to CRLF, the generator still emits LF, and
+# the determinism check fails for reasons that have nothing to do with the
+# LUT. Golden-file comparisons elsewhere are exposed to the same hazard.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending normalised.
+*.png binary
+*.jpg binary
+*.glb binary
+*.wav binary
+*.onnx binary

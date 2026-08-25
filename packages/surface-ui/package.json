@@ -1,0 +1,24 @@
+{
+  "name": "@claude-engine/surface-ui",
+  "version": "0.0.1",
+  "description": "Diegetic in-world screen framework: pure integer layout and paint trees for the sim, canvas rasterization and UV hit-mapping for the host",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./host": { "types": "./dist/host/index.d.ts", "default": "./dist/host/index.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/core": "*",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.169.0"
+  }
+}

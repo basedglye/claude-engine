@@ -18,6 +18,12 @@ export interface SyntheticPointer {
   lock(): void;
   look(dxPx: number, dyPx: number): void;
   click(): void;
+  /** H1b: simulate a click on the focused screen quad at surface UV (u, v),
+   *  each in [0, 1]. Present iff the app wired screen-focus support into
+   *  its FpsController (see @claude-engine/player-fps) — a game with no
+   *  screens simply never sets this, exactly like `pointer` itself being
+   *  absent for a game with no player-fps controller at all. */
+  screenClick?(u: number, v: number): void;
 }
 
 /**
@@ -38,6 +44,20 @@ export interface StartBarrier {
   release(): void;
 }
 
+/** The focused screen quad's projected axis-aligned pixel rect in the
+ *  viewport, plus its texel scale (screen px per surface px, i.e. the
+ *  projected quad width / SCREEN_W — see @claude-engine/surface-ui). The
+ *  `screen-readability` probe reads this to locate the calibration strip in
+ *  a captured screenshot and to check ARCHITECTURE B7's "at least one texel
+ *  per glyph pixel" (texelScale >= 1.0) directly, rather than hoping. */
+export interface ScreenRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  texelScale: number;
+}
+
 export interface WorldforgeHook {
   world: IWorld;
   /** The ONLY sim-affecting capability — standard command ingress. */
@@ -51,6 +71,12 @@ export interface WorldforgeHook {
   tickTimings?(): readonly number[];
   /** Present iff `installTestHook` was called with `startPaused: true`. */
   startBarrier?: StartBarrier;
+  /** Present iff the app wired screen-focus rendering (H1b). This package
+   *  supplies only the slot — it stays game-agnostic exactly like `pointer`
+   *  and `tickTimings`; the app (e.g. @claude-engine/hotel) supplies the
+   *  implementation by reading back its own focused screen quad's projected
+   *  bounds. Returns undefined when no screen is currently focused. */
+  screenRect?(): ScreenRect | undefined;
 }
 
 declare global {
@@ -76,6 +102,8 @@ export function installTestHook(opts: {
    *  Opt-in and false by default — a scenario with no tick-gated input
    *  steps never sets this, so the app's step loop is never touched. */
   startPaused?: boolean;
+  /** Present iff the app wired screen-focus rendering (see `ScreenRect`). */
+  screenRect?: () => ScreenRect | undefined;
 }): WorldforgeHook {
   const log: Command[] = [];
   const hook: WorldforgeHook = {
@@ -91,6 +119,7 @@ export function installTestHook(opts: {
   };
   if (opts.pointer) hook.pointer = opts.pointer;
   if (opts.tickTimings) hook.tickTimings = opts.tickTimings;
+  if (opts.screenRect) hook.screenRect = opts.screenRect;
   if (opts.startPaused) {
     let released = false;
     hook.startBarrier = {

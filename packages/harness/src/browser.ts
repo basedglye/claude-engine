@@ -15,7 +15,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { extname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { CALIB_RECT } from "@claude-engine/surface-ui";
 import type { Scenario } from "./index.js";
+import { analyzeReadability, decodePng } from "./screen-readability.js";
 
 const STATIC_MIME_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -48,7 +50,11 @@ export type InputStep =
   | { pointer: "look"; atTick: number; dx: number; dy: number }
   | { pointer: "click"; atMs: number }
   | { pointer: "click"; atTick: number }
-  | { pointer: "screenClick"; atMs: number; u: number; v: number }; // RESERVED: exit 2 in H0
+  // screenClick (docs/PHASE-H1.md Scope D): tick-gated form only. The
+  // wall-clock form stays RESERVED/exit 2 — H0 deferral rule 6 bans new
+  // wall-clock steps, and H1 restates it explicitly for this one.
+  | { pointer: "screenClick"; atMs: number; u: number; v: number } // RESERVED: exit 2
+  | { pointer: "screenClick"; atTick: number; u: number; v: number };
 
 export interface BrowserSpec {
   /** Workspace name (e.g. "@claude-engine/demo") — harness builds it and
@@ -73,7 +79,13 @@ export interface BrowserSpec {
 export type ProbeSpec =
   | { probe: "fps"; sampleMs?: number }
   | { probe: "input-latency"; key: string; component: string; samples?: number }
-  | { probe: "sim-tick-ms"; minSamples?: number };
+  | { probe: "sim-tick-ms"; minSamples?: number }
+  // docs/PHASE-H1.md "Readability as a gate": analyses the already-captured
+  // screenshot (the most recently captured one, per screenshotAtTicks — no
+  // second capture) at the focused screen's projected pose. `appId` is
+  // carried for report/debugging symmetry with other probes; the analysis
+  // itself only needs the hook's screenRect() and the screenshot bytes.
+  | { probe: "screen-readability"; appId: string };
 
 export interface BrowserRunReport {
   app: string;
@@ -114,10 +126,14 @@ export async function runBrowserScenario(
   }
   const engine: BrowserEngine = opts.browserEngine ?? "chromium";
 
-  // screenClick is reserved, not implemented in H0 (docs/PHASE-H0.md).
+  // screenClick's wall-clock form stays reserved (H0 deferral rule 6 bans
+  // new wall-clock steps; docs/PHASE-H1.md restates it for this one). The
+  // tick-gated form is implemented below.
   for (const step of spec.input ?? []) {
-    if ("pointer" in step && step.pointer === "screenClick") {
-      throw new BrowserInfraError('"screenClick" input steps are not implemented in H0 (reserved for a later phase).');
+    if ("pointer" in step && step.pointer === "screenClick" && "atMs" in step) {
+      throw new BrowserInfraError(
+        '"screenClick" input steps only support the tick-gated form ({ atTick, u, v }) — the wall-clock form stays reserved.'
+      );
     }
   }
 
@@ -209,6 +225,38 @@ export async function runBrowserScenario(
         );
       }
     }
+    // Matches the pointer precedent exactly: a specific slot check (not just
+    // the generic hookHasPointer above) for screenClick, since a hook can
+    // have a pointer with click/look/lock but no screenClick.
+    const hasScreenClickStep = (spec.input ?? []).some((s) => "pointer" in s && s.pointer === "screenClick");
+    if (hasScreenClickStep) {
+      const hookHasScreenClick = await page.evaluate(
+        () =>
+          typeof (window as unknown as { __WORLDFORGE__: { pointer?: { screenClick?: unknown } } }).__WORLDFORGE__.pointer
+            ?.screenClick === "function"
+      );
+      if (!hookHasScreenClick) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" has screenClick input steps, but the app's test hook's pointer exposes no ` +
+            `"screenClick" (window.__WORLDFORGE__.pointer.screenClick). The app must pass a SyntheticPointer with a ` +
+            `screenClick slot to installTestHook (see @claude-engine/player-fps's "screen" controller option).`
+        );
+      }
+    }
+
+    const wantsScreenReadability = (spec.probes ?? []).some((p) => p.probe === "screen-readability");
+    if (wantsScreenReadability) {
+      const hookHasScreenRect = await page.evaluate(
+        () => typeof (window as unknown as { __WORLDFORGE__: { screenRect?: unknown } }).__WORLDFORGE__.screenRect === "function"
+      );
+      if (!hookHasScreenRect) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" requests the "screen-readability" probe, but the app's test hook exposes no ` +
+            `"screenRect" (window.__WORLDFORGE__.screenRect). The app must pass a screenRect() function to installTestHook.`
+        );
+      }
+    }
+
     const wantsTickTimings = (spec.probes ?? []).some((p) => p.probe === "sim-tick-ms");
     if (wantsTickTimings) {
       const hookHasTickTimings = await page.evaluate(
@@ -293,7 +341,7 @@ export async function runBrowserScenario(
 
     const probeResults: Record<string, Record<string, number>> = {};
     for (const p of spec.probes ?? []) {
-      probeResults[p.probe] = await runProbe(page, p, tickRateHz, deadline);
+      probeResults[p.probe] = await runProbe(page, p, tickRateHz, deadline, screenshots);
     }
 
     const feelChecks: { target: string; value: number; passed: boolean }[] = [];
@@ -383,11 +431,19 @@ type TickScheduledEvent =
   | { atTick: number; type: "down" | "up"; key: string }
   | { atTick: number; type: "pointer-lock" }
   | { atTick: number; type: "pointer-look"; dx: number; dy: number }
-  | { atTick: number; type: "pointer-click" };
+  | { atTick: number; type: "pointer-click" }
+  | { atTick: number; type: "pointer-screen-click"; u: number; v: number };
 
 async function dispatchEvent(
   page: import("playwright").Page,
-  ev: { type: "down" | "up" | "pointer-lock" | "pointer-look" | "pointer-click"; key?: string; dx?: number; dy?: number }
+  ev: {
+    type: "down" | "up" | "pointer-lock" | "pointer-look" | "pointer-click" | "pointer-screen-click";
+    key?: string;
+    dx?: number;
+    dy?: number;
+    u?: number;
+    v?: number;
+  }
 ): Promise<void> {
   switch (ev.type) {
     case "down":
@@ -414,6 +470,15 @@ async function dispatchEvent(
     case "pointer-click":
       await page.evaluate(
         () => (window as unknown as { __WORLDFORGE__: { pointer?: { click(): void } } }).__WORLDFORGE__.pointer?.click()
+      );
+      break;
+    case "pointer-screen-click":
+      await page.evaluate(
+        ([u, v]) =>
+          (
+            window as unknown as { __WORLDFORGE__: { pointer?: { screenClick?(u: number, v: number): void } } }
+          ).__WORLDFORGE__.pointer?.screenClick?.(u as number, v as number),
+        [ev.u, ev.v]
       );
       break;
   }
@@ -443,6 +508,8 @@ async function runInputScript(
         if (step.pointer === "lock") tickEvents.push({ atTick: step.atTick, type: "pointer-lock" });
         else if (step.pointer === "look") tickEvents.push({ atTick: step.atTick, type: "pointer-look", dx: step.dx, dy: step.dy });
         else if (step.pointer === "click") tickEvents.push({ atTick: step.atTick, type: "pointer-click" });
+        else if (step.pointer === "screenClick")
+          tickEvents.push({ atTick: step.atTick, type: "pointer-screen-click", u: step.u, v: step.v });
       }
     } else if ("downMs" in step) {
       msEvents.push({ at: step.downMs, type: "down", key: step.key });
@@ -511,8 +578,37 @@ async function runProbe(
   page: import("playwright").Page,
   spec: ProbeSpec,
   tickRateHz: number,
-  deadline: number
+  deadline: number,
+  screenshots: readonly { requestedTick: number; actualTick: number; path: string }[]
 ): Promise<Record<string, number>> {
+  if (spec.probe === "screen-readability") {
+    // Reuse the already-captured screenshot (the harness's existing
+    // screenshotAtTicks capture path) rather than taking a second one — the
+    // most recently requested one is "the declared tick" per
+    // docs/PHASE-H1.md Scope D.
+    const shot = screenshots[screenshots.length - 1];
+    if (!shot) {
+      throw new BrowserInfraError(
+        `The "screen-readability" probe requires at least one screenshotAtTicks capture; scenario declared none.`
+      );
+    }
+    const screenRect = await page.evaluate(
+      () =>
+        (
+          window as unknown as { __WORLDFORGE__: { screenRect?(): { x: number; y: number; w: number; h: number; texelScale: number } | undefined } }
+        ).__WORLDFORGE__.screenRect?.()
+    );
+    if (!screenRect) {
+      throw new BrowserInfraError(
+        `The "screen-readability" probe's screenRect() returned undefined at tick ${shot.actualTick} — no screen is ` +
+          `focused. The scenario must focus a screen (interact + screenClick) before the probe's screenshot tick.`
+      );
+    }
+    const image = decodePng(readFileSync(shot.path));
+    const result = analyzeReadability(image, screenRect, CALIB_RECT);
+    return { texelScale: result.texelScale, calibContrast: result.calibContrast, calibPitchErr: result.calibPitchErr };
+  }
+
   if (spec.probe === "fps") {
     const sampleMs = Math.min(spec.sampleMs ?? 1000, Math.max(0, deadline - Date.now()));
     const samples = await page.evaluate(async (ms) => {
@@ -601,9 +697,17 @@ function readFirstComponentValue(component: string): unknown {
 }
 
 function lookupProbeValue(probes: Record<string, Record<string, number>>, key: string): number | undefined {
-  // Keys look like "fps.avg", "inputLatency.avgMs", or "simTickMs.avgMs" — map to our probe result names.
+  // Keys look like "fps.avg", "inputLatency.avgMs", "simTickMs.avgMs", or
+  // "screenReadability.texelScale" — map to our probe result names.
   const [probeKey, field] = key.split(".", 2);
-  const probeName = probeKey === "inputLatency" ? "input-latency" : probeKey === "simTickMs" ? "sim-tick-ms" : probeKey;
+  const probeName =
+    probeKey === "inputLatency"
+      ? "input-latency"
+      : probeKey === "simTickMs"
+        ? "sim-tick-ms"
+        : probeKey === "screenReadability"
+          ? "screen-readability"
+          : probeKey;
   return probeName && field ? probes[probeName]?.[field] : undefined;
 }
 

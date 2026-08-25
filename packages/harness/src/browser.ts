@@ -589,11 +589,49 @@ async function runInputScript(
   // via the same pollUntilTick approach the harness already uses for
   // screenshot capture.
   async function runTickEvents(): Promise<void> {
-    for (const ev of tickRest) {
-      if (Date.now() >= deadline) break;
-      await pollUntilTick(page, ev.atTick, deadline);
-      if (Date.now() >= deadline) break;
-      await dispatchEvent(page, ev);
+    if (tickRest.length === 0) return;
+    // Install the whole queue in-page and let the app's own tick pump drain
+    // it via hook.notifyTick, so each step fires synchronously ON its
+    // declared tick. The previous approach — poll world.tick from out of
+    // process, then dispatch over a round trip — is bounded-late: a key-up
+    // gated on tick N could land on N+1, which silently changed the move
+    // count between runs. docs/reviews/phase-H0.md round 3 recorded that as
+    // debt with exactly this trigger, and it fired in save-restore.
+    await page.evaluate((events) => {
+      const w = window as unknown as {
+        __WORLDFORGE_TICK_QUEUE__?: { atTick: number; run(): void; done?: boolean; error?: string }[];
+        __WORLDFORGE__: { pointer?: Record<string, (...a: number[]) => void> };
+      };
+      const queue: { atTick: number; run(): void; done?: boolean; error?: string }[] = [];
+      for (const ev of events) {
+        queue.push({
+          atTick: ev.atTick,
+          run(): void {
+            const p = w.__WORLDFORGE__.pointer;
+            if (ev.type === "down" || ev.type === "up") {
+              const type = ev.type === "down" ? "keydown" : "keyup";
+              window.dispatchEvent(new KeyboardEvent(type, { code: ev.key ?? "", bubbles: true }));
+            } else if (ev.type === "pointer-lock") p?.lock?.();
+            else if (ev.type === "pointer-look") p?.look?.(ev.dx ?? 0, ev.dy ?? 0);
+            else if (ev.type === "pointer-click") p?.click?.();
+            else if (ev.type === "pointer-screen-click") p?.screenClick?.(ev.u ?? 0, ev.v ?? 0);
+          },
+        });
+      }
+      w.__WORLDFORGE_TICK_QUEUE__ = queue;
+    }, tickRest as unknown as { atTick: number; type: string; key?: string; dx?: number; dy?: number; u?: number; v?: number }[]);
+
+    // Wait for the queue to drain (or the deadline), then surface any error
+    // a step threw in-page rather than letting it vanish.
+    const lastTick = Math.max(...tickRest.map((ev) => ev.atTick));
+    await pollUntilTick(page, lastTick, deadline);
+    const errors = await page.evaluate(() => {
+      const w = window as unknown as { __WORLDFORGE_TICK_QUEUE__?: { done?: boolean; error?: string }[] };
+      const q = w.__WORLDFORGE_TICK_QUEUE__ ?? [];
+      return { pending: q.filter((e) => !e.done).length, errors: q.map((e) => e.error).filter(Boolean) };
+    });
+    if (errors.errors.length > 0) {
+      throw new BrowserInfraError(`Tick-gated input step threw in-page: ${errors.errors.join("; ")}`);
     }
   }
 

@@ -5,6 +5,17 @@ import { SCREEN_W } from "@claude-engine/surface-ui";
 import { toBufferGeometry } from "@claude-engine/assets/web";
 import { generateDoorMesh, type GroundFloor, type DoorSpec } from "@claude-engine/interiors";
 import { createFpsController } from "@claude-engine/player-fps";
+import { webStore, createSavePump, exportSave, importSave } from "@claude-engine/save-web";
+// Deep import, not the package barrel: @claude-engine/persistence's index.ts
+// also re-exports sqliteStore/postgresStore, which pull in better-sqlite3
+// and pg (Node natives + node:crypto) at the top of their modules. Vite
+// would try to resolve those for the browser bundle and fail. recover.ts
+// itself imports only @claude-engine/core plus type-only store types
+// (docs/PHASE-H1.md section B: "verified to have no Node imports") — going
+// straight at the compiled file sidesteps the barrel's Node-only siblings
+// entirely, since it's a plain subpath import (persistence has no
+// "exports" map restricting it).
+import { recoverSim } from "@claude-engine/persistence/dist/recover.js";
 import {
   setup,
   loadGroundFloor,
@@ -14,6 +25,7 @@ import {
   screenClickCommand,
   screenKeyCommand,
   screenBlurCommand,
+  saveRestoreDebugCommand,
   PLAYER_ENTITY,
   PLAYER_ACTOR,
   type Pos,
@@ -46,6 +58,109 @@ const DEFAULT_SEED = "hotel-h0-look-1";
 const seedParam = new URLSearchParams(window.location.search).get("worldforgeSeed");
 const sim = new Sim(seedParam ?? DEFAULT_SEED, { eventRetentionTicks: 600 });
 setup(sim);
+
+// -- H1b save/load (docs/PHASE-H1.md section B + "Host (main.ts)
+//    additions"): a single fixed game id, since H1 has no save UI
+//    (listGames/deleteGame are the recorded future change, not made here).
+//    The game record is created (idempotently -- put(), not add()) before
+//    any command is submitted, so a quicksave's exportSave() always finds
+//    a record to hang commands off of. --
+const GAME_ID = "hotel-sp";
+const store = webStore();
+// Not top-level-awaited (vite's default build target predates it) --
+// quickSave() below awaits this promise before its first store access, so
+// the record is guaranteed to exist by the time exportSave() needs it.
+const gameReady: Promise<unknown> = store.createGame({ id: GAME_ID, name: "hotel-sp", seed: sim.seed });
+
+// Every command submission is routed through the pump's submit (wired into
+// installTestHook's `submit` option below) -- that is what makes the
+// write-ahead guarantee real: a command is durably queued (the in-memory
+// WAL) before the sim ever sees it, not just "eventually written somewhere
+// after the fact."
+const pump = createSavePump({ store, gameId: GAME_ID, snapshotEveryTicks: 2000 });
+
+// F5/F9 quick-save/quick-load state (docs/PHASE-H1.md open question 6):
+// this app rebuilds the sim IN PLACE rather than reloading the page or
+// constructing a fresh Sim object. Reasoning:
+//   1. installTestHook's commandLog() is a plain in-memory array scoped to
+//      one page load (packages/renderer-three/src/test-hook.ts) -- a
+//      reload starts a fresh, empty log. Browser-mode scenario assertions
+//      (and --verify-replay) are evaluated by replaying window.__WORLDFORGE__
+//      .commandLog() through a headless Sim (packages/harness/src/cli.ts's
+//      runBrowserMode). A reload would silently truncate that replay bundle
+//      to whatever ran after the reload, breaking every assertion in any
+//      scenario that saves and loads -- with no error, just wrong answers.
+//   2. A reload also tears down and re-creates the whole Three.js scene,
+//      WebGL context, and pointer-lock state for no functional gain here.
+//   3. `Sim.restore()` (packages/core/src/sim.ts) is designed to mutate an
+//      EXISTING Sim's components/tick/rng in place -- recoverSim() already
+//      uses it internally. Building the target state with recoverSim (as
+//      the spec directs) against a throwaway Sim, then applying it to the
+//      live `sim` via `sim.restore(loaded.snapshot())`, gets an identical
+//      result without ever changing the `sim` object's identity, so every
+//      closure below (controller, hook, host, tickSim) keeps working
+//      unmodified -- no teardown/re-wire step, no lost commandLog.
+// The "quick load reverts to the F5 point, discarding the walk since" part
+// (the whole point of a quicksave) rides on exportSave/importSave
+// (B8's bug-report-replay tool, repurposed as a save "slot"): F5 captures
+// the store's FULL command log for GAME_ID as of that instant into an
+// in-memory JSON string. Commands submitted after F5 keep landing in
+// GAME_ID's own continuously-growing log (autosave keeps working normally),
+// but F9 imports the captured JSON as a BRAND NEW game id (importSave never
+// reuses an id) whose command log ends exactly at the F5 tick -- so
+// recoverSim on that fresh id reconstructs precisely the F5 state, not
+// whatever GAME_ID has grown to since.
+let savedJson: string | undefined;
+let savedTick: number | undefined;
+let savedHash: number | undefined;
+let restoredHash: number | undefined;
+// Guards tickSim (below) against advancing the live sim while a quick-load
+// is mid-flight -- the load is async (recoverSim awaits the store) and the
+// render loop's fixed-tick accumulator is not, so without this a tick could
+// step a half-restored world (docs/PHASE-H1.md risk 3's class of bug,
+// applied to the load path instead of the save path).
+let loadInFlight = false;
+
+async function quickSave(): Promise<void> {
+  await gameReady;
+  // Snapshot FIRST, synchronously, before any await -- sim.tick/stateHash()
+  // read right now, alongside the snapshot object itself, are pinned to
+  // this exact instant. Deliberately NOT pump.snapshotNow(sim): that
+  // helper flushes (an await) *then* takes the snapshot, and the render
+  // loop keeps ticking across that await (guest AI advances every tick
+  // with no player command involved, docs/PHASE-H1.md's guestBrainSystem/
+  // pathSystem run unconditionally) -- so the snapshot it would take could
+  // already be a few ticks newer than whatever this function read
+  // afterwards, and savedHash would silently disagree with what actually
+  // got persisted. Taking the snapshot up front and reusing that SAME
+  // object for both the persisted bytes and the recorded hash removes the
+  // gap entirely.
+  const snapshot = sim.snapshot();
+  savedTick = sim.tick;
+  savedHash = snapshot.stateHash;
+  await pump.flush();
+  await store.saveSnapshot(GAME_ID, snapshot);
+  savedJson = await exportSave(store, GAME_ID);
+}
+
+async function quickLoad(): Promise<void> {
+  if (!savedJson) return; // F9 before any F5: a deliberate no-op (see the scenario's non-vacuous guard).
+  loadInFlight = true;
+  try {
+    const loadedGameId = await importSave(store, savedJson);
+    const { sim: loaded } = await recoverSim(store, loadedGameId, setup);
+    sim.restore(loaded.snapshot());
+    restoredHash = sim.stateHash();
+    // Carries {savedTick, savedHash, restoredHash} into sim-visible (and
+    // therefore replay-visible) state -- see saveRestoreDebugCommand's doc
+    // comment. Uses hook.submit (not a raw sim.submit) so it is also
+    // WAL-queued and appears in the harness's replay bundle like any other
+    // command.
+    hook.submit(saveRestoreDebugCommand(sim.tick + 1, savedTick ?? -1, savedHash ?? -1, restoredHash));
+  } finally {
+    loadInFlight = false;
+  }
+}
 
 // Re-derive the same pure GroundFloor from the seed for meshes. Deliberately
 // NOT reusing a game.ts closure across the module boundary — main.ts calls
@@ -91,12 +206,35 @@ const startPaused = new URLSearchParams(window.location.search).has("worldforgeS
 
 const hook = installTestHook({
   world: sim,
-  submit: (command) => sim.submit(command),
+  // Routed through the pump, not straight to sim.submit -- see the H1b
+  // save/load block above. Every command, whether from the player, a
+  // synthetic harness step, or a screen click, is WAL-queued before the sim
+  // applies it.
+  submit: (command) => pump.submit(command, (c) => sim.submit(c)),
   app: "@claude-engine/hotel",
   pointer: controller.syntheticPointer,
   tickTimings: () => tickTimings,
   startPaused,
   screenRect: () => computeScreenRect(),
+});
+
+/** The save-restore gate's hook slot (docs/PHASE-H1.md gate 4), wired the
+ *  same way screenRect/tickTimings are: an extra optional getter set on the
+ *  hook object after installTestHook() returns it, read live on each call
+ *  rather than snapshotted -- so a scenario probing mid-run always sees the
+ *  current values. Not part of WorldforgeHook itself (that interface lives
+ *  in @claude-engine/renderer-three, out of this app's scope) -- exactly
+ *  the same shape screenRect/tickTimings would have had if this app didn't
+ *  get to pass them as installTestHook options. */
+interface HotelSaveState {
+  savedTick: number | undefined;
+  savedHash: number | undefined;
+  restoredHash: number | undefined;
+}
+(hook as typeof hook & { saveState(): HotelSaveState }).saveState = (): HotelSaveState => ({
+  savedTick,
+  savedHash,
+  restoredHash,
 });
 
 // -- Per-tick timing, recorded for the sim-tick-ms probe / tickTimings(). --
@@ -116,11 +254,21 @@ function tickSim(): void {
   // early just means each drained tick did no work, so there is no
   // spiral-of-death and no special-casing needed in the host loop itself.
   if (hook.startBarrier && !hook.startBarrier.released) return;
+  // Pause the accumulator across a quick-load's async gap (see quickLoad()
+  // above) -- a tick here would apply player intent to a sim that
+  // sim.restore() is (or is about to be) mutating out from under it.
+  if (loadInFlight) return;
   controller.onTick(sim, (command) => hook.submit(command));
   const start = performance.now();
   sim.step();
   const elapsedMs = performance.now() - start;
   tickTimings.push(elapsedMs);
+  // Let the harness dispatch any tick-gated input queued for this tick,
+  // synchronously and in-page. Polling world.tick from out of process and
+  // then dispatching over a round trip is bounded-late — it cost a move
+  // command at a key-up boundary, which is exactly the trigger
+  // docs/reviews/phase-H0.md round 3 recorded for this fix.
+  hook.notifyTick(sim.tick);
   if (tickTimings.length > MAX_TICK_TIMINGS) tickTimings.shift();
 }
 
@@ -261,6 +409,21 @@ canvas.addEventListener("click", (e: MouseEvent) => {
 });
 
 window.addEventListener("keydown", (e: KeyboardEvent) => {
+  // F5/F9 quick-save/quick-load: handled globally, before the
+  // screen-focused branch below, so a focused screen never sees these as a
+  // screen.key command and pressing them never triggers a real browser
+  // reload (in case F5/F9 ever do reach the chrome, e.g. outside the
+  // sandboxed CDP input path this app is normally driven through).
+  if (e.code === "F5") {
+    e.preventDefault();
+    void quickSave();
+    return;
+  }
+  if (e.code === "F9") {
+    e.preventDefault();
+    void quickLoad();
+    return;
+  }
   if (!focusedScreen) return;
   if (e.code === "Escape") {
     hook.submit(screenBlurCommand(sim.tick + 1));

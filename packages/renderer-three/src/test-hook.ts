@@ -62,6 +62,20 @@ export interface WorldforgeHook {
   world: IWorld;
   /** The ONLY sim-affecting capability — standard command ingress. */
   submit(command: Command): void;
+  /**
+   * Called by the app once per sim tick, immediately after `sim.step()`.
+   *
+   * This exists so the harness can dispatch tick-gated input EXACTLY on the
+   * tick it declared. The harness used to poll `world.tick` from out of
+   * process and then dispatch over a round trip, which is bounded-late: a
+   * key-up gated on tick N could land on N+1, silently gaining or losing a
+   * move command. docs/reviews/phase-H0.md round 3 recorded that as debt
+   * with a named trigger ("a command landing one tick after its declared
+   * gate"), and it fired. Queued steps installed on
+   * `window.__WORLDFORGE_TICK_QUEUE__` are drained here, in-page and
+   * synchronously, so there is no gap to slip through.
+   */
+  notifyTick(tick: number): void;
   /** Every command submitted through this hook, in order. */
   commandLog(): readonly Command[];
   info: { app: string; tickRateHz: number };
@@ -91,6 +105,14 @@ declare global {
  * harness's `--replay` mode (the returned verdict's replay bundle is this
  * log, per docs/PHASE-2.md Scope E).
  */
+/** One tick-gated step the harness queued into the page. */
+export interface TickQueueEntry {
+  atTick: number;
+  run(): void;
+  done?: boolean;
+  error?: string;
+}
+
 export function installTestHook(opts: {
   world: IWorld;
   submit: (command: Command) => void;
@@ -114,6 +136,23 @@ export function installTestHook(opts: {
     },
     commandLog(): readonly Command[] {
       return log;
+    },
+    notifyTick(tick: number): void {
+      // Drain any tick-gated steps the harness queued for this tick or
+      // earlier, in queue order, synchronously — see the doc comment on
+      // WorldforgeHook.notifyTick for why this is not a poll.
+      const w = window as unknown as { __WORLDFORGE_TICK_QUEUE__?: TickQueueEntry[] };
+      const queue = w.__WORLDFORGE_TICK_QUEUE__;
+      if (!queue || queue.length === 0) return;
+      for (const entry of queue) {
+        if (entry.done || entry.atTick > tick) continue;
+        entry.done = true;
+        try {
+          entry.run();
+        } catch (err) {
+          entry.error = String(err);
+        }
+      }
     },
     info: { app: opts.app, tickRateHz: opts.tickRateHz ?? TICK_RATE_HZ },
   };

@@ -57,6 +57,7 @@ import type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  SaveRestoreDebug,
 } from "./components.js";
 import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
 import { H1_RULES, plantViolation, type RuleDoc, type ResFields } from "./rules.js";
@@ -85,6 +86,7 @@ export type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  SaveRestoreDebug,
 } from "./components.js";
 
 export const PLAYER_ENTITY: EntityId = 1;
@@ -1207,6 +1209,29 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  /** H1b save-restore gate wiring (docs/PHASE-H1.md gate 4; see
+   *  SaveRestoreDebug's doc comment in components.ts). Lazily creates one
+   *  singleton entity only if `debug.saveRestoreRecord` is ever submitted —
+   *  every scenario that never presses F5/F9 has zero extra entities and an
+   *  unchanged stateHash. */
+  function saveRestoreDebugSystem(s: Sim): void {
+    for (const c of s.commands()) {
+      if (c.type !== "debug.saveRestoreRecord") continue;
+      const payload = c.payload as { savedTick: number; savedHash: number; restoredHash: number };
+      let target: EntityId | undefined;
+      for (const [entity] of s.withComponent<SaveRestoreDebug>("saveRestoreDebug")) {
+        target = entity;
+        break;
+      }
+      const entity = target ?? s.spawn();
+      s.setComponent<SaveRestoreDebug>(entity, "saveRestoreDebug", {
+        savedTick: payload.savedTick,
+        savedHash: payload.savedHash,
+        restoredHash: payload.restoredHash,
+      });
+    }
+  }
+
   sim.addSystem(snapshotPrevSystem);
   sim.addSystem(faceSystem);
   sim.addSystem(guestSpawnSystem);
@@ -1219,6 +1244,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.addSystem(economySystem);
   sim.addSystem(dayPhaseSystem);
   sim.addSystem(cleanupSystem);
+  sim.addSystem(saveRestoreDebugSystem);
 }
 
 // -- Command factories -------------------------------------------------
@@ -1264,6 +1290,21 @@ export function screenClickCommand(tick: number, px: number, py: number, actor: 
  * player-facing decision input (docs/PHASE-H1.md): a human accepts/denies
  * exclusively through RESERVA's ACCEPT/DENY buttons.
  */
+/** H1b save-restore gate (docs/PHASE-H1.md gate 4). Submitted once by
+ *  apps/hotel/src/main.ts's quickLoad(), right after a quick-load
+ *  completes, carrying the facts the scenario's assertion needs into
+ *  sim-visible (and therefore replay-visible) state -- see
+ *  SaveRestoreDebug's doc comment in components.ts for why. */
+export function saveRestoreDebugCommand(
+  tick: number,
+  savedTick: number,
+  savedHash: number,
+  restoredHash: number,
+  actor: string = PLAYER_ACTOR
+): Command {
+  return { tick, actor, type: "debug.saveRestoreRecord", payload: { savedTick, savedHash, restoredHash } };
+}
+
 export function deskDecisionCommand(
   tick: number,
   reservationEntity: EntityId,

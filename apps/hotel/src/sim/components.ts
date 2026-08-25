@@ -149,6 +149,23 @@ export interface LedgerEntry {
   memo: string;
 }
 
+/** H1b save-restore gate (docs/PHASE-H1.md gate 4, apps/hotel/src/main.ts's
+ *  quickLoad()): the browser scenario needs `savedHash === restoredHash` to
+ *  be assertable by `--browser`'s replay-based assertion evaluation
+ *  (packages/harness/src/cli.ts's runBrowserMode replays the captured
+ *  command log through a headless Sim and runs `assertions` against THAT
+ *  Sim — a host-only value like a stateHash comparison is otherwise
+ *  invisible to it). main.ts submits one `debug.saveRestoreRecord` command
+ *  right after a quick-load completes; this component is created lazily
+ *  (never spawned by setup()) so every OTHER scenario — none of which ever
+ *  submit that command — has zero extra entities and an unchanged
+ *  stateHash. Singleton, created on first use. */
+export interface SaveRestoreDebug {
+  savedTick: number;
+  savedHash: number;
+  restoredHash: number;
+}
+
 /** Singleton — the repath round-robin cursor. A component, never a closure
  *  variable (docs/PHASE-H1.md, "no closure state", edge (b); also the
  *  Phase-3 review item-1 lesson: Sim.restore() reruns setup() fresh, so

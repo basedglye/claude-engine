@@ -10,7 +10,7 @@ export {
 export {
   installTestHook,
   type WorldforgeHook,
-  type SyntheticPointer,
+  type SyntheticPointer, type TickQueueEntry,
   type StartBarrier,
   type ScreenRect,
 } from "./test-hook.js";

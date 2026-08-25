@@ -327,12 +327,31 @@ export function generateLayout(seed: string): Layout {
     queueCells: [] as { cx: number; cz: number }[],
   };
 
-  // Queue: guest side (north of the desk row), one row, spanning the same
-  // west column range as the desk itself -- slot 0 (the head) is adjacent
-  // to the desk's west corner.
-  const queueLz = deskLz - 1;
+  // Queue: guest side (north of the desk row), one row.
+  //
+  // COLLIDER CLEARANCE (H1a lane-7 fix; the reason this row is at
+  // deskLz-2 and starts at deskLx+1 rather than sitting flush against the
+  // desk): guests are 300mm-radius circles on 250mm cells, so a guest
+  // standing at a cell CENTRE reaches 300mm out while the cell's own
+  // boundary is only 125mm away. Any walkable cell orthogonally adjacent
+  // to a SOLID or FURNITURE cell therefore has an unoccupiable centre --
+  // `space.moveCircle` refuses every step into it. The original placement
+  // (queue row at deskLz-1, columns deskLx..deskLx+7) put all eight slots
+  // directly against the desk's FURNITURE row, and slot 0 additionally
+  // against the lobby's west wall, so NO guest could ever physically
+  // reach a queue slot: they piled up one cell short and the whole
+  // check-in chain was dead. This is the same class of bug as
+  // apps/hotel/src/sim/nav.ts's `hasClearance` doorway fix, applied to
+  // furniture instead of jambs. The 100-seed sweep in scripts/test.mjs
+  // now asserts full clearance on every queue cell so it cannot regress.
+  //
+  // Only `desk.queueCells` changes -- no cell is carved or re-flagged
+  // here, so the grid, the rooms map, the portals, the doors and the
+  // generated mesh are byte-identical to before this fix. The golden
+  // hash moves only because the serialized GroundFloor includes `desk`.
+  const queueLz = deskLz - 2;
   for (let i = 0; i < QUEUE_LEN; i++) {
-    const lx = deskLx + i;
+    const lx = deskLx + 1 + i;
     desk.queueCells.push({ cx: lx + margin, cz: queueLz + marginZ });
   }
 

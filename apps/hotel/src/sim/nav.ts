@@ -92,32 +92,48 @@ import { CELL_SIZE_MM as CELL_SIZE_MM_LOCAL } from "@claude-engine/space";
 
 // -- The jittered A* (see file header) -------------------------------------
 
-/** Judgment-call fix, discovered while wiring the desk/street doorways
- *  (this file's own bug, not `interiors`'): a DOOR span is
- *  DOOR_WIDTH_CELLS (4) cells = 1000mm wide, but guest/player colliders are
- *  GUEST_RADIUS_MM/PLAYER_RADIUS_MM = 300mm — a circle centered on either
- *  EDGE cell of a 4-cell span sits only 125mm from the jamb, well inside
- *  its own radius, so `moveCircle` (space's axis-separated circle-vs-grid
- *  check) correctly refuses to move there even though the cell itself is
- *  WALKABLE|DOOR. `findPathCells`/`findJitteredPath` only ever tested
- *  single-cell occupiability, so A* happily routed guests onto those edge
- *  cells and they then got stuck forever unable to step through their own
- *  computed path. Fix: a DOOR cell is only occupiable for a circle-bodied
- *  agent if neither of its cardinal neighbours is SOLID — that excludes
- *  exactly the two jamb-adjacent edge cells of every span (the two
- *  interior cells of a 4-wide span clear the jamb by 375mm > 300mm) and
- *  leaves through-traffic cells untouched (their in-line neighbours are
- *  WALKABLE on both sides of the doorway, never SOLID). Applies to every
- *  door this pathfinder crosses, not just the entrance. */
+/** Can a circle-bodied agent of up to AGENT_RADIUS_MM stand on this cell's
+ *  CENTRE?
+ *
+ *  H1a lane-7 correction of the original (doors-only, 4-neighbour) rule.
+ *  The original version — written while fixing guests getting stuck in
+ *  their own doorways — checked only the four cardinal neighbours, and
+ *  only for DOOR cells. Both restrictions were wrong, and the second one
+ *  hid the first:
+ *
+ *  - Cells are CELL_SIZE_MM = 250mm, agents are 300mm-radius. A cell
+ *    centre is 125mm from its own edge and ~177mm from its nearest
+ *    DIAGONAL cell's corner, so `space.moveCircle`'s circle-vs-AABB test
+ *    reports a blocking cell anywhere in the 3x3 neighbourhood as an
+ *    overlap. An agent can therefore never stand on the centre of a cell
+ *    with ANY blocking neighbour, diagonals included.
+ *  - Nothing about that is door-specific: a WALKABLE cell one step from a
+ *    wall or from the front desk's FURNITURE row is equally unoccupiable.
+ *
+ *  Concretely (seed "hotel-h1-rush-1"): A* happily routed arriving guests
+ *  onto cell (22,7), whose four cardinal neighbours are all walkable but
+ *  whose DIAGONAL neighbour (21,6) is the wall beside the entrance
+ *  doorway. Guests walked in through the door, stopped dead at (23,7) and
+ *  stayed there for the rest of the run, because every step of their own
+ *  computed path was refused by `moveCircle`.
+ *
+ *  So: a cell is occupiable only if all eight neighbours are non-blocking.
+ *  DOOR neighbours count as non-blocking here, matching `pathSystem`'s
+ *  optimistic planning (guests open the doors they need — see game.ts's
+ *  moveSystem door-opening block); the real `open` bit is still enforced
+ *  by `moveCircle` at the moment of the move. The cost is one cell of
+ *  margin against every wall, which the generated floor has everywhere
+ *  (6-cell corridors, 4-cell doorways -> 2 usable lanes, and
+ *  packages/interiors' 100-seed sweep asserts clearance for the queue
+ *  slots, bedroom goals, terminal anchor and street cells). */
 function hasClearance(grid: NavGrid, cx: number, cz: number): boolean {
-  const neighbours: [number, number][] = [
-    [cx + 1, cz],
-    [cx - 1, cz],
-    [cx, cz + 1],
-    [cx, cz - 1],
-  ];
-  for (const [nx, nz] of neighbours) {
-    if (cellAt(grid, nx, nz) & CELL.SOLID) return false;
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dz === 0) continue;
+      const cell = cellAt(grid, cx + dx, cz + dz);
+      if (cell & CELL.SOLID) return false;
+      if (cell & CELL.FURNITURE) return false;
+    }
   }
   return true;
 }
@@ -129,8 +145,8 @@ function isOccupiable(grid: NavGrid, cx: number, cz: number, isOpen: (cx: number
   if (cell & CELL.FURNITURE) return false;
   if (cell & CELL.DOOR) {
     if (!isOpen(cx, cz)) return false;
-    if (!hasClearance(grid, cx, cz)) return false;
   }
+  if (!hasClearance(grid, cx, cz)) return false;
   return (cell & CELL.WALKABLE) !== 0;
 }
 

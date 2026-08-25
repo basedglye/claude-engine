@@ -16,6 +16,9 @@ import {
   type Yaw,
   type Door,
 } from "./sim/game.js";
+import type { Guest } from "./sim/components.js";
+import { syncCharacter, pruneCharacters } from "./render/characters.js";
+import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
 if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
@@ -104,6 +107,16 @@ function tickSim(): void {
 const doorGroups = new Map<EntityId, THREE.Group>();
 const DOOR_SWING_OPEN_RAD = Math.PI / 2;
 
+// A presenting-eligible guest (queue head) has no `interactable` component
+// (interactSystem handles it via the `guest` component directly, see
+// docs/PHASE-H1.md's interactSystem widening) but the player-fps click
+// pipeline still raycasts against explicitly *registered* interactable
+// objects (packages/player-fps) -- so guest rigs must be registered the
+// same way door meshes are, or a queue-head guest could never be clicked
+// to trigger "presenting". Registered once per entity (guarded by this
+// Set), the same create-once discipline as objectFor itself.
+const registeredGuestInteractables = new Set<EntityId>();
+
 
 const host = createThreeHost(sim, {
   canvas,
@@ -111,7 +124,7 @@ const host = createThreeHost(sim, {
   submit: (command) => hook.submit(command),
   pointerHandlers: controller.pointerHandlers,
   onFrame: controller.onFrame,
-  syncScene(ctx: SceneContext, world: IWorld) {
+  syncScene(ctx: SceneContext, world: IWorld, alpha: number) {
     ctx.scenery("floor-mesh", () => {
       const geometry = toBufferGeometry(floor.mesh);
       const material = new THREE.MeshStandardMaterial({ vertexColors: true });
@@ -145,6 +158,32 @@ const host = createThreeHost(sim, {
       }
       group.rotation.y = door.open ? DOOR_SWING_OPEN_RAD : 0;
     }
+
+    // -- guest characters: articulated Object3D limb rigs, interpolated
+    //    exactly like the player (prevPos/pos, prevYaw/yaw + alpha), posed
+    //    from guest.state + this frame's actual displacement. See
+    //    render/characters.ts (apps/hotel/docs/ARCHITECTURE.md B6). --
+    const liveGuests = new Set<EntityId>();
+    for (const entity of world.entities()) {
+      const guest = world.getComponent<Guest>(entity, "guest");
+      if (!guest) continue;
+      const pos = world.getComponent<Pos>(entity, "pos");
+      const prevPos = world.getComponent<Pos>(entity, "prevPos");
+      const yaw = world.getComponent<Yaw>(entity, "yaw");
+      const prevYaw = world.getComponent<Yaw>(entity, "prevYaw");
+      if (!pos || !prevPos || !yaw || !prevYaw) continue;
+      liveGuests.add(entity);
+      const rigRoot = syncCharacter(ctx, entity, guest, pos, prevPos, yaw, prevYaw, alpha);
+      if (rigRoot && !registeredGuestInteractables.has(entity)) {
+        controller.registerInteractable(entity, rigRoot);
+        registeredGuestInteractables.add(entity);
+      }
+    }
+    pruneCharacters(liveGuests);
+
+    // -- held-document view: docs/PHASE-H1.md "Held-item inspect". --
+    syncHeldDocuments(ctx, world, ctx.camera, PLAYER_ENTITY);
+    pruneHeldDocuments(world, PLAYER_ENTITY);
   },
 });
 

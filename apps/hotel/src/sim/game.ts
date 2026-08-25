@@ -108,10 +108,34 @@ const DAY_TICKS = 4 * 1500;
 const PHASE_TICKS = 1500;
 
 /** How long an accepted guest stays before checking out (implementer
- *  judgment call — spec leaves guest patience/stay tuning free, open
- *  question 4). Short enough that a small room pool turns over inside a
- *  multi-thousand-tick scenario run. */
-const STAY_TICKS = 500;
+ *  judgment call — the spec leaves guest patience/stay tuning free, open
+ *  question 4).
+ *
+ *  Tuned in H1a lane 7 against the `checkin-rush` gate's own fixed
+ *  numbers (8 guests arriving over ticks 100-900, 4 bedrooms, a 2400-tick
+ *  run). The value has to satisfy two opposing constraints at once:
+ *
+ *   - short enough that the 4-room pool turns over and ALL 8 guests get a
+ *     room inside the run (the gate asserts 8 `guest.checkedIn`), and
+ *   - long enough that the run does not END with an empty hotel, or the
+ *     gate's occupancy-consistency and "checked-in guest is inside its
+ *     assigned room" assertions become vacuously true against zero guests
+ *     — exactly the hardcoded-`[]` failure mode H0's review round 1
+ *     rejected.
+ *
+ *  At 500 the whole hotel had emptied out by ~tick 1500 and those two
+ *  assertions were checking nothing. At 1600 the first four guests check
+ *  in around ticks 170-430 and check out around 1770-2030, the second
+ *  four take those rooms immediately after and are still `inRoom` when
+ *  the run ends: 8 check-ins AND a non-empty final state. */
+const STAY_TICKS = 1600;
+
+/** Half-length, in cells, of the "headon" fixture's Z-axis (mirrored) pair
+ *  leg, measured from the lobby spawn cell. 3 keeps both endpoints inside
+ *  the lobby for every generated lobbyDepth (9..12 cells, spawn always at
+ *  its mid-row) with a cell of wall clearance to spare — see the fixture
+ *  block in setupWithConfig. */
+const HEADON_Z_HALF_SPAN = 3;
 
 const ROOM_RATE_MINOR: Record<number, number> = { 1: 5000, 2: 8000 };
 const DAILY_WAGES_MINOR = 3000;
@@ -133,10 +157,13 @@ export interface ScenarioConfig {
   /** Per-mille (0..1000) chance a spawned guest's documents are planted
    *  with exactly one violation via rules.ts's plantViolation. */
   fraudRatePermille: number;
-  /** "headon" places two navAgent guests at opposite ends of the generated
-   *  corridor with swapped goals and spawns no scheduled guests — the
-   *  corridor-headon gate's fixture (that scenario itself is a later lane;
-   *  this is the hook it drives). */
+  /** "headon" spawns no scheduled guests and instead places two head-on
+   *  navAgent PAIRS with swapped starts/goals — one along X (the queue
+   *  row), one along Z (a column through the lobby spawn cell), the
+   *  mirror of the first with the id/direction relation flipped. Both
+   *  members of a pair share one jitterSeed so they genuinely want the
+   *  same lane; see the fixture block in setupWithConfig and
+   *  scenarios/corridor-headon.scenario.mjs. */
   fixture: "normal" | "headon";
 }
 
@@ -290,45 +317,74 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   // 300mm-radius collider, so it isn't a legal walk-through/goal point.
   const streetCell: PathCell = cellOfMm(grid, streetDoor.xMm, streetDoor.zMm);
 
-  // -- headon fixture: two navAgent guests, opposite ends, swapped goals --
+  // -- headon fixture: two head-on navAgent PAIRS, swapped goals --------
+  //
+  // Gate 1 (`corridor-headon`) exists to prove the yield rule resolves a
+  // genuine head-on conflict, so the fixture's whole job is to MANUFACTURE
+  // that conflict rather than hope for it. Two things make it structural:
+  //
+  //  1. Both members of a pair share ONE `jitterSeed`. Per determinism
+  //     rule 5 the A* step cost is `1 + jitter(agentSeed, cell)`, so two
+  //     agents with different seeds see different cost fields and, in an
+  //     open room, simply pick different lanes and glide past each other
+  //     (measured: with per-agent seeds the pair never once contended).
+  //     One shared seed gives them one identical cost field, so the cheapest
+  //     route from A to B is the reverse of the cheapest route from B to A —
+  //     they want the same cells, in opposite order, at the same time.
+  //  2. Each pair starts AT the other's goal, on one axis, so the conflict
+  //     is exactly head-on rather than a crossing.
+  //
+  // Pair 1 runs along X (the queue row); pair 2 is its mirror on Z (a
+  // column through the lobby spawn cell), with the id/direction relation
+  // flipped: pair 1's LOWER id starts at the low-coordinate end, pair 2's
+  // lower id starts at the HIGH-coordinate end. That matters because the
+  // yield rule is asymmetric in EntityId (lower id has priority), so the
+  // mirrored pair exercises the "higher-id occupant, sidestep-repath"
+  // branch as well as the "wait" branch.
   if (config.fixture === "headon") {
     const qLen = floor.desk.queueCells.length;
-    const cellA = floor.desk.queueCells[0]!;
-    const cellB = floor.desk.queueCells[qLen - 1]!;
-    const mmA = cellMm(cellA.cx, cellA.cz);
-    const mmB = cellMm(cellB.cx, cellB.cz);
-    const seedA = guestSpawnRng.int(0, 0x7fffffff);
-    const seedB = guestSpawnRng.int(0, 0x7fffffff);
-    const agentA = sim.spawn();
-    sim.setComponent<Pos>(agentA, "pos", mmA);
-    sim.setComponent<Pos>(agentA, "prevPos", mmA);
-    sim.setComponent<Yaw>(agentA, "yaw", { mdeg: 0 });
-    sim.setComponent<Yaw>(agentA, "prevYaw", { mdeg: 0 });
-    sim.setComponent<Collider>(agentA, "collider", { radiusMm: GUEST_RADIUS_MM });
-    sim.setComponent<NavAgent>(agentA, "navAgent", {
-      goalCx: cellB.cx,
-      goalCz: cellB.cz,
-      path: [],
-      pathIdx: 0,
-      repathAtTick: 0,
-      jitterSeed: seedA,
-      stuckTicks: 0,
-    });
-    const agentB = sim.spawn();
-    sim.setComponent<Pos>(agentB, "pos", mmB);
-    sim.setComponent<Pos>(agentB, "prevPos", mmB);
-    sim.setComponent<Yaw>(agentB, "yaw", { mdeg: 0 });
-    sim.setComponent<Yaw>(agentB, "prevYaw", { mdeg: 0 });
-    sim.setComponent<Collider>(agentB, "collider", { radiusMm: GUEST_RADIUS_MM });
-    sim.setComponent<NavAgent>(agentB, "navAgent", {
-      goalCx: cellA.cx,
-      goalCz: cellA.cz,
-      path: [],
-      pathIdx: 0,
-      repathAtTick: 0,
-      jitterSeed: seedB,
-      stuckTicks: 0,
-    });
+    const spawnCell = cellOfMm(grid, floor.spawn.xMm, floor.spawn.zMm);
+    const pairs: { from: PathCell; to: PathCell }[][] = [
+      // Pair 1, X axis: queue row, west end <-> east end. Lower id west.
+      [
+        { from: floor.desk.queueCells[0]!, to: floor.desk.queueCells[qLen - 1]! },
+        { from: floor.desk.queueCells[qLen - 1]!, to: floor.desk.queueCells[0]! },
+      ],
+      // Pair 2, Z axis (mirrored): a column through the lobby spawn cell,
+      // south end <-> north end. Lower id SOUTH (the mirror of pair 1).
+      [
+        {
+          from: { cx: spawnCell.cx, cz: spawnCell.cz + HEADON_Z_HALF_SPAN },
+          to: { cx: spawnCell.cx, cz: spawnCell.cz - HEADON_Z_HALF_SPAN },
+        },
+        {
+          from: { cx: spawnCell.cx, cz: spawnCell.cz - HEADON_Z_HALF_SPAN },
+          to: { cx: spawnCell.cx, cz: spawnCell.cz + HEADON_Z_HALF_SPAN },
+        },
+      ],
+    ];
+    for (const pair of pairs) {
+      // One draw per PAIR, shared by both of its agents (see note 1 above).
+      const pairJitterSeed = guestSpawnRng.int(0, 0x7fffffff);
+      for (const { from, to } of pair) {
+        const mm = cellMm(from.cx, from.cz);
+        const agent = sim.spawn();
+        sim.setComponent<Pos>(agent, "pos", mm);
+        sim.setComponent<Pos>(agent, "prevPos", mm);
+        sim.setComponent<Yaw>(agent, "yaw", { mdeg: 0 });
+        sim.setComponent<Yaw>(agent, "prevYaw", { mdeg: 0 });
+        sim.setComponent<Collider>(agent, "collider", { radiusMm: GUEST_RADIUS_MM });
+        sim.setComponent<NavAgent>(agent, "navAgent", {
+          goalCx: to.cx,
+          goalCz: to.cz,
+          path: [],
+          pathIdx: 0,
+          repathAtTick: 0,
+          jitterSeed: pairJitterSeed,
+          stuckTicks: 0,
+        });
+      }
+    }
   }
 
   // === Systems ============================================================
@@ -456,9 +512,20 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       return d !== 0 ? d : a[0] - b[0];
     });
     active.forEach(([entity, guest], i) => {
-      if (guest.queueIndex !== i) {
-        s.setComponent<Guest>(entity, "guest", { ...guest, queueIndex: i });
-      }
+      if (guest.queueIndex === i) return;
+      s.setComponent<Guest>(entity, "guest", { ...guest, queueIndex: i });
+      // ...and WALK to the new slot. Compacting `queueIndex` without
+      // re-issuing the nav goal (the original behaviour) advanced the
+      // queue only on paper: a guest that arrived into slot 3 kept
+      // slot 3's cell as its goal forever, so once it compacted to index
+      // 0 it stood three cells short of the desk and never came into the
+      // clerk's interact range. `checkin-rush` deadlocked there with the
+      // whole line "queued" and nobody ever presenting. A `presenting`
+      // guest is deliberately left alone — it is already at the desk and
+      // must not be re-pathed mid-transaction.
+      if (guest.state !== "queued") return;
+      const slot = floor.desk.queueCells[i];
+      if (slot) setGoal(s, entity, slot.cx, slot.cz);
     });
     let nextFreeSlot = active.length;
 
@@ -728,6 +795,14 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
             blocked = !willVacate;
           }
           if (blocked) {
+            // The yield rule actually firing. Emitted so a gate can PROVE
+            // it exercised contention instead of asserting that two agents
+            // happened to walk past each other in an empty room (the H0
+            // review's "a gate must be provably non-vacuous" item, applied
+            // to nav). Distinct from `nav.stuck`, which fires only once a
+            // yield has persisted for STUCK_THRESHOLD ticks: `nav.yield`
+            // is the healthy, expected case, `nav.stuck` the pathology.
+            s.emit("nav.yield", { entity, blockedBy: occupant, cx: targetCell.cx, cz: targetCell.cz });
             const newStuck = agent.stuckTicks + 1;
             if (agent.stuckTicks < STUCK_THRESHOLD && newStuck >= STUCK_THRESHOLD) {
               s.emit("nav.stuck", { entity, cx: curCell.cx, cz: curCell.cz });

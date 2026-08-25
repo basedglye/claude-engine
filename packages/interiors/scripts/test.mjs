@@ -67,7 +67,12 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // docs/PHASE-H0.md deferral item 3): the generator now adds a front desk
 // (FURNITURE cells), an explicit queue chain, a street door + exterior
 // street strip, and bedroom annotations -- every seed's grid/mesh changed.
-const GOLDEN_HASH = 0x969cc517;
+// Re-pinned again for the H1a lane-7 queue-clearance fix (see
+// src/layout.ts's "COLLIDER CLEARANCE" note): `desk.queueCells` moved one
+// row north and one column east so a 300mm-radius guest can actually
+// stand on a slot. No grid cell, portal, door or mesh vertex changed --
+// only the serialized `desk` block, which this hash covers.
+const GOLDEN_HASH = 0x132c99ef;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {
@@ -480,6 +485,14 @@ const GOLDEN_HASH = 0x969cc517;
       if (!isWalkableCell(cell)) qOk = false;
       if (isDoorCell(cell)) qOk = false;
       if (k > 0 && !isAdjacent(desk.queueCells[k - 1], c)) qOk = false;
+      // H1a lane-7 addition: a queue slot must be OCCUPIABLE by a
+      // 300mm-radius guest, not merely walkable. On 250mm cells a cell
+      // centre is 125mm from its own boundary, so any cell orthogonally
+      // adjacent to SOLID or FURNITURE has a centre `space.moveCircle`
+      // will never let an agent stand on. Without this property the queue
+      // row sat flush against the desk's FURNITURE row and no guest could
+      // ever reach a slot (the check-in chain was dead for every seed).
+      if (!hasClearance(grid, c.cx, c.cz)) qOk = false;
     }
     if (qOk) queueOk++;
 
@@ -577,7 +590,7 @@ const GOLDEN_HASH = 0x969cc517;
   }
 
   console.log(`  H1a queue chain: ${queueOk}/${N} seeds passed`);
-  check(`H1a: queue chain is walkable/non-door, adjacent, unique, length>=8 across all ${N} seeds`, queueOk === N);
+  check(`H1a: queue chain is walkable/non-door, adjacent, unique, clear for a 300mm collider, length>=8 across all ${N} seeds`, queueOk === N);
 
   console.log(`  H1a terminal anchor: ${terminalOk}/${N} seeds passed`);
   check(`H1a: terminal anchor has clearance and is adjacent to a desk FURNITURE cell across all ${N} seeds`, terminalOk === N);

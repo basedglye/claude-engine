@@ -23,6 +23,21 @@ export interface GroundFloor {
    *  presentation, the grid is truth. */
   mesh: MeshDataWithColors;
   spawn: { xMm: number; zMm: number; yawMdeg: number }; // lobby center
+  /** Front desk: the desk prop cells are FURNITURE in `grid` (see
+   *  mesh-gen.ts -- they get wall geometry from the same boundary scan as
+   *  every other wall, never a second description). `xMm`/`zMm`/`yawMdeg`
+   *  is the clerk-side terminal anchor; `queueCells[0]` is the head slot,
+   *  adjacent to the desk on the guest side. */
+  desk: {
+    xMm: number;
+    zMm: number;
+    yawMdeg: number;
+    queueCells: { cx: number; cz: number }[];
+  };
+  /** Index into `doors`: the street door guests spawn outside of. */
+  entranceDoorIndex: number;
+  /** The 4 existing rooms, annotated as bedrooms with a walk-to goal cell. */
+  bedrooms: { roomId: number; tier: number; goalCx: number; goalCz: number }[];
 }
 
 /** Pure function of the seed: BSP-partition a lobby + corridor + 4 rooms
@@ -40,5 +55,8 @@ export function generateGroundFloor(seed: string): GroundFloor {
     doors: layout.doors,
     mesh,
     spawn: layout.spawn,
+    desk: layout.desk,
+    entranceDoorIndex: layout.entranceDoorIndex,
+    bedrooms: layout.bedrooms,
   };
 }

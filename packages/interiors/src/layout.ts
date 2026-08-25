@@ -53,6 +53,14 @@ export interface Layout {
   portals: PortalGraph;
   doors: DoorSpec[];
   spawn: { xMm: number; zMm: number; yawMdeg: number };
+  desk: {
+    xMm: number;
+    zMm: number;
+    yawMdeg: number;
+    queueCells: { cx: number; cz: number }[];
+  };
+  entranceDoorIndex: number;
+  bedrooms: { roomId: number; tier: number; goalCx: number; goalCz: number }[];
 }
 
 // Room ids. 0 is reserved for "outside" (space's convention).
@@ -62,6 +70,19 @@ const ROOM_1 = 3;
 const ROOM_2 = 4;
 const ROOM_3 = 5;
 const ROOM_4 = 6;
+const ROOM_STREET = 7;
+
+/** Front desk footprint: FURNITURE cells (blocking, non-walkable) forming
+ *  one row. Deliberately pinned to the lobby's west wall (local lx 0..7) --
+ *  see the H1a queue-bypass reasoning below the desk placement code. */
+const DESK_WIDTH_CELLS = 8;
+/** Queue slot count -- spec floor is 8; matches DESK_WIDTH_CELLS so the
+ *  queue row fits exactly across the desk's own footprint. */
+const QUEUE_LEN = 8;
+/** Walkable street rows outside the entrance door. */
+const STREET_WALK_ROWS = 5;
+/** Extra walkable columns of street on each side of the doorway span. */
+const STREET_PAD_CELLS = 6;
 
 function clampInt(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
@@ -122,14 +143,23 @@ export function generateLayout(seed: string): Layout {
     corridorTop + restH - minRoomDepth - 1
   );
 
-  const margin = 1; // 1-cell "outside" border, kept SOLID
+  const margin = 1; // 1-cell "outside" border on west/east/south, kept SOLID
+  // North margin is pushed out to make room for the street strip: 1-cell
+  // outer solid border, then STREET_WALK_ROWS of walkable street, then the
+  // wall row the entrance door is cut into (that wall row is what `margin`
+  // played on the other three sides -- see addDoor's lz=-1 call below).
+  const marginZ = margin + STREET_WALK_ROWS + 1;
   const width = FW + margin * 2;
-  const height = FH + margin * 2;
+  const height = FH + marginZ + margin;
   const cells = new Array<number>(width * height).fill(CELL.SOLID);
   const rooms = new Array<number>(width * height).fill(0);
 
+  // gidx is the ONE place local (lx,lz) building coordinates map to the
+  // grid's flat array -- lz may be negative (street / entrance-wall rows
+  // sit north of the lobby's local lz=0), everything downstream (carve,
+  // addDoor, desk/queue/street placement) goes through it.
   function gidx(lx: number, lz: number): number {
-    return (lz + margin) * width + (lx + margin);
+    return (lz + marginZ) * width + (lx + margin);
   }
 
   function carve(x0: number, x1: number, z0: number, z1: number, roomId: number): void {
@@ -155,7 +185,7 @@ export function generateLayout(seed: string): Layout {
 
   const doors: DoorSpec[] = [];
   const portals: Portal[] = [];
-  const roomTouches: number[][] = [[], [], [], [], [], [], []]; // index 0..6
+  const roomTouches: number[][] = [[], [], [], [], [], [], [], []]; // index 0..7 (7 = street)
 
   /** Carve a DOOR_WIDTH_CELLS-wide doorway. `axis: "row"` spans local X at
    *  fixed lz (lx is the span start); `axis: "col"` spans local Z at fixed
@@ -174,7 +204,7 @@ export function generateLayout(seed: string): Layout {
     for (let i = 0; i < DOOR_WIDTH_CELLS; i++) {
       cellsLocal.push(axis === "row" ? { lx: lx + i, lz } : { lx, lz: lz + i });
     }
-    const cellsGlobal = cellsLocal.map(({ lx: clx, lz: clz }) => ({ cx: clx + margin, cz: clz + margin }));
+    const cellsGlobal = cellsLocal.map(({ lx: clx, lz: clz }) => ({ cx: clx + margin, cz: clz + marginZ }));
     for (const { cx, cz } of cellsGlobal) {
       const idx = cx + cz * width;
       cells[idx] = CELL.WALKABLE | CELL.DOOR;
@@ -234,6 +264,100 @@ export function generateLayout(seed: string): Layout {
     addDoor("col", corridorX1, lz, ROOM_CORRIDOR, ROOM_4, 90_000);
   }
 
+  // --- Entrance door + street (H1a). ---------------------------------
+  // Reuse the corridor's own centered x-span for the entrance door too
+  // (instead of the full lobby width): this keeps both doors -- the ONLY
+  // two doorways the lobby's main walkway passes through -- inside one
+  // central band, well clear of the desk/queue corner carved below. See
+  // "risk 1" in docs/PHASE-H1.md: a departing guest's shortest path must
+  // never have to cross the queue.
+  const streetDoorLx = pickSpanStart(corridorX0, corridorX1, DOOR_WIDTH_CELLS, doorRng.fork("door-street-x"));
+  // Door row: local lz=-1, i.e. the wall row directly north of the lobby's
+  // own local lz=0 (see marginZ's derivation above). roomA is the smaller-lz
+  // side (street), roomB the larger-lz side (lobby) -- same convention the
+  // internal doors above use.
+  addDoor("row", streetDoorLx, -1, ROOM_STREET, ROOM_LOBBY, 0);
+  const entranceDoorIndex = doors.length - 1;
+
+  // Street strip: STREET_WALK_ROWS of walkable cells north of the wall row,
+  // padded sideways around the doorway span, clamped to the footprint.
+  const streetX0 = clampInt(streetDoorLx - STREET_PAD_CELLS, 0, FW - 1);
+  const streetX1 = clampInt(streetDoorLx + DOOR_WIDTH_CELLS + STREET_PAD_CELLS, streetX0 + 1, FW);
+  carve(streetX0, streetX1, -(STREET_WALK_ROWS + 1), -1, ROOM_STREET);
+
+  // --- Front desk (H1a). ---------------------------------------------
+  // The desk gets its geometry from mesh-gen's EXISTING wall-boundary scan,
+  // not a separate prop mesh: desk cells carry CELL.FURNITURE only (no
+  // WALKABLE bit), so mesh-gen's isWalkable(cell) is false for them exactly
+  // like a SOLID cell, and the wall-quad scan (which already runs over
+  // every grid cell boundary) automatically emits a box of wall quads
+  // around the desk block. There is no second place that knows the desk's
+  // shape -- it cannot desync from the grid because it IS the grid.
+  //
+  // Placement: pinned to the lobby's west wall (local lx 0..DESK_WIDTH_CELLS)
+  // rather than centered. The corridor<->lobby door and the entrance door
+  // above are both drawn from the corridor's centered x-span
+  // [corridorX0,corridorX1), which -- given FW>=40 and corridorW 6..8 -- sits
+  // at local x >= ~16, comfortably clear of the desk's [0,DESK_WIDTH_CELLS)
+  // footprint. Since the desk blocks only its own row and nothing else in
+  // the lobby is obstructed, the shortest path between those two doors
+  // never needs to enter the desk's column range at all -- it's a straight
+  // Manhattan walk confined to the central band. That is what keeps the
+  // queue (carved next, immediately north of the desk, in the very same
+  // west column range) off every corridor<->street route, for every seed,
+  // by construction rather than by chance.
+  const deskLx = 0;
+  const deskLz = clampInt(Math.floor(lobbyDepth / 2), 3, lobbyDepth - 3);
+  for (let lx = deskLx; lx < deskLx + DESK_WIDTH_CELLS; lx++) {
+    const idx = gidx(lx, deskLz);
+    cells[idx] = CELL.FURNITURE;
+    rooms[idx] = ROOM_LOBBY;
+  }
+
+  // Terminal: clerk side (south of the desk row), centered on the desk span.
+  const termLx = deskLx + Math.floor(DESK_WIDTH_CELLS / 2);
+  const termLz = deskLz + 1;
+  const termGx = termLx + margin;
+  const termGz = termLz + marginZ;
+  const desk = {
+    xMm: termGx * CELL_SIZE_MM + CELL_SIZE_MM / 2,
+    zMm: termGz * CELL_SIZE_MM + CELL_SIZE_MM / 2,
+    // Facing north (toward the guest/queue side of the desk).
+    yawMdeg: 180_000,
+    queueCells: [] as { cx: number; cz: number }[],
+  };
+
+  // Queue: guest side (north of the desk row), one row, spanning the same
+  // west column range as the desk itself -- slot 0 (the head) is adjacent
+  // to the desk's west corner.
+  const queueLz = deskLz - 1;
+  for (let i = 0; i < QUEUE_LEN; i++) {
+    const lx = deskLx + i;
+    desk.queueCells.push({ cx: lx + margin, cz: queueLz + marginZ });
+  }
+
+  // --- Bedrooms (H1a): annotate the existing 4 rooms. ------------------
+  // roomRects mirrors the carve() calls above for rooms ROOM_1..ROOM_4 --
+  // one source of truth for "where is each room's rectangle" would be nice,
+  // but these 4 carves are already the one source (this just remembers
+  // their bounds long enough to compute a center cell).
+  const roomRects: { roomId: number; x0: number; x1: number; z0: number; z1: number }[] = [
+    { roomId: ROOM_1, x0: 0, x1: corridorX0 - 1, z0: corridorTop, z1: splitRowLeft - 1 },
+    { roomId: ROOM_2, x0: 0, x1: corridorX0 - 1, z0: splitRowLeft, z1: FH },
+    { roomId: ROOM_3, x0: corridorX1 + 1, x1: FW, z0: corridorTop, z1: splitRowRight - 1 },
+    { roomId: ROOM_4, x0: corridorX1 + 1, x1: FW, z0: splitRowRight, z1: FH },
+  ];
+  const bedrooms = roomRects.map(({ roomId, x0, x1, z0, z1 }, i) => {
+    const glx = Math.floor((x0 + x1) / 2);
+    const glz = Math.floor((z0 + z1) / 2);
+    return {
+      roomId,
+      tier: (i % 2) + 1,
+      goalCx: glx + margin,
+      goalCz: glz + marginZ,
+    };
+  });
+
   const graph: PortalGraph = {
     rooms: roomTouches,
     portals,
@@ -246,12 +370,12 @@ export function generateLayout(seed: string): Layout {
   const spawnLx = Math.floor(FW / 2);
   const spawnLz = Math.floor(lobbyDepth / 2);
   const spawnGx = spawnLx + margin;
-  const spawnGz = spawnLz + margin;
+  const spawnGz = spawnLz + marginZ;
   const spawn = {
     xMm: spawnGx * CELL_SIZE_MM + CELL_SIZE_MM / 2,
     zMm: spawnGz * CELL_SIZE_MM + CELL_SIZE_MM / 2,
     yawMdeg: 0,
   };
 
-  return { grid, rooms, portals: graph, doors, spawn };
+  return { grid, rooms, portals: graph, doors, spawn, desk, entranceDoorIndex, bedrooms };
 }

@@ -33,18 +33,35 @@ const STATIC_MIME_TYPES: Record<string, string> = {
 };
 
 export type InputStep =
-  | { key: string; downMs: number; upMs: number } // existing
+  | { key: string; downMs: number; upMs: number } // existing, wall-clock
+  // Tick-gated form (docs/PHASE-H0.md risk 4's mitigation, phase-H0 review
+  // item 1): down/up are dispatched once window.__WORLDFORGE__.world.tick
+  // reaches the given tick, via the same polling approach as screenshot
+  // capture (see pollUntilTick). Removes the wall-clock-vs-sim-tick
+  // scheduling variance at the source for scenarios that need an exact,
+  // reproducible tick count under a held key (e.g. a deterministic number
+  // of move ticks before a corrective look + click).
+  | { key: string; downAtTick: number; upAtTick: number }
   | { pointer: "lock"; atMs: number }
+  | { pointer: "lock"; atTick: number }
   | { pointer: "look"; atMs: number; dx: number; dy: number } // px deltas
+  | { pointer: "look"; atTick: number; dx: number; dy: number }
   | { pointer: "click"; atMs: number }
+  | { pointer: "click"; atTick: number }
   | { pointer: "screenClick"; atMs: number; u: number; v: number }; // RESERVED: exit 2 in H0
 
 export interface BrowserSpec {
   /** Workspace name (e.g. "@claude-engine/demo") — harness builds it and
    *  serves via vite preview — or an http(s):// URL to use as-is. */
   app: string;
-  /** Wall-clock input script, driven by Playwright. Keyboard steps and
-   *  pointer steps share the same wall-clock scheduler (see runInputScript). */
+  /** Input script driven by Playwright: wall-clock steps (existing) and/or
+   *  tick-gated steps (see InputStep). Wall-clock steps keep their existing
+   *  scheduler (sorted by atMs, replayed against real elapsed time) so
+   *  older scenarios (e.g. demo-visual) are unaffected; tick-gated steps
+   *  run as a separate sequential queue, each waiting for its declared sim
+   *  tick before firing, processed in declaration order. Both queues run
+   *  concurrently (see runInputScript) — a scenario would normally use one
+   *  kind or the other, not mix them. */
   input?: readonly InputStep[];
   /** Sim ticks (via the test hook) at which to capture screenshots. */
   screenshotAtTicks?: readonly number[];
@@ -300,55 +317,100 @@ type ScheduledEvent =
   | { at: number; type: "pointer-look"; dx: number; dy: number }
   | { at: number; type: "pointer-click" };
 
+type TickScheduledEvent =
+  | { atTick: number; type: "down" | "up"; key: string }
+  | { atTick: number; type: "pointer-lock" }
+  | { atTick: number; type: "pointer-look"; dx: number; dy: number }
+  | { atTick: number; type: "pointer-click" };
+
+async function dispatchEvent(
+  page: import("playwright").Page,
+  ev: { type: "down" | "up" | "pointer-lock" | "pointer-look" | "pointer-click"; key?: string; dx?: number; dy?: number }
+): Promise<void> {
+  switch (ev.type) {
+    case "down":
+      await page.keyboard.down(ev.key!);
+      break;
+    case "up":
+      await page.keyboard.up(ev.key!);
+      break;
+    case "pointer-lock":
+      await page.evaluate(
+        () => (window as unknown as { __WORLDFORGE__: { pointer?: { lock(): void } } }).__WORLDFORGE__.pointer?.lock()
+      );
+      break;
+    case "pointer-look":
+      await page.evaluate(
+        ([dx, dy]) =>
+          (window as unknown as { __WORLDFORGE__: { pointer?: { look(dx: number, dy: number): void } } }).__WORLDFORGE__.pointer?.look(
+            dx as number,
+            dy as number
+          ),
+        [ev.dx, ev.dy]
+      );
+      break;
+    case "pointer-click":
+      await page.evaluate(
+        () => (window as unknown as { __WORLDFORGE__: { pointer?: { click(): void } } }).__WORLDFORGE__.pointer?.click()
+      );
+      break;
+  }
+}
+
 async function runInputScript(page: import("playwright").Page, input: readonly InputStep[], deadline: number): Promise<void> {
   if (input.length === 0) return;
   const start = Date.now();
-  const events: ScheduledEvent[] = [];
+  const msEvents: ScheduledEvent[] = [];
+  const tickEvents: TickScheduledEvent[] = [];
   for (const step of input) {
     if ("pointer" in step) {
-      if (step.pointer === "lock") events.push({ at: step.atMs, type: "pointer-lock" });
-      else if (step.pointer === "look") events.push({ at: step.atMs, type: "pointer-look", dx: step.dx, dy: step.dy });
-      else if (step.pointer === "click") events.push({ at: step.atMs, type: "pointer-click" });
-      // screenClick is rejected before this function is ever called.
+      if ("atMs" in step) {
+        if (step.pointer === "lock") msEvents.push({ at: step.atMs, type: "pointer-lock" });
+        else if (step.pointer === "look") msEvents.push({ at: step.atMs, type: "pointer-look", dx: step.dx, dy: step.dy });
+        else if (step.pointer === "click") msEvents.push({ at: step.atMs, type: "pointer-click" });
+        // screenClick is rejected before this function is ever called.
+      } else if ("atTick" in step) {
+        if (step.pointer === "lock") tickEvents.push({ atTick: step.atTick, type: "pointer-lock" });
+        else if (step.pointer === "look") tickEvents.push({ atTick: step.atTick, type: "pointer-look", dx: step.dx, dy: step.dy });
+        else if (step.pointer === "click") tickEvents.push({ atTick: step.atTick, type: "pointer-click" });
+      }
+    } else if ("downMs" in step) {
+      msEvents.push({ at: step.downMs, type: "down", key: step.key });
+      msEvents.push({ at: step.upMs, type: "up", key: step.key });
     } else {
-      events.push({ at: step.downMs, type: "down", key: step.key });
-      events.push({ at: step.upMs, type: "up", key: step.key });
+      // Tick-gated keyboard step: down is dispatched once the polled tick
+      // reaches downAtTick, up once it reaches upAtTick. Pushed in this
+      // order so the tick-event queue (sequential, declaration order)
+      // always processes down before up for a given step.
+      tickEvents.push({ atTick: step.downAtTick, type: "down", key: step.key });
+      tickEvents.push({ atTick: step.upAtTick, type: "up", key: step.key });
     }
   }
-  events.sort((a, b) => a.at - b.at);
-  for (const ev of events) {
-    const wait = start + ev.at - Date.now();
-    if (wait > 0) await page.waitForTimeout(Math.min(wait, Math.max(0, deadline - Date.now())));
-    if (Date.now() >= deadline) break;
-    switch (ev.type) {
-      case "down":
-        await page.keyboard.down(ev.key);
-        break;
-      case "up":
-        await page.keyboard.up(ev.key);
-        break;
-      case "pointer-lock":
-        await page.evaluate(
-          () => (window as unknown as { __WORLDFORGE__: { pointer?: { lock(): void } } }).__WORLDFORGE__.pointer?.lock()
-        );
-        break;
-      case "pointer-look":
-        await page.evaluate(
-          ([dx, dy]) =>
-            (window as unknown as { __WORLDFORGE__: { pointer?: { look(dx: number, dy: number): void } } }).__WORLDFORGE__.pointer?.look(
-              dx as number,
-              dy as number
-            ),
-          [ev.dx, ev.dy]
-        );
-        break;
-      case "pointer-click":
-        await page.evaluate(
-          () => (window as unknown as { __WORLDFORGE__: { pointer?: { click(): void } } }).__WORLDFORGE__.pointer?.click()
-        );
-        break;
+
+  async function runMsEvents(): Promise<void> {
+    msEvents.sort((a, b) => a.at - b.at);
+    for (const ev of msEvents) {
+      const wait = start + ev.at - Date.now();
+      if (wait > 0) await page.waitForTimeout(Math.min(wait, Math.max(0, deadline - Date.now())));
+      if (Date.now() >= deadline) break;
+      await dispatchEvent(page, ev);
     }
   }
+
+  // Tick-gated events run in declaration order (not sorted — a scenario
+  // may legitimately wait for the same tick twice, e.g. a look immediately
+  // following a key-up gated on the same tick), each waiting via the same
+  // pollUntilTick approach the harness already uses for screenshot capture.
+  async function runTickEvents(): Promise<void> {
+    for (const ev of tickEvents) {
+      if (Date.now() >= deadline) break;
+      await pollUntilTick(page, ev.atTick, deadline);
+      if (Date.now() >= deadline) break;
+      await dispatchEvent(page, ev);
+    }
+  }
+
+  await Promise.all([runMsEvents(), runTickEvents()]);
 }
 
 async function runProbe(

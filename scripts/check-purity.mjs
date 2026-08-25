@@ -196,6 +196,17 @@ const PURITY_ROOTS = [
     excludeDirNames: new Set(),
     banTranscendentals: true,
   },
+  // Phase H0 review item 3: apps/hotel/src/sim is the one sim-code module
+  // living outside packages/ (apps/hotel/src/main.ts is the DOM/three host,
+  // NOT scanned) — moved out of apps/hotel/src into its own directory so it
+  // can be a file-level (well, directory-level) purity root, exactly like
+  // every other sim root above.
+  {
+    name: 'apps/hotel/src/sim',
+    dir: path.join(REPO_ROOT, 'apps', 'hotel', 'src', 'sim'),
+    excludeDirNames: new Set(),
+    banTranscendentals: true,
+  },
 ];
 
 function runSelfTest() {
@@ -338,7 +349,7 @@ function runSelfTest() {
     const assetsCheck = testWebExclusion('packages/assets');
     const netCheck = testWebExclusion('packages/net');
     const botsCheck = testPlainRoot('packages/bots');
-    const trigBanCheck = testTranscendentalBan('packages/core/src');
+    const trigBanCheck = testTranscendentalBan('packages/space/src');
     const trigNotBannedCheck = testTranscendentalNotBanned('packages/assets/src (excluding');
 
     const allPass =
@@ -366,8 +377,8 @@ function runSelfTest() {
       console.log(`  - Math.random planted in packages/net/src: CAUGHT`);
       console.log(`  - three import planted in packages/net/src/web: correctly EXCLUDED`);
       console.log(`  - Math.random planted in packages/bots/src: CAUGHT`);
-      console.log(`  - Math.atan2 planted in packages/core/src: CAUGHT`);
-      console.log(`  - Math.floor planted in packages/core/src: correctly NOT flagged`);
+      console.log(`  - Math.atan2 planted in packages/space/src: CAUGHT`);
+      console.log(`  - Math.floor planted in packages/space/src: correctly NOT flagged`);
       console.log(`  - Math.cos planted in packages/assets/src: correctly NOT flagged`);
       return 0;
     } else {
@@ -381,8 +392,8 @@ function runSelfTest() {
       if (!netCheck.hasPathViolation) console.error('  - Math.random planted in packages/net/src: NOT CAUGHT');
       if (!netCheck.webCorrectlyExcluded) console.error('  - packages/net/src/web exclusion: NOT WORKING (false positive)');
       if (!botsCheck.hasPathViolation) console.error('  - Math.random planted in packages/bots/src: NOT CAUGHT');
-      if (!trigBanCheck.hasAtan2Violation) console.error('  - Math.atan2 planted in packages/core/src: NOT CAUGHT');
-      if (!trigBanCheck.floorNotFlagged) console.error('  - Math.floor planted in packages/core/src: FALSE POSITIVE');
+      if (!trigBanCheck.hasAtan2Violation) console.error('  - Math.atan2 planted in packages/space/src: NOT CAUGHT');
+      if (!trigBanCheck.floorNotFlagged) console.error('  - Math.floor planted in packages/space/src: FALSE POSITIVE');
       if (!trigNotBannedCheck.cosNotFlagged) console.error('  - Math.cos planted in packages/assets/src: FALSE POSITIVE');
       return 1;
     }
@@ -413,12 +424,17 @@ function main() {
   const allViolations = [];
   for (const root of PURITY_ROOTS) {
     if (!fs.existsSync(root.dir)) {
-      // Concurrently-developed roots (packages/space/src,
-      // packages/interiors/src during Phase H0) may not exist yet on a
-      // given checkout — skip gracefully rather than failing the whole
-      // check, matching the self-test helpers' existsSync guard below.
-      console.log(`(skip) ${root.name} not found at ${root.dir} yet`);
-      continue;
+      // Phase H0 review item 4: this used to be a soft skip, added as a
+      // concurrent-development convenience while packages/space/src and
+      // packages/interiors/src didn't exist yet. That convenience is over
+      // — every root above now exists on every checkout that reaches this
+      // script — so a missing root is once again a hard failure (as it was
+      // before that convenience was added): silently skipping would let a
+      // future rename (e.g. packages/space/src) disable that root's entire
+      // purity coverage while CI stayed green.
+      console.error(`✗ Purity root "${root.name}" not found at ${root.dir}`);
+      console.error(`\nFound a missing purity root — exiting 2 (not a violation count, an infra failure).`);
+      process.exit(2);
     }
     allViolations.push(
       ...scanDirectory(root.dir, { excludeDirNames: root.excludeDirNames, banTranscendentals: root.banTranscendentals })

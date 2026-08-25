@@ -6,7 +6,7 @@ looking at a door within range to open/close it. See `docs/DESIGN.md` and
 `docs/ARCHITECTURE.md` for game context and `docs/PHASE-H0.md` (repo root)
 for the implementation spec.
 
-The sim logic in `src/game.ts` is core+space+interiors only (headless-safe)
+The sim logic in `src/sim/game.ts` is core+space+interiors only (headless-safe)
 and is run both by the browser (via `src/main.ts`) and by the headless
 harness against the same compiled `dist-game/game.js` artifact:
 

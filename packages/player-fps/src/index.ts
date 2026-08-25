@@ -230,9 +230,21 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
 
     // face{} — sim state. Submitted at most once per tick, only past drift
     // threshold, quantized (whole millidegrees — camYawMdeg already is).
+    // Stamp at world.tick + 1, not world.tick: onTick runs before
+    // sim.step() (main.ts's tickSim wraps stepSim as
+    // `controller.onTick(...); sim.step()`), so world.tick here is the
+    // pre-step tick T while the command actually executes in the step that
+    // produces T+1. Matches the server's convention
+    // (packages/server/src/server.ts's doTick drain: `sim.tick + 1`) --
+    // phase-H0 review item 2, the same stamp!=execution-tick class phase 3
+    // removed from the server. Headless replay (replayToSim) executes a
+    // command stamped T in the step producing T, so an unstamped mismatch
+    // here would shift every replayed command by one tick relative to the
+    // live browser session; a command submitted at world.tick===0 would
+    // also be silently dropped by replayToSim's `for (t = 1..ticks)` loop.
     const drift = Math.abs(angleDeltaMdeg(camYawMdeg, pose.yawMdeg));
     if (drift > yawDriftThresholdMdeg) {
-      submit(opts.makeFace(world.tick, camYawMdeg));
+      submit(opts.makeFace(world.tick + 1, camYawMdeg));
     }
 
     // move{} — held WASD relative to the current SIM yaw; sim does the trig.
@@ -247,7 +259,7 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     if (heldKeys.has("KeyD")) strafeMilli += 1000;
     if (heldKeys.has("KeyA")) strafeMilli -= 1000;
     if (forwardMilli !== 0 || strafeMilli !== 0) {
-      submit(opts.makeMove(world.tick, forwardMilli, strafeMilli));
+      submit(opts.makeMove(world.tick + 1, forwardMilli, strafeMilli));
     }
 
     // interact{} — proposed by the click seam, consumed here so it rides
@@ -255,7 +267,7 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     if (clickRequested) {
       clickRequested = false;
       if (pendingClickTarget !== undefined) {
-        submit(opts.makeInteract(world.tick, pendingClickTarget));
+        submit(opts.makeInteract(world.tick + 1, pendingClickTarget));
       }
       pendingClickTarget = undefined;
     }

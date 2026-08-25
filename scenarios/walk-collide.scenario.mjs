@@ -1,13 +1,13 @@
 // Phase H0 exit criterion 2 ("walk-collide", docs/PHASE-H0.md). Runs the
 // exact same compiled module the browser hotel app uses (apps/hotel/src/
-// game.ts -> apps/hotel/dist-game/game.js via `npm run build:game -w
+// game.ts -> apps/hotel/dist-game/sim/game.js via `npm run build:game -w
 // @claude-engine/hotel`), headless, proving collision/sliding logic is
 // agent-verifiable without a browser.
 //
 // Coordinates below were derived, not guessed: a throwaway node script (run
 // from the scratchpad dir, outside this repo) first imported the built
 // packages/interiors dist and printed generateGroundFloor("hotel-h0-walk-1")
-// for this scenario's seed, then imported apps/hotel/dist-game/game.js and
+// for this scenario's seed, then imported apps/hotel/dist-game/sim/game.js and
 // simulated candidate command sequences against a real Sim, printing
 // position/cell/solid-flag every tick until the ram/slide/walk segments
 // below produced the intended behaviour. Key derived facts for seed
@@ -37,7 +37,7 @@
 //     through all 5 doors of a 100-seed sweep, and
 //     scenarios/fps-look-interact.scenario.mjs exercises one crossing
 //     end-to-end through the sim via a real interact command.
-import { setup, cellAt, cellOfMm, CELL, PLAYER_ENTITY, faceCommand, moveCommand } from "../apps/hotel/dist-game/game.js";
+import { setup, cellAt, cellOfMm, CELL, PLAYER_ENTITY, faceCommand, moveCommand } from "../apps/hotel/dist-game/sim/game.js";
 import { generateGroundFloor } from "../packages/interiors/dist/index.js";
 
 const commands = [
@@ -60,7 +60,7 @@ const grid = generateGroundFloor("hotel-h0-walk-1").grid;
 
 // Recorded by the extra setup's per-tick system below; read by assertions
 // after the run. This is scenario-local instrumentation (never part of
-// apps/hotel/src/game.ts), so it may hold plain per-tick history the sim
+// apps/hotel/src/sim/game.ts), so it may hold plain per-tick history the sim
 // itself must not.
 const tickPositions = [];
 

@@ -15,7 +15,7 @@ import {
   type Pos,
   type Yaw,
   type Door,
-} from "./game.js";
+} from "./sim/game.js";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
 if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");

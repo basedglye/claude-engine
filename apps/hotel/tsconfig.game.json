@@ -6,7 +6,7 @@
     "lib": ["ES2022"],
     "types": []
   },
-  "include": ["src/game.ts"],
+  "include": ["src/sim/game.ts"],
   "references": [
     { "path": "../../packages/core" },
     { "path": "../../packages/assets" },

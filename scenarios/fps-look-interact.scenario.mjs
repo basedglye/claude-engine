@@ -3,9 +3,32 @@
 // click input against the live @claude-engine/hotel browser app via the
 // harness's browser mode (packages/harness/src/browser.ts), then verifies
 // the captured command log replays headlessly to the same final state
-// (--verify-replay). `setup` is imported from apps/hotel/dist-game/game.js
+// (--verify-replay). `setup` is imported from apps/hotel/dist-game/sim/game.js
 // -- the exact compiled module the browser bundles (docs/PHASE-H0.md, "The
 // synthetic-input contract").
+//
+// --- Determinism fix (phase-H0 review item 1, BLOCKING) -------------------
+// The original version of this scenario scheduled every input step on
+// wall-clock atMs offsets, including the KeyW hold (downMs:400, upMs:850).
+// Real scheduling jitter (page.waitForTimeout, event-loop scheduling, CI
+// machine speed) meant that window landed on 8 OR 9 sim ticks depending on
+// timing, but the corrective look below was derived for the 9-tick rest
+// position only -- on an 8-tick run the reticle ends up off the door panel
+// and the click's raycast resolves nothing (reviewer repro: 1 of 6 runs,
+// zero interact commands captured). Per docs/PHASE-H0.md risk 4's own
+// stated mitigation ("if flake persists, gate the click step on world.tick
+// instead of wall clock"), every input step below now uses the harness's
+// tick-gated InputStep form (packages/harness/src/browser.ts) instead of
+// atMs: each step waits for window.__WORLDFORGE__.world.tick to reach a
+// declared tick (the same pollUntilTick polling the harness already uses
+// for screenshot capture) before firing. The KeyW hold itself is also
+// tick-gated (downAtTick/upAtTick) rather than wall-clock timed, which
+// removes the 8-vs-9-tick variance at its source instead of merely coping
+// with whichever count wall-clock scheduling happens to produce: the hold
+// now spans deterministically exactly ticks 1..9 on every run, on every
+// engine. Because that is exactly the N=9 rest position the corrective
+// look below was already derived for, the derived deltas themselves did
+// not need to change -- only how the hold is scheduled.
 //
 // --- Pointer-delta derivation (committed as literals, not guessed) --------
 // A throwaway node script (run from the scratchpad dir) imported
@@ -68,9 +91,11 @@
 //     commands) even though the player was well within the interactable's
 //     radiusMm=1500 the whole time -- proximity was never the problem,
 //     aim was. N=9 leaves comfortable margin on both sides of the span, so
-//     KeyW is held ~450ms (9 ticks at the sim's 20Hz) here: downMs=400,
-//     upMs=850.
-import { setup } from "../apps/hotel/dist-game/game.js";
+//     KeyW is held for exactly 9 sim ticks here, gated on tick number
+//     (downAtTick:0, upAtTick:9, not wall-clock) so the count is exact on
+//     every run rather than landing on 8 or 9 depending on scheduling --
+//     see "Determinism fix" above.
+import { setup } from "../apps/hotel/dist-game/sim/game.js";
 
 // NOTE on "player ended up through the doorway" (docs/PHASE-H0.md exit
 // criterion 1's optional extra assertion): deliberately NOT added.
@@ -111,12 +136,16 @@ export default {
   ],
   browser: {
     app: "@claude-engine/hotel",
+    // Tick-gated input (see "Determinism fix" above): each step waits for
+    // window.__WORLDFORGE__.world.tick to reach the declared tick, in this
+    // declaration order, instead of a wall-clock atMs offset. This makes
+    // the KeyW hold span exactly ticks 1..9 on every run.
     input: [
-      { pointer: "lock", atMs: 100 },
-      { pointer: "look", atMs: 300, dx: -75, dy: 0 }, // turn toward the lobby door (see derivation above)
-      { key: "KeyW", downMs: 400, upMs: 850 }, // ~9 ticks: stops inside the doorway's x-span, see derivation above
-      { pointer: "look", atMs: 1500, dx: 142, dy: 0 }, // corrective look, re-aims onto the door (derivation above)
-      { pointer: "click", atMs: 1800 },
+      { pointer: "lock", atTick: 0 },
+      { pointer: "look", atTick: 0, dx: -75, dy: 0 }, // turn toward the lobby door (see derivation above)
+      { key: "KeyW", downAtTick: 0, upAtTick: 9 }, // exactly 9 move ticks: stops inside the doorway's x-span
+      { pointer: "look", atTick: 9, dx: 142, dy: 0 }, // corrective look, re-aims onto the door (derivation above)
+      { pointer: "click", atTick: 9 },
     ],
     screenshotAtTicks: [5, 50],
     probes: [{ probe: "fps" }, { probe: "sim-tick-ms" }],

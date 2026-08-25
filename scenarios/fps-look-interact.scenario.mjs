@@ -31,12 +31,20 @@
 // not need to change -- only how the hold is scheduled.
 //
 // --- Pointer-delta derivation (committed as literals, not guessed) --------
-// A throwaway node script (run from the scratchpad dir) imported
-// packages/interiors/dist/index.js and packages/space/dist/index.js and
-// printed generateGroundFloor("hotel-h0-look-1")'s spawn and doors[0] (the
-// lobby's only door -- the lobby<->corridor doorway, roomA=1=lobby):
-//   spawn = { xMm: 5375, zMm: 1375, yawMdeg: 0 }
-//   door0 = { xMm: 5000, zMm: 2625, roomA: 1 (lobby), roomB: 2 (corridor) }
+// RE-DERIVED for Phase H1a (docs/PHASE-H1.md): the interiors generator now
+// adds a street strip north of the lobby (desk/queue/entrance-door), which
+// shifts every lobby/corridor coordinate south by a constant offset -- the
+// comment below previously cited the PRE-H1 numbers and had gone stale
+// even though (by luck: the shift is a pure Z-translation, so bearings and
+// the resulting look-deltas are unchanged) the scenario still passed. A
+// throwaway node script (apps/hotel, importing the built
+// @claude-engine/interiors + @claude-engine/space + the compiled
+// dist-game/sim/game.js) printed generateGroundFloor("hotel-h0-look-1")'s
+// CURRENT spawn and doors[0] (the lobby<->corridor doorway; still
+// doorIndex 0 -- door generation order is unchanged, the entrance door is
+// appended last -- roomA=1=lobby):
+//   spawn = { xMm: 5375, zMm: 2875, yawMdeg: 0 }
+//   door0 = { xMm: 5000, zMm: 4125, roomA: 1 (lobby), roomB: 2 (corridor) }
 //
 // createFpsController (packages/player-fps/src/index.ts) initializes its
 // free-look camYawMdeg to the sim's spawn yaw (0) on the first onTick, then
@@ -45,20 +53,27 @@
 // synthetic `pointer:"look"` steps both call (the synthetic-input contract).
 // At yaw 0 the sim's forward direction is +Z, and bearing is computed the
 // same way the sim's interactSystem computes it: atan2Mdeg(dx, dz) where
-// dx/dz are (target - player). So:
+// dx/dz are (target - player). So, with the RE-DERIVED (current) spawn/door0:
 //   bearing1 = atan2Mdeg(door0.xMm - spawn.xMm, door0.zMm - spawn.zMm)
 //            = atan2Mdeg(-375, 1250) = 343_400 mdeg
 //   signed delta from camYaw=0 (wrap to (-180_000,180_000]): -16_600 mdeg
 //   dx1Px = round(-16_600 / 220) = -75  (-> camYaw becomes 343_500 mdeg,
 //     100 mdeg of quantization error off the exact bearing -- comfortably
 //     inside the interactable's +/-30_000 mdeg arc half-width)
+// The street strip's addition shifted spawn and door0 by an IDENTICAL
+// (dx=0, dz=+1500) offset -- lobby geometry translated wholesale, not
+// reshaped -- so this bearing, and every delta derived from it below, come
+// out byte-identical to the pre-H1 numbers. That is a property of this
+// particular seed/generator change, not something to assume holds for a
+// future layout change; re-derive again if the generator moves the lobby
+// relative to itself (not just translates the whole floor).
 // The corrective look re-derives the bearing from the player's ACTUAL
 // resting position after the KeyW hold, not the straight spawn->door line
 // -- walking at a ~16.5deg angle for N=9 ticks against a still-closed door
 // (see the KeyW-duration derivation below) leaves the player short of and
-// off to the side of the door, at (4871, 2139) (found the same way as the
+// off to the side of the door, at (4871, 3639) (found the same way as the
 // duration below: replaying the real compiled setup()/moveCircle):
-//   bearing2 = atan2Mdeg(door0.xMm - 4871, door0.zMm - 2139)
+//   bearing2 = atan2Mdeg(door0.xMm - 4871, door0.zMm - 3639)
 //            = atan2Mdeg(129, 486) = 14_800 mdeg
 //   signed delta from camYaw=343_500 (after look1): +31_300 mdeg -- already
 //   OUTSIDE the interactable's +/-30_000 mdeg arc half-width, confirmed by
@@ -112,6 +127,14 @@ import { setup } from "../apps/hotel/dist-game/sim/game.js";
 // The two assertions below are what the exit criterion actually requires:
 // the door flipped in sim state, backed by a sim event.
 const SEED = "hotel-h0-look-1";
+// The click targets door0 -- doorIndex 0, the lobby<->corridor doorway
+// this whole file's derivation walks/aims the player toward. Pinning the
+// assertions to THIS doorIndex (rather than "some door") matters as of
+// H1a: the generator now creates six doors on this seed (H0 had one), so
+// "some entity's door component has open===true" is true at setup-adjacent
+// ticks for reasons that have nothing to do with the click under test --
+// exactly the vacuous-gate failure mode the H0 review round blocked on.
+const CLICKED_DOOR_INDEX = 0;
 
 export default {
   name: "fps-look-interact",
@@ -120,18 +143,23 @@ export default {
   setup,
   assertions: [
     {
-      description: "some entity's door component has open === true (the flip happened in sim state)",
+      description: `doorIndex ${CLICKED_DOOR_INDEX} (the lobby<->corridor door this scenario's click targets) has open === true -- the flip happened in sim state, on the SPECIFIC door under test`,
       check: (s) => {
         for (const e of s.entities()) {
           const door = s.getComponent(e, "door");
-          if (door && door.open === true) return true;
+          if (door && door.doorIndex === CLICKED_DOOR_INDEX) return door.open === true;
         }
-        return false;
+        return false; // the door entity itself must exist
       },
     },
     {
-      description: 'a "door" event with open: true was emitted (not just scenery)',
-      check: (s) => s.eventsSince(0).some((e) => e.type === "door" && e.payload && e.payload.open === true),
+      description: `a "door" event with { doorIndex: ${CLICKED_DOOR_INDEX}, open: true } was emitted (not just scenery, and not some OTHER door)`,
+      check: (s) =>
+        s
+          .eventsSince(0)
+          .some(
+            (e) => e.type === "door" && e.payload && e.payload.doorIndex === CLICKED_DOOR_INDEX && e.payload.open === true,
+          ),
     },
   ],
   browser: {

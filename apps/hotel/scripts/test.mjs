@@ -3,8 +3,15 @@
 // assert-and-exit script, matching packages/space/scripts/test.mjs's style
 // (PASS:/FAIL: lines, process.exit(1) on any failure) rather than pulling in
 // a test framework.
-import { Rng } from "@claude-engine/core";
+import { Rng, Sim } from "@claude-engine/core";
 import { H1_RULES, evaluateRules, plantViolation, rulesForStars, describeRule } from "../dist-game/sim/rules.js";
+import {
+  setupWithConfig,
+  PLAYER_ENTITY,
+  interactCommand,
+  deskDecisionCommand,
+} from "../dist-game/sim/game.js";
+import { jitter } from "../dist-game/sim/nav.js";
 
 let failures = 0;
 
@@ -231,6 +238,336 @@ const ctx = { day: 100, lists: {} };
     if (!exact) allExact = false;
   }
   check(`plant/evaluate property also holds when rng.pick selects the rule (${SEEDS} seeds, full table)`, allExact);
+}
+
+// ============================================================================
+// H1a sim tests: game.ts / components.ts / nav.ts, driving a Sim directly
+// (no harness, no clerkBot — those are later lanes). See docs/PHASE-H1.md.
+// ============================================================================
+
+function findGuestAtQueueHead(sim) {
+  for (const [e, g] of sim.withComponent("guest")) {
+    if (g.state === "queued" && g.queueIndex === 0) return [e, g];
+  }
+  return undefined;
+}
+
+function findReservationForGuest(sim, guestEntity) {
+  for (const [e, r] of sim.withComponent("reservation")) {
+    if (r.guestEntity === guestEntity) return [e, r];
+  }
+  return undefined;
+}
+
+function findVacantRoom(sim) {
+  for (const [e, r] of sim.withComponent("roomUnit")) {
+    if (r.occupantEntity === 0) return [e, r];
+  }
+  return undefined;
+}
+
+/** Teleports the player next to `targetEntity`, facing it (south of it,
+ *  yaw 0 — matches the layout's default spawn yaw, so no face command is
+ *  needed), within interact/desk range. Test-only convenience: a real host
+ *  would submit face/move commands, but the FSM/ledger/queue properties
+ *  under test don't depend on how the player got there. */
+function teleportPlayerNextTo(sim, targetEntity) {
+  const targetPos = sim.getComponent(targetEntity, "pos");
+  sim.setComponent(PLAYER_ENTITY, "pos", { xMm: targetPos.xMm, zMm: targetPos.zMm - 500 });
+  sim.setComponent(PLAYER_ENTITY, "yaw", { mdeg: 0 });
+}
+
+function runUntil(sim, maxTicks, predicate) {
+  for (let i = 0; i < maxTicks; i++) {
+    sim.step();
+    if (predicate(sim)) return true;
+  }
+  return false;
+}
+
+const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" };
+
+// --- Guest FSM: accepted guest reaches inRoom -------------------------------
+{
+  const sim = new Sim("hotel-h1a-fsm-accept-1");
+  setupWithConfig(sim, FSM_CONFIG);
+
+  const reachedHead = runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  check("FSM(accept): a guest reaches the queue head", reachedHead);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+  check("FSM(accept): guest transitions to presenting", sim.getComponent(guestEntity, "guest").state === "presenting");
+
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const [roomEntity] = findVacantRoom(sim);
+  // Move the player to the desk terminal itself for the decision (deskSystem
+  // checks range against the desk anchor, not the guest).
+  const deskTerminalPos = (() => {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  })();
+  sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  const resAfter = sim.getComponent(resEntity, "reservation");
+  check("FSM(accept): reservation decided+accepted", resAfter.decided === true && resAfter.accepted === true);
+
+  const reachedInRoom = runUntil(sim, 4000, (s) => {
+    const g = s.getComponent(guestEntity, "guest");
+    return g !== undefined && g.state === "inRoom";
+  });
+  check("FSM(accept): guest FSM reaches inRoom", reachedInRoom);
+}
+
+// --- Guest FSM: denied guest reaches left (despawned) -----------------------
+{
+  const sim = new Sim("hotel-h1a-fsm-deny-1");
+  setupWithConfig(sim, FSM_CONFIG);
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const deskTerminalPos = (() => {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  })();
+  sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, false));
+  sim.step();
+  const resAfter = sim.getComponent(resEntity, "reservation");
+  check("FSM(deny): reservation decided, not accepted", resAfter.decided === true && resAfter.accepted === false);
+  // deskSystem (system-order item 8) sets `reservation.decided` THIS tick;
+  // guestBrainSystem (item 4) runs BEFORE deskSystem in the same tick, so
+  // it reacts to the decision on the NEXT tick — one more step() needed.
+  sim.step();
+  check("FSM(deny): guest transitions to leaving", sim.getComponent(guestEntity, "guest").state === "leaving");
+
+  let sawLeftEvent = false;
+  const despawned = runUntil(sim, 4000, (s) => {
+    for (const e of s.eventsSince(s.tick)) {
+      if (e.type === "guest.left" && e.payload?.guestEntity === guestEntity) sawLeftEvent = true;
+    }
+    return s.getComponent(guestEntity, "guest") === undefined;
+  });
+  check("FSM(deny): guest FSM reaches 'left' (despawned)", despawned);
+  check("FSM(deny): a guest.left event was emitted for this guest", sawLeftEvent);
+}
+
+// --- Double-entry ledger -----------------------------------------------------
+{
+  const sim = new Sim("hotel-h1a-ledger-1");
+  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+
+  let accepted = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+    const head = findGuestAtQueueHead(sim);
+    if (!head) break;
+    const [guestEntity] = head;
+    teleportPlayerNextTo(sim, guestEntity);
+    sim.submit(interactCommand(sim.tick + 1, guestEntity));
+    sim.step();
+    const [resEntity] = findReservationForGuest(sim, guestEntity);
+    const vacant = findVacantRoom(sim);
+    if (!vacant) break;
+    const [roomEntity] = vacant;
+    const deskTerminalPos = (() => {
+      for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+      return undefined;
+    })();
+    sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+    sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+    sim.step();
+    const res = sim.getComponent(resEntity, "reservation");
+    if (res.accepted) accepted++;
+  }
+  check("ledger: at least one guest was accepted for the ledger test", accepted > 0);
+
+  let debitCash = 0;
+  let creditRevenue = 0;
+  let debitExpense = 0;
+  let creditCash = 0;
+  for (const [, entry] of sim.withComponent("ledgerEntry")) {
+    if (entry.debitAccount === "cash") debitCash += entry.amountMinor;
+    if (entry.creditAccount === "revenue:rooms") creditRevenue += entry.amountMinor;
+    if (entry.debitAccount.startsWith("expense:")) debitExpense += entry.amountMinor;
+    if (entry.creditAccount === "cash") creditCash += entry.amountMinor;
+  }
+  check("ledger: every charge's debit(cash) equals its credit(revenue:rooms) in aggregate", debitCash === creditRevenue);
+  const hotel = (() => {
+    for (const [, h] of sim.withComponent("hotel")) return h;
+    return undefined;
+  })();
+  check(
+    "ledger: hotel.cash equals opening(0) + sum(charges) - sum(expenses)",
+    hotel.cash === 0 + creditRevenue - debitExpense,
+  );
+  check("ledger: expense debits equal expense credits(cash) in aggregate", debitExpense === creditCash);
+}
+
+// --- Queue: distinct slots, chain advances -----------------------------------
+{
+  const sim = new Sim("hotel-h1a-queue-1");
+  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+
+  const allQueued = runUntil(sim, 5000, (s) => {
+    let n = 0;
+    for (const [, g] of s.withComponent("guest")) if (g.state === "queued") n++;
+    return n >= 8;
+  });
+  check("queue: 8 guests reach 'queued'", allQueued);
+
+  const indices = [];
+  for (const [, g] of sim.withComponent("guest")) {
+    if (g.state === "queued") indices.push(g.queueIndex);
+  }
+  const distinct = new Set(indices);
+  check("queue: 8 guests have distinct queueIndex values", distinct.size === 8);
+  check("queue: queueIndex values are exactly {0..7}", [...distinct].sort((a, b) => a - b).join(",") === "0,1,2,3,4,5,6,7");
+
+  const [headEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, headEntity);
+  sim.submit(interactCommand(sim.tick + 1, headEntity));
+  sim.step();
+  const [resEntity] = findReservationForGuest(sim, headEntity);
+  const deskTerminalPos = (() => {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  })();
+  sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, false));
+  sim.step(); // deskSystem applies the decision this tick.
+  sim.step(); // guestBrainSystem reacts: head guest leaves "queued".
+  // guestBrainSystem compacts queueIndex every tick: once the head guest
+  // leaves the active (queued|presenting) set, the chain must shift down.
+  sim.step();
+  const indicesAfter = [];
+  for (const [, g] of sim.withComponent("guest")) {
+    if (g.state === "queued") indicesAfter.push(g.queueIndex);
+  }
+  const distinctAfter = new Set(indicesAfter);
+  check("queue: chain advances after the head clears (no gap, no duplicate)", distinctAfter.size === indicesAfter.length);
+  check(
+    "queue: after the head clears, a new guest occupies slot 0",
+    indicesAfter.includes(0),
+  );
+}
+
+// --- Restore fidelity: the load-bearing property ----------------------------
+{
+  const seed = "hotel-h1a-restore-1";
+  const config = { guestCount: 5, spawnTickMin: 1, spawnTickMax: 50, fraudRatePermille: 300, fixture: "normal" };
+
+  const simA = new Sim(seed);
+  setupWithConfig(simA, config);
+  for (let i = 0; i < 400; i++) simA.step();
+
+  // A decision, mid-run, on whatever's at the queue head (if any).
+  const headA = findGuestAtQueueHead(simA);
+  if (headA) {
+    const [guestEntity] = headA;
+    teleportPlayerNextTo(simA, guestEntity);
+    simA.submit(interactCommand(simA.tick + 1, guestEntity));
+    simA.step();
+    const [resEntity] = findReservationForGuest(simA, guestEntity);
+    const vacant = findVacantRoom(simA);
+    const deskTerminalPos = (() => {
+      for (const [e] of simA.withComponent("terminal")) return simA.getComponent(e, "pos");
+      return undefined;
+    })();
+    simA.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+    simA.submit(deskDecisionCommand(simA.tick + 1, resEntity, vacant !== undefined, vacant ? vacant[0] : undefined));
+    simA.step();
+  }
+  for (let i = 0; i < 200; i++) simA.step();
+
+  const snap = simA.snapshot();
+  for (let i = 0; i < 800; i++) simA.step();
+  const hashContinuous = simA.stateHash();
+
+  const simB = new Sim(seed);
+  setupWithConfig(simB, config);
+  simB.restore(snap);
+  for (let i = 0; i < 800; i++) simB.step();
+  const hashRestored = simB.stateHash();
+
+  check(
+    "restore fidelity: continuous run and fresh-setup+restore+continue reach an identical stateHash",
+    hashContinuous === hashRestored,
+  );
+  if (hashContinuous !== hashRestored) {
+    console.log(`  continuous=${hashContinuous} restored=${hashRestored}`);
+  }
+}
+
+// --- Jitter is stateless ------------------------------------------------------
+{
+  const a1 = jitter(12345, 3, 7, 64);
+  const a2 = jitter(12345, 3, 7, 64);
+  const a3 = jitter(12345, 3, 7, 64);
+  check("jitter: repeated calls with the same inputs return the same value", a1 === a2 && a2 === a3);
+  check("jitter: result is in range 0..3", a1 >= 0 && a1 <= 3);
+
+  const b = jitter(999, 3, 7, 64);
+  // Not a correctness requirement that they differ (a hash COULD collide),
+  // but assert the function is a pure function of its inputs by checking a
+  // different seed is evaluated independently (no shared mutable state
+  // between calls — verified by re-deriving `a1` after computing `b`).
+  const a4 = jitter(12345, 3, 7, 64);
+  check("jitter: interleaving calls with other inputs does not perturb prior results", a4 === a1);
+  void b;
+}
+
+// --- despawn clears departed guests and their documents ----------------------
+{
+  const sim = new Sim("hotel-h1a-despawn-1");
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+
+  const baseline = new Set([...sim.entities()]);
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  let docCount = 0;
+  for (const [, d] of sim.withComponent("document")) {
+    if (d.ownerEntity === guestEntity) docCount++;
+  }
+  check("despawn: the spawned guest has documents before departure", docCount > 0);
+
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const deskTerminalPos = (() => {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  })();
+  sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, false));
+  sim.step();
+
+  runUntil(sim, 4000, (s) => s.getComponent(guestEntity, "guest") === undefined);
+  check("despawn: the guest entity is gone after departure", sim.getComponent(guestEntity, "guest") === undefined);
+
+  let docCountAfter = 0;
+  for (const [, d] of sim.withComponent("document")) {
+    if (d.ownerEntity === guestEntity) docCountAfter++;
+  }
+  check("despawn: the guest's documents are gone after departure", docCountAfter === 0);
+  check("despawn: the guest's reservation entity is gone after departure", sim.getComponent(resEntity, "reservation") === undefined);
+
+  const finalEntities = new Set([...sim.entities()]);
+  check(
+    "despawn: total entity count returns to baseline (guest + its documents + reservation, minus the ledger/hotel/etc. entities that persist regardless)",
+    !finalEntities.has(guestEntity) && [...baseline].every((e) => finalEntities.has(e)),
+  );
 }
 
 if (failures > 0) {

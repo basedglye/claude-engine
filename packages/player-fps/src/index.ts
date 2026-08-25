@@ -310,6 +310,26 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
       submit(opts.makeFace(world.tick + 1, camYawMdeg));
     }
 
+    // screen.click{px,py} — resolved uv->pixel, queued by applyScreenClick,
+    // submitted here so it rides the same per-tick cadence as face/move/
+    // interact below rather than firing mid-tick. Deliberately handled
+    // BEFORE the `!locked` gate below: focusing a screen is precisely what
+    // exits pointer lock (see docs/PHASE-H1.md "The screen contract" —
+    // "pointer exits lock but stays captured"), so gating screen clicks on
+    // `locked` the same way WASD movement is gated made every screen click
+    // a silent no-op the instant a screen was actually focused (caught by
+    // the H1b review's synthetic-vs-real seam check: a synthetic
+    // `screenClick` produced zero commands even though `uvToPixel`
+    // resolved a valid pixel).
+    if (screenClickRequested) {
+      screenClickRequested = false;
+      const px = pendingScreenClickPx;
+      pendingScreenClickPx = undefined;
+      if (px && opts.screen) {
+        submit(opts.screen.makeScreenClick(world.tick + 1, px.px, px.py));
+      }
+    }
+
     // move{} — held WASD relative to the current SIM yaw; sim does the trig.
     // Gated on pointer lock: without lock there is no live look/movement
     // session, so held keys (e.g. stale from before a lock loss) submit
@@ -327,24 +347,14 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
 
     // interact{} — proposed by the click seam, consumed here so it rides
     // the same per-tick cadence as everything else the sim revalidates.
+    // Stays gated on `locked` (unlike screenClick above): a world-click
+    // interact only ever happens during a normal locked FPS session.
     if (clickRequested) {
       clickRequested = false;
       if (pendingClickTarget !== undefined) {
         submit(opts.makeInteract(world.tick + 1, pendingClickTarget));
       }
       pendingClickTarget = undefined;
-    }
-
-    // screen.click{px,py} — resolved uv->pixel, queued by applyScreenClick,
-    // submitted here so it rides the same per-tick cadence as face/move/
-    // interact above rather than firing mid-tick.
-    if (screenClickRequested) {
-      screenClickRequested = false;
-      const px = pendingScreenClickPx;
-      pendingScreenClickPx = undefined;
-      if (px && opts.screen) {
-        submit(opts.screen.makeScreenClick(world.tick + 1, px.px, px.py));
-      }
     }
   }
 

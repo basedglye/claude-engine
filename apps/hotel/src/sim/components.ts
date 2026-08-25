@@ -11,6 +11,7 @@
  * `exactOptionalPropertyTypes` friction, and no ambiguity between "not yet
  * computed" and "computed as absent").
  */
+import type { ShellState } from "@claude-engine/surface-ui";
 
 // -- H0 (unchanged) ----------------------------------------------------
 
@@ -115,11 +116,14 @@ export interface Terminal {
   focusedBy: string;
 }
 
-/** H1a stub: screenSystem/reduce land in H1b. The component exists now
- *  (on the terminal entity) so H1b's addition is purely additive to state
- *  that already round-trips through snapshot/restore. */
+/** The terminal's diegetic-shell state (H1b): the shell's `ShellState` is
+ *  JSON-plain (`{ openAppId, appStates }`, surface-ui/shell.ts) so it lives
+ *  verbatim here and is hashed like any other component. `paintSeq` is a
+ *  counter bumped by `screenSystem` on state-reference change — never a
+ *  content hash (hashing paint output would smuggle presentation into
+ *  `stateHash`, docs/PHASE-H1.md determinism rules). */
 export interface ScreenApp {
-  state: Record<string, never>;
+  state: ShellState;
   paintSeq: number;
 }
 

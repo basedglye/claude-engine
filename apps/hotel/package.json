@@ -18,6 +18,7 @@
     "@claude-engine/player-fps": "*",
     "@claude-engine/renderer-three": "*",
     "@claude-engine/space": "*",
+    "@claude-engine/surface-ui": "*",
     "three": "^0.169.0"
   },
   "devDependencies": {

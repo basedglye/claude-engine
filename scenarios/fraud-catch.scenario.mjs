@@ -57,7 +57,6 @@ export const CONFIG = {
   ...DEFAULTS,
   guestCount: GUEST_COUNT,
   spawnTickMin: 100,
-  spawnTickMax: 900,
   fraudRatePermille: 500,
   fixture: "normal",
 };

@@ -4,7 +4,11 @@
 // (PASS:/FAIL: lines, process.exit(1) on any failure) rather than pulling in
 // a test framework.
 import { Rng, Sim } from "@claude-engine/core";
+import { findOverflowingNodes } from "@claude-engine/surface-ui";
 import { H1_RULES, evaluateRules, plantViolation, rulesForStars, describeRule } from "../dist-game/sim/rules.js";
+import { ARCHETYPES } from "../dist-game/sim/guests.js";
+import { reservaApp } from "../dist-game/sim/reserva-app.js";
+import { auditApp } from "../dist-game/sim/audit-app.js";
 import {
   setupWithConfig,
   PLAYER_ENTITY,
@@ -567,6 +571,92 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
   check(
     "despawn: total entity count returns to baseline (guest + its documents + reservation, minus the ledger/hotel/etc. entities that persist regardless)",
     !finalEntities.has(guestEntity) && [...baseline].every((e) => finalEntities.has(e)),
+  );
+}
+
+// --- Screen overflow gate (surface-ui's findOverflowingNodes) ------------
+//
+// H1b review round 3: a clipped guest name and a crowded, dropped-looking
+// PROCEDURES wrap got past eyeballing a screenshot -- the front-desk loop
+// is entirely "the player reads a field and compares it by eye" (rules.ts's
+// header), so a field the surface cannot display is a fraud the player
+// cannot catch. This block is the mechanical gate: it builds RESERVA's and
+// AUDIT's worst-case `ScreenWorldView.data` from the ACTUAL generator/rule
+// data (never a hand-picked string) and asserts `findOverflowingNodes`
+// returns zero violations against that worst case, then proves the checker
+// is not a no-op by widening a string past the surface and asserting it
+// DOES flag it.
+{
+  const allNames = ARCHETYPES.flatMap((a) => a.names);
+  const longestName = allNames.reduce((a, b) => (b.length > a.length ? b : a));
+  check("overflow-gate setup: longest guest name is non-trivial (>= 10 chars)", longestName.length >= 10);
+
+  // Widest star tier H1_RULES ships -- if a later phase appends a higher
+  // tier, this picks it up automatically rather than staying pinned at 1.
+  const maxStars = Math.max(...H1_RULES.map((r) => r.minStars));
+  const widestRules = rulesForStars(H1_RULES, maxStars);
+  check("overflow-gate setup: widest star tier includes every H1 rule", widestRules.length === H1_RULES.length);
+
+  // Reservation code / doc number are fixed-width by construction
+  // (makeResCode/makeDocNumber in guests.js always emit a 4-digit / 6-digit
+  // number), so their worst case is their format's max width, not a
+  // hand-picked example.
+  const worstResCode = "RC-9999";
+  const worstDocNumber = "X999999";
+  const worstExpiresDay = "99999";
+
+  // The generator ships exactly 4 bedrooms per floor (layout.ts's
+  // ROOM_1..ROOM_4), tiers 1-2 -- a full vacant-room list is all 4 at once.
+  const worstRooms = [
+    { roomEntity: 3, roomId: 3, tier: 1 },
+    { roomEntity: 4, roomId: 4, tier: 2 },
+    { roomEntity: 5, roomId: 5, tier: 1 },
+    { roomEntity: 6, roomId: 6, tier: 2 },
+  ];
+
+  function worstCaseView(guestName) {
+    return {
+      tick: 1,
+      data: {
+        queue: {
+          reservationEntity: 1,
+          guestEntity: 2,
+          docFields: {
+            id: { name: guestName, docNumber: worstDocNumber, expiresDay: worstExpiresDay },
+            resSlip: { guestName, resCode: worstResCode },
+          },
+          resFields: { guestName, resCode: worstResCode },
+        },
+        rooms: worstRooms,
+        ledger: { day: 99999, revenueMinor: 999999999, expenseMinor: 999999999, closingCashMinor: -999999999 },
+      },
+    };
+  }
+
+  const view = worstCaseView(longestName);
+  const reservaNodes = reservaApp.paintSpec(reservaApp.init(), view);
+  const reservaViolations = findOverflowingNodes(reservaNodes);
+  check(
+    `RESERVA: worst-case data (name=${JSON.stringify(longestName)}, all ${widestRules.length} rules, 4 vacant rooms) has zero surface overflows`,
+    reservaViolations.length === 0,
+  );
+  if (reservaViolations.length > 0) console.log(JSON.stringify(reservaViolations, null, 2));
+
+  const auditNodes = auditApp.paintSpec(auditApp.init(), view);
+  const auditViolations = findOverflowingNodes(auditNodes);
+  check("AUDIT: worst-case ledger figures have zero surface overflows", auditViolations.length === 0);
+  if (auditViolations.length > 0) console.log(JSON.stringify(auditViolations, null, 2));
+
+  // Negative control: the checker must actually be capable of catching an
+  // overflow, not just passing because it never fires. Widen the guest
+  // name well past anything the surface can hold and confirm it's flagged.
+  const absurdName = "X".repeat(200);
+  const absurdView = worstCaseView(absurdName);
+  const absurdNodes = reservaApp.paintSpec(reservaApp.init(), absurdView);
+  const absurdViolations = findOverflowingNodes(absurdNodes);
+  check(
+    "overflow gate is not a no-op: a 200-char guest name IS flagged as overflowing",
+    absurdViolations.length > 0,
   );
 }
 

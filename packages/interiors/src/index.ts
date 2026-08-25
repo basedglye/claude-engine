@@ -8,6 +8,8 @@ import { generateLayout, type DoorSpec } from "./layout.js";
 import { buildFloorMesh } from "./mesh-gen.js";
 
 export type { DoorSpec } from "./layout.js";
+export { DOOR_WIDTH_CELLS, DOOR_HEAD_HEIGHT_MM } from "./layout.js";
+export { WALL_HEIGHT_MM } from "./mesh-gen.js";
 export type { MeshDataWithColors } from "@claude-engine/assets";
 export { generateDoorMesh } from "./door-mesh.js";
 

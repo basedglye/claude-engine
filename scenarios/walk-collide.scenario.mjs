@@ -26,15 +26,17 @@
 //     lobby toward its east side; verified never to enter a SOLID cell for
 //     the whole 200-tick run, ending at { xMm: 10875, zMm: 2625 }, cell
 //     { cx: 43, cz: 10 } (not SOLID), 5099mm from the tick-1 position.
-//   - separately verified (and NOT used by this scenario -- reported in the
-//     phase implementation notes instead): with PLAYER_RADIUS_MM=300 and
-//     CELL_SIZE_MM=250, this seed's single-cell-wide doors (250mm cell,
-//     less than the player's 600mm diameter) are mathematically
-//     impassable via space.moveCircle even once door.open===true. This
-//     scenario therefore demonstrates wall-ram/slide/open-lobby travel
-//     rather than a literal doorway crossing; see the phase report for
-//     details (a packages/space + packages/interiors interaction issue,
-//     out of this scope's packages/** boundary, not patched here).
+//   - doors are now DOOR_WIDTH_CELLS=4 cells (1000mm) wide (packages/
+//     interiors/src/layout.ts), comfortable clearance for the player's
+//     600mm diameter -- the coordinates above were re-derived against the
+//     wider-door generator and are unchanged from the pre-fix values,
+//     because this seed's west lobby wall (the wall this scenario rams and
+//     slides along) sits outside the door span the fix touched. Actual
+//     doorway crossing is exercised separately: packages/interiors/scripts/
+//     test.mjs's "doorway traversal" check drives real space.moveCircle
+//     through all 5 doors of a 100-seed sweep, and
+//     scenarios/fps-look-interact.scenario.mjs exercises one crossing
+//     end-to-end through the sim via a real interact command.
 import { setup, cellAt, cellOfMm, CELL, PLAYER_ENTITY, faceCommand, moveCommand } from "../apps/hotel/dist-game/game.js";
 import { generateGroundFloor } from "../packages/interiors/dist/index.js";
 

@@ -124,12 +124,21 @@ export function setup(sim: Sim): void {
     });
   }
 
-  /** True iff some door entity's cell is (cx,cz) and it is currently open.
-   *  Scans `withComponent("door")` every call — never a closure Map keyed
-   *  by doorIndex/cell (determinism rule 5). */
+  /** True iff (cx,cz) is one of the cells spanned by some currently-open
+   *  door. Doorways are DOOR_WIDTH_CELLS (4) grid cells wide (packages/
+   *  interiors/src/layout.ts) — a single `door.cx`/`cz` names only the
+   *  span's anchor cell, so membership is checked against the matching
+   *  Portal's `cells` list. `floor.portals.portals[doorIndex]` is the same
+   *  portal `addDoor` pushed for that door (doorIndex === portalId by
+   *  construction), so this is closure data derivable byte-identically
+   *  from `sim.seed` alone (determinism rule 5) — it is NOT a map from
+   *  spawn-time state. Scans `withComponent("door")` every call, same as
+   *  before, never a closure Map keyed by cell. */
   function isOpenAt(s: Sim, cx: number, cz: number): boolean {
     for (const [, door] of s.withComponent<Door>("door")) {
-      if (door.cx === cx && door.cz === cz && door.open) return true;
+      if (!door.open) continue;
+      const portal = floor.portals.portals[door.doorIndex];
+      if (portal && portal.cells.some((c) => c.cx === cx && c.cz === cz)) return true;
     }
     return false;
   }

@@ -76,7 +76,6 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
   const interactables = new Map<EntityId, THREE.Object3D>();
   const objectToEntity = new Map<THREE.Object3D, EntityId>();
   let raycastCamera: THREE.Camera | undefined;
-  let raycastScene: THREE.Scene | undefined;
   const raycaster = new THREE.Raycaster();
 
   let pendingClickTarget: EntityId | undefined;
@@ -200,7 +199,7 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
   };
 
   function resolveTarget(): EntityId | undefined {
-    if (!raycastCamera || !raycastScene) return undefined;
+    if (!raycastCamera) return undefined;
     raycaster.setFromCamera(new THREE.Vector2(0, 0), raycastCamera);
     const objects = Array.from(interactables.values());
     const hits = raycaster.intersectObjects(objects, true);
@@ -264,7 +263,6 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
 
   function onFrame(camera: THREE.Camera, world: IWorld, alpha: number): void {
     raycastCamera = camera;
-    if (camera.parent instanceof THREE.Scene) raycastScene = camera.parent;
 
     ensureCamInitialized(world);
     const pose = opts.readPose(world);
@@ -303,7 +301,15 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     }
 
     camera.rotation.order = "YXZ";
-    camera.rotation.y = -yawRad;
+    // Sim forward at yaw 0 is +Z (moveSystem integrates dz = forward *
+    // cosMdeg(yaw)), while a THREE camera at rotation.y = 0 looks down -Z.
+    // A camera with rotation.y = r looks along (-sin r, -cos r), so matching
+    // a sim heading of (sin yaw, cos yaw) requires r = yaw + PI. Getting
+    // this wrong points the camera exactly opposite the way "forward" walks
+    // and the way interactSystem's bearing check faces, which reads as a
+    // black screen at yaw 0 and a reticle that drifts off targets as you
+    // turn.
+    camera.rotation.y = yawRad + Math.PI;
     camera.rotation.x = -pitchRad;
     camera.rotation.z = 0;
   }

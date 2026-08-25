@@ -8,13 +8,40 @@ import { Rng } from "@claude-engine/core";
 import { CELL, CELL_SIZE_MM, type NavGrid } from "@claude-engine/space";
 import type { Portal, PortalGraph } from "@claude-engine/space";
 
+/** A doorway spans this many 250mm cells along its wall (1000mm) — real
+ *  doorway width, and comfortable clearance for the 600mm-diameter player
+ *  collider (PLAYER_RADIUS_MM=300 in apps/hotel). A single 250mm cell is
+ *  narrower than the player, which made every doorway impassable
+ *  regardless of door.open — this constant is the fix. */
+export const DOOR_WIDTH_CELLS = 4;
+
+/** Door head height, in mm: the wall above this (up to WALL_HEIGHT_MM in
+ *  mesh-gen.ts) is a solid header over a DOOR cell, closing off what would
+ *  otherwise be a hole straight through the wall to the void above the door
+ *  leaf. ~2100mm matches a real interior door leaf height (also the
+ *  DOOR_HEIGHT_MM in door-mesh.ts, which sizes the leaf mesh itself). Grid
+ *  and collision are unaffected -- a DOOR cell stays walkable at floor
+ *  level regardless of this constant; this only changes header GEOMETRY. */
+export const DOOR_HEAD_HEIGHT_MM = 2100;
+
 export interface DoorSpec {
-  /** Stable per-layout door index (generation order). */
+  /** Stable per-layout door index (generation order). One doorway == one
+   *  DoorSpec, even though it spans DOOR_WIDTH_CELLS grid cells. */
   doorIndex: number;
+  /** Anchor DOOR cell (full-grid coords): the lowest-coordinate cell of the
+   *  span (lowest cx for a row-spanning doorway, lowest cz for a
+   *  column-spanning doorway). All DOOR_WIDTH_CELLS cells of the span carry
+   *  CELL.WALKABLE|CELL.DOOR and are listed in the matching Portal's
+   *  `cells` (portals.portals[doorIndex] by construction). */
   cx: number;
-  cz: number; // the DOOR cell (full-grid coords)
+  cz: number;
+  /** Center of the full span, in world mm — for mesh placement and the
+   *  `interactable` component. NOT the anchor cell's center. */
   xMm: number;
-  zMm: number; // center, for placing the mesh + interactable
+  zMm: number;
+  /** Cell span width, always DOOR_WIDTH_CELLS in H0 but carried explicitly
+   *  so consumers (mesh sizing) never hardcode it. */
+  widthCells: number;
   yawMdeg: number; // hinge orientation
   roomA: number;
   roomB: number;
@@ -40,11 +67,19 @@ function clampInt(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-/** Pick an interior point (avoiding the corners) in [start, endExclusive). */
-function pickInterior(start: number, endExclusive: number, rng: Rng): number {
+/** Pick the start of a `width`-cell span (avoiding the corners) inside
+ *  [start, endExclusive), i.e. the span [p, p+width) with at least a
+ *  1-cell margin on each side when the segment is long enough. Callers
+ *  (layout generation, Scope C) guarantee every wall segment a door is cut
+ *  into is at least width+2 cells long, so the margin branch below is a
+ *  defensive fallback, never the live path for DOOR_WIDTH_CELLS. */
+function pickSpanStart(start: number, endExclusive: number, width: number, rng: Rng): number {
   const lo = start + 1;
-  const hi = endExclusive - 2;
-  if (hi < lo) return Math.floor((start + endExclusive - 1) / 2);
+  const hi = endExclusive - 1 - width;
+  if (hi < lo) {
+    const p = Math.floor((start + endExclusive - width) / 2);
+    return clampInt(p, start, Math.max(start, endExclusive - width));
+  }
   return lo + rng.int(0, hi - lo);
 }
 
@@ -59,14 +94,21 @@ export function generateLayout(seed: string): Layout {
   const FW = 40 + layoutRng.int(0, 6); // 40..46
   const FH = 30 + layoutRng.int(0, 6); // 30..36
   const lobbyDepth = 9 + layoutRng.int(0, 3); // 9..12
-  const corridorW = 4 + layoutRng.int(0, 2); // 4..6
+  // Corridor width must leave room for a DOOR_WIDTH_CELLS-wide lobby<->
+  // corridor doorway plus a 1-cell margin on each side (pickSpanStart's
+  // fitting requirement): >= DOOR_WIDTH_CELLS + 2 = 6.
+  const corridorW = (DOOR_WIDTH_CELLS + 2) + layoutRng.int(0, 2); // 6..8
 
   const corridorTop = lobbyDepth + 1; // 1-cell gap row separates lobby/corridor
   const corridorX0 = Math.floor((FW - corridorW) / 2);
   const corridorX1 = corridorX0 + corridorW;
 
   const restH = FH - corridorTop; // corridor + flanking rooms depth
-  const minRoomDepth = 7;
+  // Each split room's depth must leave room for a DOOR_WIDTH_CELLS-wide
+  // corridor<->room doorway plus margin (same pickSpanStart requirement as
+  // the corridor width above), i.e. >= DOOR_WIDTH_CELLS + 2 = 6; the extra
+  // +1 here (7) keeps the pre-existing room-proportion feel unchanged.
+  const minRoomDepth = DOOR_WIDTH_CELLS + 3; // 7
   const midLeft = corridorTop + Math.floor(restH / 2) + layoutRng.int(-2, 2);
   const splitRowLeft = clampInt(
     midLeft,
@@ -115,46 +157,81 @@ export function generateLayout(seed: string): Layout {
   const portals: Portal[] = [];
   const roomTouches: number[][] = [[], [], [], [], [], [], []]; // index 0..6
 
-  function addDoor(lx: number, lz: number, roomA: number, roomB: number, yawMdeg: number): void {
-    const idx = gidx(lx, lz);
-    cells[idx] = CELL.WALKABLE | CELL.DOOR;
-    rooms[idx] = roomA;
-    const gx = lx + margin;
-    const gz = lz + margin;
+  /** Carve a DOOR_WIDTH_CELLS-wide doorway. `axis: "row"` spans local X at
+   *  fixed lz (lx is the span start); `axis: "col"` spans local Z at fixed
+   *  lx (lz is the span start). One DoorSpec (stable doorIndex) per
+   *  doorway; its Portal (portals[doorIndex] by construction) lists every
+   *  spanned cell. */
+  function addDoor(
+    axis: "row" | "col",
+    lx: number,
+    lz: number,
+    roomA: number,
+    roomB: number,
+    yawMdeg: number
+  ): void {
+    const cellsLocal: { lx: number; lz: number }[] = [];
+    for (let i = 0; i < DOOR_WIDTH_CELLS; i++) {
+      cellsLocal.push(axis === "row" ? { lx: lx + i, lz } : { lx, lz: lz + i });
+    }
+    const cellsGlobal = cellsLocal.map(({ lx: clx, lz: clz }) => ({ cx: clx + margin, cz: clz + margin }));
+    for (const { cx, cz } of cellsGlobal) {
+      const idx = cx + cz * width;
+      cells[idx] = CELL.WALKABLE | CELL.DOOR;
+      rooms[idx] = roomA;
+    }
+    const anchor = cellsGlobal[0]!;
+    const last = cellsGlobal[cellsGlobal.length - 1]!;
     const doorIndex = doors.length;
-    const xMm = gx * CELL_SIZE_MM + CELL_SIZE_MM / 2;
-    const zMm = gz * CELL_SIZE_MM + CELL_SIZE_MM / 2;
-    doors.push({ doorIndex, cx: gx, cz: gz, xMm, zMm, yawMdeg, roomA, roomB });
+    // Center of the full span, in world mm (midpoint between the anchor
+    // cell's min corner and the last cell's max corner).
+    const anchorMinX = anchor.cx * CELL_SIZE_MM;
+    const anchorMinZ = anchor.cz * CELL_SIZE_MM;
+    const lastMaxX = (last.cx + 1) * CELL_SIZE_MM;
+    const lastMaxZ = (last.cz + 1) * CELL_SIZE_MM;
+    const xMm = Math.floor((anchorMinX + lastMaxX) / 2);
+    const zMm = Math.floor((anchorMinZ + lastMaxZ) / 2);
+    doors.push({
+      doorIndex,
+      cx: anchor.cx,
+      cz: anchor.cz,
+      xMm,
+      zMm,
+      widthCells: DOOR_WIDTH_CELLS,
+      yawMdeg,
+      roomA,
+      roomB,
+    });
     const portalId = portals.length;
-    portals.push({ id: portalId, roomA, roomB, cells: [{ cx: gx, cz: gz }] });
+    portals.push({ id: portalId, roomA, roomB, cells: cellsGlobal });
     roomTouches[roomA]!.push(portalId);
     roomTouches[roomB]!.push(portalId);
   }
 
   // Lobby <-> corridor door: on the gap row (lobbyDepth), within corridor span.
   {
-    const lx = pickInterior(corridorX0, corridorX1, doorRng.fork("door-lobby-x"));
-    addDoor(lx, lobbyDepth, ROOM_LOBBY, ROOM_CORRIDOR, 0);
+    const lx = pickSpanStart(corridorX0, corridorX1, DOOR_WIDTH_CELLS, doorRng.fork("door-lobby-x"));
+    addDoor("row", lx, lobbyDepth, ROOM_LOBBY, ROOM_CORRIDOR, 0);
   }
   // Corridor <-> room1 (left-top): on the gap column corridorX0-1.
   {
-    const lz = pickInterior(corridorTop, splitRowLeft - 1, doorRng.fork("door-r1-z"));
-    addDoor(corridorX0 - 1, lz, ROOM_CORRIDOR, ROOM_1, 90_000);
+    const lz = pickSpanStart(corridorTop, splitRowLeft - 1, DOOR_WIDTH_CELLS, doorRng.fork("door-r1-z"));
+    addDoor("col", corridorX0 - 1, lz, ROOM_CORRIDOR, ROOM_1, 90_000);
   }
   // Corridor <-> room2 (left-bottom).
   {
-    const lz = pickInterior(splitRowLeft, FH, doorRng.fork("door-r2-z"));
-    addDoor(corridorX0 - 1, lz, ROOM_CORRIDOR, ROOM_2, 90_000);
+    const lz = pickSpanStart(splitRowLeft, FH, DOOR_WIDTH_CELLS, doorRng.fork("door-r2-z"));
+    addDoor("col", corridorX0 - 1, lz, ROOM_CORRIDOR, ROOM_2, 90_000);
   }
   // Corridor <-> room3 (right-top): on the gap column corridorX1.
   {
-    const lz = pickInterior(corridorTop, splitRowRight - 1, doorRng.fork("door-r3-z"));
-    addDoor(corridorX1, lz, ROOM_CORRIDOR, ROOM_3, 90_000);
+    const lz = pickSpanStart(corridorTop, splitRowRight - 1, DOOR_WIDTH_CELLS, doorRng.fork("door-r3-z"));
+    addDoor("col", corridorX1, lz, ROOM_CORRIDOR, ROOM_3, 90_000);
   }
   // Corridor <-> room4 (right-bottom).
   {
-    const lz = pickInterior(splitRowRight, FH, doorRng.fork("door-r4-z"));
-    addDoor(corridorX1, lz, ROOM_CORRIDOR, ROOM_4, 90_000);
+    const lz = pickSpanStart(splitRowRight, FH, DOOR_WIDTH_CELLS, doorRng.fork("door-r4-z"));
+    addDoor("col", corridorX1, lz, ROOM_CORRIDOR, ROOM_4, 90_000);
   }
 
   const graph: PortalGraph = {

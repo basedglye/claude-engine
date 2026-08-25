@@ -28,7 +28,15 @@ import { resolve, isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Sim, RestoreError } from "@claude-engine/core";
 import type { Scenario, Verdict } from "./index.js";
-import { runScenario, verifyReplay, replayVerdict, replayVerdictFromCheckpoint, CheckpointError } from "./index.js";
+import {
+  runScenario,
+  verifyReplay,
+  replayVerdict,
+  replayVerdictFromCheckpoint,
+  replayToSim,
+  evaluateAssertions,
+  CheckpointError,
+} from "./index.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 // dist/cli.js -> packages/harness/dist -> packages/harness -> packages -> repo root
@@ -252,12 +260,29 @@ async function runBrowserMode(
   scenario.setup(sim);
   const setupStateHash = sim.stateHash();
 
+  // Browser mode captures a command log but never runs the sim itself, so
+  // scenario.assertions (which check final sim state / events) can only be
+  // evaluated against a headlessly-replayed sim built from that log — the
+  // same mechanism --verify-replay already uses for its hash check. This
+  // replay happens whenever the scenario declares assertions, independent
+  // of whether --verify-replay was also passed: an assertion result must
+  // never be silently reported as `[]`, and gating it behind an opt-in flag
+  // would let a plain `--browser` run pass vacuously exactly like the bug
+  // this fixes. (A scenario with an empty `assertions: []` array, e.g.
+  // demo-visual, is unaffected — replaySim below is skipped and the verdict
+  // keeps an honest empty array, not a "not evaluated" one either way.)
+  const assertionResults =
+    scenario.assertions.length > 0
+      ? evaluateAssertions(scenario, replayToSim(scenario, result.commands, result.browser.finalTick))
+      : [];
+  const assertionsPassed = assertionResults.every((r) => r.passed);
+
   const verdict: Verdict = {
     scenario: scenario.name,
     seed: scenario.seed,
     ticks: result.browser.finalTick,
-    passed: result.passed,
-    assertions: [],
+    passed: result.passed && assertionsPassed,
+    assertions: assertionResults,
     finalStateHash: result.browser.finalStateHash,
     eventCount: result.eventCount,
     entityCount: result.entityCount,

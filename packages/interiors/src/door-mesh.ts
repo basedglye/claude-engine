@@ -24,7 +24,7 @@ function rotateToWorldM(lx: number, lz: number, yawMdeg: number, cxMm: number, c
 /** Door mesh for one door: a thin box panel spanning the doorway width,
  *  DOOR_HEIGHT_MM tall, centered on the door cell and oriented by yawMdeg. */
 export function generateDoorMesh(spec: DoorSpec): MeshDataWithColors {
-  const halfW = CELL_SIZE_MM / 2;
+  const halfW = (spec.widthCells * CELL_SIZE_MM) / 2;
   const halfT = DOOR_THICKNESS_MM / 2;
   const h = DOOR_HEIGHT_MM;
 

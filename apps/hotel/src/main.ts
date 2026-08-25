@@ -20,7 +20,16 @@ import {
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
 if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
 
-const sim = new Sim("hotel-h0-1", { eventRetentionTicks: 600 });
+// Seed must match scenarios/fps-look-interact.scenario.mjs's declared seed
+// (docs/PHASE-H0.md exit criterion 1: "seed hotel-h0-look-1"). A browser
+// scenario's --verify-replay reconstructs a fresh `Sim` from the scenario's
+// `seed` field (packages/harness/src/index.ts's `verifyReplay`), and
+// GroundFloor geometry/spawn/doors are a pure function of the seed
+// (determinism rule 5) -- if this literal ever drifts from the live app's
+// seed, headless replay diverges from the browser session on the very
+// first tick (different spawn point, different door layout), independent
+// of any command-log or trig determinism issue.
+const sim = new Sim("hotel-h0-look-1", { eventRetentionTicks: 600 });
 setup(sim);
 
 // Re-derive the same pure GroundFloor from the seed for meshes. Deliberately
@@ -76,12 +85,13 @@ function tickSim(): void {
 const doorGroups = new Map<EntityId, THREE.Group>();
 const DOOR_SWING_OPEN_RAD = Math.PI / 2;
 
+
 const host = createThreeHost(sim, {
   canvas,
   stepSim: tickSim,
   submit: (command) => hook.submit(command),
   pointerHandlers: controller.pointerHandlers,
-  onFrame: (camera, world, alpha) => controller.onFrame(camera, world, alpha),
+  onFrame: controller.onFrame,
   syncScene(ctx: SceneContext, world: IWorld) {
     ctx.scenery("floor-mesh", () => {
       const geometry = toBufferGeometry(floor.mesh);

@@ -14,7 +14,13 @@ design bible and technical architecture these phases build against.
 straight Sonnet execution. Every phase ends in something walkable in a
 browser and gated by harness verdicts.
 
-## Phase 0 — "Walk the Lobby" (~3–5 days) [F]
+## Phase 0 — "Walk the Lobby" (~3–5 days) [F] — **DONE** (merged 2026-08-25)
+
+Spec: [PHASE-H0.md](PHASE-H0.md). Review: [reviews/phase-H0.md](reviews/phase-H0.md) — PASS at round 3.
+Shipped `@claude-engine/space`, `@claude-engine/interiors`, `@claude-engine/player-fps`, and `apps/hotel`.
+Gates live: `walk-collide --verify-replay`, and `fps-look-interact --browser --verify-replay` on Chromium
+and Firefox. Carry the review's consolidated deferral list into the H1 spec.
+
 
 Scaffold `apps/hotel`; create `space` (incl. `sim-math` fixed-point trig)
 and `player-fps`; minimal `interiors` (one BSP floor — lobby + corridor + 4

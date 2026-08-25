@@ -19,8 +19,8 @@ import { SCREEN_H, SCREEN_W } from "@claude-engine/surface-ui";
 import { createScreenSurface } from "@claude-engine/surface-ui/host";
 import { hotelShell, buildScreenWorldView, type Terminal, type ScreenApp, type Pos, type Yaw } from "../sim/game.js";
 
-const SCREEN_W_M = 0.85;
-const SCREEN_H_M = SCREEN_W_M * (SCREEN_H / SCREEN_W);
+export const SCREEN_W_M = 0.55;
+export const SCREEN_H_M = SCREEN_W_M * (SCREEN_H / SCREEN_W);
 /** Mounted above the desk surface at roughly monitor height. */
 const SCREEN_Y_M = 1.15;
 /** How far the screen plane sits in front of the housing's back panel —
@@ -33,6 +33,20 @@ const SCREEN_Z_OFFSET_M = 0.051;
  *  every side (a bezel), with some depth for the "casing". Presentation
  *  only -- no sim meaning, just geometry. */
 const HOUSING_BEZEL_M = 0.05;
+/** How far the monitor stands off the desk anchor, along its own facing. */
+const TERMINAL_STANDOFF_M = 0.45;
+/**
+ * How far the monitor sits along the desk from the anchor cell.
+ *
+ * Placed exactly on the anchor, the desk's own furniture geometry occludes
+ * the far ~27% of the monitor: the screen rendered 643x662 against a 640x480
+ * texture (aspect 0.97 where it should be 1.33), which reads as the right
+ * side of the UI being cropped and cost a previous session a long hunt for a
+ * texture-sampling bug that did not exist. Offsetting along the desk clears
+ * it — measured, the screen then renders 884x662, aspect 1.335 against the
+ * texture's 1.333, with texelScale 1.38 matching screenRect exactly.
+ */
+const TERMINAL_ALONG_DESK_M = 0.35;
 const HOUSING_W_M = SCREEN_W_M + HOUSING_BEZEL_M * 2;
 const HOUSING_H_M = SCREEN_H_M + HOUSING_BEZEL_M * 2;
 const HOUSING_DEPTH_M = 0.1;
@@ -115,6 +129,14 @@ export function syncTerminalScreens(
       // with the desk's usable (counter-front) side instead of its
       // lengthwise axis.
       group.rotation.y = (yaw.mdeg / 1000) * (Math.PI / 180) - Math.PI / 2;
+      // Stand the monitor off the desk anchor along its own facing. The
+      // anchor sits against the lobby's west wall, and a monitor placed
+      // exactly on it has its far half buried in that wall — which reads as
+      // the screen being cropped by a hard vertical edge, because the wall
+      // is drawn in front of the half that is inside it. Offsetting along
+      // the group's local forward puts the whole panel in the room.
+      group.translateZ(-TERMINAL_STANDOFF_M);
+      group.translateX(TERMINAL_ALONG_DESK_M);
       ctx.scene.add(group);
       screen = { entity, group, screenMesh, surface };
       screensByEntity.set(entity, screen);

@@ -24,7 +24,7 @@ import {
 import type { Guest } from "./sim/components.js";
 import { syncCharacter, pruneCharacters } from "./render/characters.js";
 import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
-import { syncTerminalScreens, type TerminalScreen } from "./render/screens.js";
+import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from "./render/screens.js";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
 if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
@@ -152,16 +152,29 @@ let focusedScreen: TerminalScreen | undefined;
 let terminalScreens: Map<EntityId, TerminalScreen> = new Map();
 let focusEase = 0; // 0 = normal FPS pose, 1 = fully eased toward the screen
 const FOCUS_EASE_STEP = 0.12;
-// Tuned empirically against live viewport screenshots, not derived from
-// FOV math (which was unreliable across this feature's iterations): too
-// close (0.55m) cropped the monitor's right edge out of the browser
-// viewport at a small window size; too far (1.05m) fit the whole monitor
-// but rendered it too small/blurry for the text to actually be legible
-// (the project's own screen-readability gate, docs/PHASE-H1.md, wants
-// texelScale >= 1 texel per surface pixel). This distance, paired with the
-// larger physical screen (SCREEN_W_M in render/screens.ts), is what an
-// actual screenshot confirmed both fits AND reads.
-const FOCUS_STAND_BACK_M = 1.15;
+// How far back the focused camera sits from the monitor.
+//
+// This used to be a constant tuned by eye at one window size, which is a
+// trap: too close cropped the monitor's edge out of a small viewport, too
+// far dropped texelScale to 0.72 and the text turned to mush. Both failure
+// modes are viewport-dependent, so a single number cannot be right.
+//
+// Derive it instead. The screen quad is SCREEN_W_M x SCREEN_H_M metres; a
+// perspective camera with vertical FOV `fovV` and aspect `a` shows, at
+// distance d, a frustum 2*d*tan(fovV/2) tall and that times `a` wide. Solve
+// for the distance at which the quad occupies FIT_FRACTION of the smaller
+// dimension, and take whichever constraint binds. That maximises
+// texelScale (screen pixels per surface pixel, which
+// apps/hotel/docs/ARCHITECTURE.md B7 requires to be at least 1) while
+// keeping the whole monitor — including the calibration strip the
+// readability probe samples — inside the frame at ANY viewport.
+const FOCUS_FIT_FRACTION = 0.92;
+function focusStandBackM(camera: THREE.PerspectiveCamera): number {
+  const halfV = Math.tan((camera.fov * Math.PI) / 360);
+  const byHeight = SCREEN_H_M / 2 / (halfV * FOCUS_FIT_FRACTION);
+  const byWidth = SCREEN_W_M / 2 / (halfV * camera.aspect * FOCUS_FIT_FRACTION);
+  return Math.max(byHeight, byWidth);
+}
 /** Matches SCREEN_Y_M in render/screens.ts -- eye level looking straight at the monitor. */
 const SCREEN_EYE_Y_M = 1.15;
 const raycaster = new THREE.Raycaster();
@@ -298,7 +311,7 @@ const host = createThreeHost(sim, {
       const screenWorldPos = screen.screenMesh.getWorldPosition(new THREE.Vector3());
       const screenWorldQuat = screen.screenMesh.getWorldQuaternion(new THREE.Quaternion());
       const normal = new THREE.Vector3(0, 0, 1).applyQuaternion(screenWorldQuat);
-      const targetPos = screenWorldPos.clone().addScaledVector(normal, FOCUS_STAND_BACK_M);
+      const targetPos = screenWorldPos.clone().addScaledVector(normal, focusStandBackM(camera as THREE.PerspectiveCamera));
       targetPos.y = SCREEN_EYE_Y_M;
       camera.position.lerp(targetPos, focusEase);
       // Same convention player-fps's own onFrame uses (see its comment on

@@ -11,7 +11,6 @@ import {
   isqrt,
   angleDeltaMdeg,
   CELL,
-  CELL_SIZE_MM,
   cellAt,
   cellOfMm,
   moveCircle,

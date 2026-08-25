@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "vite",
     "build:game": "tsc -p tsconfig.game.json",
-    "build": "npm run build:game && vite build"
+    "build": "npm run build:game && vite build",
+    "test": "npm run build:game --silent && node scripts/test.mjs"
   },
   "dependencies": {
     "@claude-engine/assets": "*",

@@ -68,6 +68,17 @@ jobs:
       - name: Harness bots-headless scenario (--verify-replay)
         run: npm run harness --silent -- bots-headless --verify-replay
 
+      - name: Interiors generator tests (golden hash + 100-seed property sweep)
+        run: node packages/interiors/scripts/test.mjs
+
+      - name: Harness hotel scenarios (H0 walk-collide + H1a gates, --verify-replay)
+        run: |
+          npm run harness --silent -- walk-collide --verify-replay
+          npm run harness --silent -- corridor-headon --verify-replay
+          npm run harness --silent -- checkin-rush --verify-replay
+          npm run harness --silent -- fraud-catch --verify-replay
+          npm run harness --silent -- fraud-catch-b --verify-replay
+
       - name: Harness soak scenarios (net-walk, net-interest, net-abuse, soak-ci)
         run: |
           npm run harness --silent -- net-walk --soak

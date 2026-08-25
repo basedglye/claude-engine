@@ -7,7 +7,7 @@ import {
   DOOR_HEAD_HEIGHT_MM,
   WALL_HEIGHT_MM,
 } from "../dist/index.js";
-import { CELL, CELL_SIZE_MM, cellAt, findPathCells, findRoute, moveCircle, roomAt } from "@claude-engine/space";
+import { CELL, CELL_SIZE_MM, cellAt, cellOfMm, findPathCells, findRoute, moveCircle, roomAt } from "@claude-engine/space";
 
 let failures = 0;
 
@@ -38,6 +38,9 @@ function serializeGroundFloor(gf) {
     portals: gf.portals,
     doors: gf.doors,
     spawn: gf.spawn,
+    desk: gf.desk,
+    entranceDoorIndex: gf.entranceDoorIndex,
+    bedrooms: gf.bedrooms,
     mesh: {
       positions: Array.from(gf.mesh.positions),
       normals: Array.from(gf.mesh.normals),
@@ -60,7 +63,16 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // (header quads over each DOOR cell from DOOR_HEAD_HEIGHT_MM to
 // WALL_HEIGHT_MM) in mesh-gen.ts -- both change the mesh's vertex order
 // and quad count for every seed, including this one.
-const GOLDEN_HASH = 0xe96201ca;
+// Re-pinned again for Phase H1a (see docs/PHASE-H1.md section E /
+// docs/PHASE-H0.md deferral item 3): the generator now adds a front desk
+// (FURNITURE cells), an explicit queue chain, a street door + exterior
+// street strip, and bedroom annotations -- every seed's grid/mesh changed.
+// Re-pinned again for the H1a lane-7 queue-clearance fix (see
+// src/layout.ts's "COLLIDER CLEARANCE" note): `desk.queueCells` moved one
+// row north and one column east so a 300mm-radius guest can actually
+// stand on a slot. No grid cell, portal, door or mesh vertex changed --
+// only the serialized `desk` block, which this hash covers.
+const GOLDEN_HASH = 0x132c99ef;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {
@@ -202,7 +214,7 @@ const GOLDEN_HASH = 0xe96201ca;
 // --- Doors: count, stable dense doorIndex, roomA/roomB match cell neighbours.
 {
   const gf = generateGroundFloor(GOLDEN_SEED);
-  check("doors: 4 rooms + lobby produce exactly 5 doors", gf.doors.length === 5);
+  check("doors: 4 rooms + lobby + entrance produce exactly 6 doors", gf.doors.length === 6);
   const indices = gf.doors.map((d) => d.doorIndex).sort((a, b) => a - b);
   check(
     "doors: doorIndex values are stable and dense (0..N-1)",
@@ -420,6 +432,177 @@ const GOLDEN_HASH = 0xe96201ca;
   }
   console.log(`  connectivity sweep: ${allPassed}/${N} seeds passed`);
   check(`connectivity sweep: all ${N} seeds pass (every room reachable from spawn)`, allPassed === N);
+}
+
+// --- H1a: desk / queue / entrance / bedrooms property sweep, 100 seeds. ----
+// See docs/PHASE-H1.md section E and the H0 deferral ledger row 3.
+{
+
+  function isWalkableCell(cellValue) {
+    return (cellValue & CELL.WALKABLE) !== 0 && (cellValue & CELL.SOLID) === 0 && (cellValue & CELL.FURNITURE) === 0;
+  }
+  function isDoorCell(cellValue) {
+    return (cellValue & CELL.DOOR) !== 0;
+  }
+  function hasClearance(grid, cx, cz) {
+    const here = cellAt(grid, cx, cz);
+    if (!isWalkableCell(here)) return false;
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nb = cellAt(grid, cx + dx, cz + dz);
+      if ((nb & CELL.SOLID) !== 0 || (nb & CELL.FURNITURE) !== 0) return false;
+    }
+    return true;
+  }
+  function isAdjacent(a, b) {
+    const dx = Math.abs(a.cx - b.cx);
+    const dz = Math.abs(a.cz - b.cz);
+    return dx + dz === 1;
+  }
+
+  const N = 100;
+  let queueOk = 0;
+  let terminalOk = 0;
+  let bedroomsOk = 0;
+  let entranceOk = 0;
+  let risk1Ok = 0;
+
+  for (let i = 0; i < N; i++) {
+    const seed = `hotel-h0-sweep-${i}`;
+    const gf = generateGroundFloor(seed);
+    const { grid, rooms, portals, doors, desk, entranceDoorIndex, bedrooms } = gf;
+    const isOpen = () => true;
+
+    // 1. Queue chain: every entry WALKABLE and not DOOR, consecutive
+    // entries orthogonally adjacent, no duplicates, length >= 8.
+    let qOk = desk.queueCells.length >= 8;
+    const seen = new Set();
+    for (let k = 0; k < desk.queueCells.length; k++) {
+      const c = desk.queueCells[k];
+      const key = `${c.cx}:${c.cz}`;
+      if (seen.has(key)) qOk = false;
+      seen.add(key);
+      const cell = cellAt(grid, c.cx, c.cz);
+      if (!isWalkableCell(cell)) qOk = false;
+      if (isDoorCell(cell)) qOk = false;
+      if (k > 0 && !isAdjacent(desk.queueCells[k - 1], c)) qOk = false;
+      // H1a lane-7 addition: a queue slot must be OCCUPIABLE by a
+      // 300mm-radius guest, not merely walkable. On 250mm cells a cell
+      // centre is 125mm from its own boundary, so any cell orthogonally
+      // adjacent to SOLID or FURNITURE has a centre `space.moveCircle`
+      // will never let an agent stand on. Without this property the queue
+      // row sat flush against the desk's FURNITURE row and no guest could
+      // ever reach a slot (the check-in chain was dead for every seed).
+      if (!hasClearance(grid, c.cx, c.cz)) qOk = false;
+    }
+    if (qOk) queueOk++;
+
+    // 2. Terminal anchor: walkable, adjacent to a desk FURNITURE cell (by
+    // design -- the clerk stands right up against the desk, so the side
+    // facing the desk is expected to be blocked), and clear on its other
+    // three sides for a 300mm-radius agent to occupy the cell.
+    const termC = cellOfMm(grid, desk.xMm, desk.zMm);
+    const termCell = cellAt(grid, termC.cx, termC.cz);
+    let tOk = isWalkableCell(termCell);
+    const neighbourDirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const deskNeighbours = neighbourDirs.map(([dx, dz]) => cellAt(grid, termC.cx + dx, termC.cz + dz));
+    if (!deskNeighbours.some((c) => (c & CELL.FURNITURE) !== 0)) tOk = false;
+    for (const [dx, dz] of neighbourDirs) {
+      const nb = cellAt(grid, termC.cx + dx, termC.cz + dz);
+      if ((nb & CELL.FURNITURE) !== 0) continue; // the desk side -- expected
+      if ((nb & CELL.SOLID) !== 0) tOk = false;
+    }
+    if (tOk) terminalOk++;
+
+    // 3. Bedrooms: each goal walkable, clear, inside its stated roomId,
+    // and reachable from the desk head slot (all doors open).
+    const headCell = desk.queueCells[0];
+    let bOk = bedrooms.length === 4;
+    for (const b of bedrooms) {
+      if (!hasClearance(grid, b.goalCx, b.goalCz)) bOk = false;
+      const idx = b.goalCz * grid.width + b.goalCx;
+      if (rooms[idx] !== b.roomId) bOk = false;
+      const route = findRoute(portals, rooms[headCell.cz * grid.width + headCell.cx], b.roomId);
+      if (route === null) bOk = false;
+      const path = findPathCells(grid, { cx: headCell.cx, cz: headCell.cz }, { cx: b.goalCx, cz: b.goalCz }, isOpen);
+      if (!path) bOk = false;
+    }
+    if (bOk) bedroomsOk++;
+
+    // 4. Entrance: exterior side has walkable spawn cells, and a guest can
+    // path street -> queue head -> any bedroom goal, all doors open.
+    const entranceDoor = doors[entranceDoorIndex];
+    const streetRoomId = entranceDoor.roomA; // convention: roomA = street, see layout.ts
+    let eOk = true;
+    let streetCellIdx = -1;
+    for (let idx = 0; idx < rooms.length; idx++) {
+      if (rooms[idx] === streetRoomId) {
+        const cx = idx % grid.width;
+        const cz = Math.floor(idx / grid.width);
+        if (hasClearance(grid, cx, cz)) {
+          streetCellIdx = idx;
+          break;
+        }
+      }
+    }
+    if (streetCellIdx < 0) eOk = false;
+    else {
+      const scx = streetCellIdx % grid.width;
+      const scz = Math.floor(streetCellIdx / grid.width);
+      const toHead = findPathCells(grid, { cx: scx, cz: scz }, { cx: headCell.cx, cz: headCell.cz }, isOpen);
+      if (!toHead) eOk = false;
+      for (const b of bedrooms) {
+        const toBed = findPathCells(grid, { cx: scx, cz: scz }, { cx: b.goalCx, cz: b.goalCz }, isOpen);
+        if (!toBed) eOk = false;
+      }
+    }
+    if (eOk) entranceOk++;
+
+    // 5. Risk 1: a departing guest's shortest path (bedroom goal -> street)
+    // must not run through the queue chain -- a guest leaving must not have
+    // to cross the line waiting to check in.
+    let rOk = true;
+    if (streetCellIdx >= 0) {
+      const scx = streetCellIdx % grid.width;
+      const scz = Math.floor(streetCellIdx / grid.width);
+      const queueSet = new Set(desk.queueCells.map((c) => `${c.cx}:${c.cz}`));
+      for (const b of bedrooms) {
+        const leavePath = findPathCells(grid, { cx: b.goalCx, cz: b.goalCz }, { cx: scx, cz: scz }, isOpen);
+        if (!leavePath) {
+          rOk = false;
+          continue;
+        }
+        for (const cell of leavePath) {
+          if (queueSet.has(`${cell.cx}:${cell.cz}`)) {
+            rOk = false;
+          }
+        }
+      }
+    } else {
+      rOk = false;
+    }
+    if (rOk) risk1Ok++;
+
+    if (!(qOk && tOk && bOk && eOk && rOk)) {
+      console.log(
+        `  H1a FAIL seed="${seed}": queue=${qOk} terminal=${tOk} bedrooms=${bOk} entrance=${eOk} risk1=${rOk}`
+      );
+    }
+  }
+
+  console.log(`  H1a queue chain: ${queueOk}/${N} seeds passed`);
+  check(`H1a: queue chain is walkable/non-door, adjacent, unique, clear for a 300mm collider, length>=8 across all ${N} seeds`, queueOk === N);
+
+  console.log(`  H1a terminal anchor: ${terminalOk}/${N} seeds passed`);
+  check(`H1a: terminal anchor has clearance and is adjacent to a desk FURNITURE cell across all ${N} seeds`, terminalOk === N);
+
+  console.log(`  H1a bedrooms: ${bedroomsOk}/${N} seeds passed`);
+  check(`H1a: every bedroom goal is walkable, clear, in-room, and reachable from the desk head across all ${N} seeds`, bedroomsOk === N);
+
+  console.log(`  H1a entrance/street: ${entranceOk}/${N} seeds passed`);
+  check(`H1a: street has walkable spawn cells and paths to the queue head and every bedroom across all ${N} seeds`, entranceOk === N);
+
+  console.log(`  H1a risk-1 (queue bypass): ${risk1Ok}/${N} seeds passed`);
+  check(`H1a: a departing guest's path from any bedroom goal to the street never crosses the queue chain, across all ${N} seeds`, risk1Ok === N);
 }
 
 if (failures > 0) {

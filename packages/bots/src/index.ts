@@ -6,3 +6,5 @@ export {
   type BotContext,
   type BotBehavior,
 } from "./bot.js";
+
+export { clerkBot, type DeskDecision } from "./clerk.js";

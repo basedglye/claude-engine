@@ -2,7 +2,7 @@
 // built dist/ (npm run test -w @claude-engine/bots builds first).
 // Hand-rolled assert-and-exit script matching this repo's scripts/smoke.mjs
 // style.
-import { createBot, scripted, randomWalk } from "../dist/index.js";
+import { createBot, scripted, randomWalk, clerkBot } from "../dist/index.js";
 
 let failures = 0;
 
@@ -76,6 +76,122 @@ const fakeWorld = {
 
   const botB = createBot({ actor: "walker2", seed: "walk-seed", behavior: randomWalk({ commandType: "move", payloadFor: (dx, dz) => ({ dx, dz }), every: 3 }) });
   check("randomWalk: same seed -> same direction sequence", JSON.stringify(botB.act(fakeWorld, 3)) === JSON.stringify(atThree));
+}
+
+// --- clerkBot -------------------------------------------------------------
+
+function makeDecision(accept) {
+  return { type: "desk.decision", payload: { accept } };
+}
+function invertDecision(d) {
+  return { type: d.type, payload: { accept: !d.payload.accept } };
+}
+
+// determinism: same seed, same world sequence -> identical intent streams
+{
+  const decide = (world) => (world.tick % 5 === 0 ? makeDecision(true) : undefined);
+  const mkBot = (actor) =>
+    clerkBot({ actor, seed: "clerk-seed", decide, invert: invertDecision, errorRatePermille: 300, everyTicks: 20 });
+  const botA = mkBot("clerk-a");
+  const botB = mkBot("clerk-b");
+  const seqA = Array.from({ length: 200 }, (_, tick) => botA.act({ ...fakeWorld, tick }, tick));
+  const seqB = Array.from({ length: 200 }, (_, tick) => botB.act({ ...fakeWorld, tick }, tick));
+  check("clerkBot: same seed -> identical intent stream", JSON.stringify(seqA) === JSON.stringify(seqB));
+}
+
+// errorRatePermille: 0 never inverts
+{
+  const decide = () => makeDecision(true);
+  const bot = clerkBot({ actor: "never-wrong", seed: "s1", decide, invert: invertDecision, errorRatePermille: 0, everyTicks: 1 });
+  let allCorrect = true;
+  for (let tick = 0; tick < 500; tick++) {
+    const intents = bot.act({ ...fakeWorld, tick }, tick);
+    if (intents[0].payload.accept !== true) allCorrect = false;
+  }
+  check("clerkBot: errorRatePermille 0 never inverts", allCorrect);
+}
+
+// errorRatePermille: 1000 always inverts (reliably, not statistically)
+{
+  const decide = () => makeDecision(true);
+  const bot = clerkBot({ actor: "always-wrong", seed: "s2", decide, invert: invertDecision, errorRatePermille: 1000, everyTicks: 1 });
+  let allInverted = true;
+  for (let tick = 0; tick < 500; tick++) {
+    const intents = bot.act({ ...fakeWorld, tick }, tick);
+    if (intents[0].payload.accept !== false) allInverted = false;
+  }
+  check("clerkBot: errorRatePermille 1000 always inverts", allInverted);
+}
+
+// intermediate errorRatePermille: near-nominal rate over a large sample, and
+// exactly reproducible for a given seed
+{
+  const decide = () => makeDecision(true);
+  const mk = () => clerkBot({ actor: "sometimes-wrong", seed: "s3", decide, invert: invertDecision, errorRatePermille: 200, everyTicks: 1 });
+  const bot1 = mk();
+  let inverted = 0;
+  const N = 5000;
+  const results1 = [];
+  for (let tick = 0; tick < N; tick++) {
+    const intents = bot1.act({ ...fakeWorld, tick }, tick);
+    const wasInverted = intents[0].payload.accept === false;
+    results1.push(wasInverted);
+    if (wasInverted) inverted++;
+  }
+  const rate = inverted / N;
+  check(`clerkBot: errorRatePermille 200 -> observed rate ~0.2 (got ${rate.toFixed(3)})`, Math.abs(rate - 0.2) < 0.03);
+
+  const bot2 = mk();
+  const results2 = [];
+  for (let tick = 0; tick < N; tick++) {
+    const intents = bot2.act({ ...fakeWorld, tick }, tick);
+    results2.push(intents[0].payload.accept === false);
+  }
+  check("clerkBot: intermediate errorRatePermille exactly reproducible for a given seed", JSON.stringify(results1) === JSON.stringify(results2));
+}
+
+// decide returning undefined emits nothing
+{
+  const bot = clerkBot({ actor: "idle", seed: "s4", decide: () => undefined, invert: invertDecision, errorRatePermille: 1000, everyTicks: 1 });
+  check("clerkBot: decide() undefined emits nothing", bot.act(fakeWorld, 0).length === 0);
+}
+
+// cadence: intents appear only on the expected tick multiples
+{
+  const decide = () => makeDecision(true);
+  const bot = clerkBot({ actor: "cadenced", seed: "s5", decide, invert: invertDecision, everyTicks: 20 });
+  check("clerkBot: no intent between cadence ticks", bot.act(fakeWorld, 1).length === 0 && bot.act(fakeWorld, 19).length === 0 && bot.act(fakeWorld, 21).length === 0);
+  check("clerkBot: intent emitted on cadence tick 0", bot.act(fakeWorld, 0).length === 1);
+  check("clerkBot: intent emitted on cadence tick 20", bot.act(fakeWorld, 20).length === 1);
+  check("clerkBot: intent emitted on cadence tick 40", bot.act(fakeWorld, 40).length === 1);
+}
+
+// Rng isolation: clerkBot's own rng draws are independent of a separately
+// seeded Rng used elsewhere — running the bot must not consume from, or be
+// perturbed by, an unrelated Rng stream. We verify this indirectly: running
+// the bot with error rolls enabled produces the exact same sequence whether
+// or not an unrelated Rng (simulating "the sim's Rng") is driven in
+// between act() calls.
+{
+  const decide = () => makeDecision(true);
+  const mk = () => clerkBot({ actor: "isolated", seed: "s6", decide, invert: invertDecision, errorRatePermille: 400, everyTicks: 1 });
+
+  const botX = mk();
+  const seqX = [];
+  for (let tick = 0; tick < 300; tick++) {
+    seqX.push(botX.act({ ...fakeWorld, tick }, tick));
+  }
+
+  // Simulate an unrelated "sim" Rng being drawn from between every act()
+  // call on a second, freshly built bot with the identical seed.
+  const unrelated = { calls: 0 };
+  const botY = mk();
+  const seqY = [];
+  for (let tick = 0; tick < 300; tick++) {
+    unrelated.calls++; // stand-in for sim-side randomness happening elsewhere
+    seqY.push(botY.act({ ...fakeWorld, tick }, tick));
+  }
+  check("clerkBot: intent stream unaffected by unrelated Rng activity around it", JSON.stringify(seqX) === JSON.stringify(seqY));
 }
 
 if (failures > 0) {

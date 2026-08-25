@@ -93,4 +93,56 @@ Address item 1 (the spec's own tick-gating mitigation) and re-run `fps-look-inte
 
 ## Round 2
 
-*(appended after the fix pass)*
+Reviewer: Fable 5. Resubmission reviewed: `1d1cc58` ("Phase H0 fix-list round 1: all five items"), diffed against `f359eb7`. All numbers below re-run by the reviewer; nothing taken from the resubmission's own report.
+
+### Verdict: FIX-LIST (round 2) — 1 blocking item
+
+Items 2–5 are confirmed fixed with reviewer-generated evidence, and no regression exists anywhere in the battery. But item 1 is **not fixed on Firefox**: the reviewer's Firefox runs went red 2 of 5, a worse rate than the round-1 Chromium flake this fix was meant to remove. The tick-gating pinned the *end* of the KeyW window and left the *start* floating, so the walk length still varies with page-startup latency. Chromium happens to start fast enough that this never shows; Firefox does not.
+
+### Run-by-run table (`fps-look-interact --browser --verify-replay`)
+
+| # | Engine | Exit | Assertions | replayCheck | move cmds | interact | move ticks |
+|---|---|---|---|---|---|---|---|
+| 1–8 | Chromium | 0 | 2/2 | true | 9 | 1 | 1–9 |
+| 1 | Firefox | 0 | 2/2 | true | 7 | 1 | 3–9 |
+| 2 | Firefox | **1** | **0/2** | true | **3** | 1 | **7–9** |
+| 3 | Firefox | 0 | 2/2 | true | 7 | 1 | 3–9 |
+| 4 | Firefox | **1** | **0/2** | true | **4** | 1 | **6–9** |
+| 5 | Firefox | 0 | 2/2 | true | 6 | 1 | 4–9 |
+
+Every run, red or green, replayed to its live hash — the determinism half continues to hold perfectly. The Chromium leg is a genuinely identical command stream across all 8 runs (`face@1`, `move@1..9`, `face@10:14740`, `interact@10`); final-hash differences trace solely to run-length `ticks` 86/88/90, which replay absorbs.
+
+### 1. [BLOCKING] Tick-gating pins the up-edge of the KeyW hold but not the down-edge; on Firefox the hold starts 2–6 ticks late and the gate reds ~2-in-5
+
+**What the fix actually did, mechanically.** `pollUntilTick` (`packages/harness/src/browser.ts:298`) returns on `last >= tick`, so an overshot tick fires the step *late* rather than never — the silent-skip failure mode does not exist; every step always fires. Good. But the whole tick-event queue begins executing whenever `runInputScript` starts, and `{downAtTick: 0}` returns *immediately* with whatever tick the world has already reached. On Chromium the page is interactive before tick 1 every time (8/8). On Firefox the world is at tick 2–5 before the first dispatch lands: the first `face` was stamped at tick 3 or 6 across these runs, while `upAtTick: 9` is absolute — so the hold is *truncated* to 7, 6, 4 or 3 move ticks depending on startup latency. The scenario comment's claim of "exactly ticks 1..9 on every run, on every engine" is true only on Chromium, by luck of fast startup, not by construction.
+
+**On the margin question.** The resubmission's arc-margin argument is wrong in kind. The passing Firefox runs walked 6–7 ticks instead of 9 — the click was aimed from rest positions hundreds of mm short of the derived one, and passed anyway because the reticle at that distance still lands on the door panel and the rest position is still inside the interactable's `radiusMm: 1500`. The failing runs (3–4 moves) *did* capture an `interact` command — the visual raycast still resolved the door — but the sim's revalidation rejected it out of range, so the door never opened and both assertions failed. The gate is passing on **range margin, not determinism**, and the variance window (3–9 moves observed) is far wider than the margin. This is the round-1 defect in a new coat: the aim/range half flakes while the replay half is perfect.
+
+**Fix.** The floating edge must be eliminated, not narrowed. Two acceptable shapes: (a) a start barrier — the app's test hook holds the sim at tick 0 (or the harness delays sim start) until the input script signals armed, so `downAtTick: 0` genuinely means tick 0 on every engine; or (b) key steps become span-relative (`holdTicks: 9` from the *observed* dispatch tick) **and** the corrective look is issued relative to the observed rest state — but (b) reintroduces derivation coupling, so (a) is strongly preferred and is a small hook/harness change. Re-verify with at least 8 consecutive greens on Chromium and 5 on Firefox, and the Firefox runs must show a **constant** move count, not a green streak over a varying one.
+
+### Items 2–5: confirmed fixed (reviewer's own evidence)
+
+- **Item 2 (stamp tick).** All three `submit(opts.make…(world.tick + 1, …))` sites confirmed in `packages/player-fps/src/index.ts`; `apps/hotel/src/main.ts` still orders `onTick` before `sim.step()`, so `world.tick + 1` is the true execution tick, matching the server drain convention. Observed live: the first command is now stamped tick 1, so nothing can land in the tick-0 slot that `replayToSim`'s `t = 1..ticks` loop drops. Smoke hash 919868270 unchanged, as a uniform stamp shift predicts.
+- **Item 3 (hotel sim purity root).** `apps/hotel/src/sim` appears in the real scan output. Adversarial plant against a mirrored copy: the checker named it by file and line and exited 1. Repo untouched.
+- **Item 4 (exit 2 on missing root).** Confirmed by mirroring the script with no roots present: exit code 2, root named.
+- **Item 5 (self-test fixture location).** `testTranscendentalBan('packages/space/src')` at `scripts/check-purity.mjs:352`; `--self-test` passes with the fixture CAUGHT in the spec's named root and the `Math.floor` / assets negative controls intact.
+
+### Regression battery (all re-run, all green)
+
+`npm run build` 0; `npx eslint .` 0; `check-purity` 0 (seven roots including the new one); `--self-test` 0; `npm test` hash 919868270; core/space/interiors/assets suites all 0; `walk-collide --verify-replay` 0 (4/4, verified); `smoke`, `demo-walk`, `bots-headless`, `net-walk`, `net-interest`, `net-abuse`, `soak-ci --soak` all 0; `demo-visual --browser` (the untouched wall-clock scheduler) 0.
+
+The mixed-queue design (`Promise.all([runMsEvents(), runTickEvents()])`) was read for starvation: both loops await only their own timers/polls plus per-event dispatch, neither blocks the other, and the sequential tick queue's declaration-order processing is correct for repeated same-tick gates. `git status --porcelain` empty at review end.
+
+### Deferrals added to the H1 list
+
+None beyond round 1's. The Firefox variance is **not** deferred — it is the blocking item, because this gate is the phase's flagship and a 2-in-5 red on one of the two engines it explicitly claims is exactly the re-run-until-green training that round 1 blocked on. Had the rate been a rare tail rather than 40%, deferral-with-trigger might have been defensible; it is not.
+
+### Resubmission
+
+Fix item 1's floating down-edge (start barrier preferred). Re-run the gate at least 8× Chromium and 5× Firefox, all exit 0, all with a constant move count and one interact; plus one `walk-collide --verify-replay` and `npm test`. Items 2–5 are closed.
+
+---
+
+## Round 3
+
+*(appended after the round-2 fix pass)*

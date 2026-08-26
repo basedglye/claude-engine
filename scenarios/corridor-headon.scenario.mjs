@@ -97,7 +97,9 @@ const grid = generateGroundFloor(SEED).grid;
  * first stood on its goal cell.
  */
 function setupHeadon(sim) {
-  setupWithConfig(sim, { ...DEFAULTS, fixture: "headon" });
+  // `upkeep: false` — this is a nav gate; props would add entities (and
+  // shift the committed fixture entity ids) for nothing.
+  setupWithConfig(sim, { ...DEFAULTS, fixture: "headon", upkeep: false });
   sim.addSystem((s) => {
     for (const [entity, agent] of s.withComponent("navAgent")) {
       const pos = s.getComponent(entity, "pos");

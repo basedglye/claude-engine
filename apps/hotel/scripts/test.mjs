@@ -403,7 +403,7 @@ function runUntil(sim, maxTicks, predicate) {
   return false;
 }
 
-const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" };
+const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false };
 
 // --- Guest FSM: accepted guest reaches inRoom -------------------------------
 {
@@ -482,7 +482,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- Double-entry ledger -----------------------------------------------------
 {
   const sim = new Sim("hotel-h1a-ledger-1");
-  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
 
   let accepted = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -534,7 +534,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- Queue: distinct slots, chain advances -----------------------------------
 {
   const sim = new Sim("hotel-h1a-queue-1");
-  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
 
   const allQueued = runUntil(sim, 5000, (s) => {
     let n = 0;
@@ -647,7 +647,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- despawn clears departed guests and their documents ----------------------
 {
   const sim = new Sim("hotel-h1a-despawn-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
 
   const baseline = new Set([...sim.entities()]);
 
@@ -727,7 +727,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- ACCEPT branch: room + ACCEPT clicks check the guest in end to end ---
 {
   const sim = new Sim("hotel-h1b-decision-accept-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -775,7 +775,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- Guard: clicking ACCEPT with no room selected does not decide -------
 {
   const sim = new Sim("hotel-h1b-decision-guard-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -803,7 +803,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- DENY branch: a planted violation is caught and the guest leaves ----
 {
   const sim = new Sim("hotel-h1b-decision-deny-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal", upkeep: false });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -952,6 +952,188 @@ function focusTerminal(sim, terminalEntity) {
     "overflow gate is not a no-op on shell chrome: the pre-fix glyph-row position IS flagged",
     preFixViolations.length > 0,
   );
+}
+
+// ============================================================================
+// H2a: housekeeping and maintenance (docs/PHASE-H2.md §9)
+// ============================================================================
+
+/** Every entity carrying `component`, as [entity, value]. */
+function scanAll(sim, component) {
+  return [...sim.withComponent(component)];
+}
+
+/** interact from a pose that is guaranteed in range and arc, the same way
+ *  every other decision test in this file does it. */
+function interactWith(sim, targetEntity) {
+  teleportPlayerNextTo(sim, targetEntity);
+  sim.submit(interactCommand(sim.tick + 1, targetEntity));
+  sim.step();
+}
+
+const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixture: "normal", upkeep: true };
+
+// --- the component shapes ARE the zen ruling ------------------------------
+// DESIGN §6 / H2 spec §9: "no per-room timer ... consequences only at day
+// granularity". The enforcement is structural, not disciplinary: if `mess`
+// or `prop` carried any timestamp, decay/expiry/compounding would become
+// expressible, and a later phase would express it. This asserts the shape.
+{
+  const sim = new Sim("hotel-h2-zen-shape-1");
+  setupWithConfig(sim, UPKEEP_ON);
+  const props = scanAll(sim, "prop");
+  check("upkeep: one prop per bedroom at setup", props.length === scanAll(sim, "roomUnit").length);
+  const propKeys = Object.keys(props[0][1]).sort();
+  check(
+    `prop carries exactly {broken, kind, repairProgress, roomEntity} -- no timestamp of any kind (got ${propKeys.join(",")})`,
+    JSON.stringify(propKeys) === JSON.stringify(["broken", "kind", "repairProgress", "roomEntity"]),
+  );
+  const off = new Sim("hotel-h2-zen-shape-2");
+  setupWithConfig(off, { ...UPKEEP_ON, upkeep: false });
+  check("upkeep: no props are created when config.upkeep is false", scanAll(off, "prop").length === 0);
+}
+
+// --- a checkout leaves 2..4 messes; wiping them removes them --------------
+{
+  const sim = new Sim("hotel-h2-zen-mess-1");
+  setupWithConfig(sim, UPKEEP_ON);
+
+  runUntil(sim, 4000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  interactWith(sim, guestEntity);
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const [roomEntity] = findVacantRoom(sim);
+  teleportPlayerNextTo(sim, findTerminalEntity(sim));
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check("zen: the guest checked in", sim.getComponent(roomEntity, "roomUnit").occupantEntity === guestEntity);
+
+  const checkedOut = runUntil(sim, 6000, (s) => s.eventsSince(0).some((e) => e.type === "guest.checkedOut"));
+  check("zen: the guest eventually checks out", checkedOut);
+
+  const room = sim.getComponent(roomEntity, "roomUnit");
+  const messes = scanAll(sim, "mess").filter(([, m]) => m.roomEntity === roomEntity);
+  check(`zen: checkout left 2..4 messes (got ${messes.length})`, messes.length >= 2 && messes.length <= 4);
+  check("zen: roomUnit.messCount agrees with a live mess scan", room.messCount === messes.length);
+  check("zen: the room is vacant after checkout", room.occupantEntity === 0);
+
+  // RESERVA must not offer a room the desk would refuse.
+  const viewDirty = buildScreenWorldView(sim);
+  check(
+    "zen: RESERVA's vacant-room list excludes the dirty room",
+    !viewDirty.data.rooms.some((r) => r.roomEntity === roomEntity),
+  );
+
+  // Wipe them all, one interact each.
+  const messCountBefore = messes.length;
+  for (const [messEntity] of messes) interactWith(sim, messEntity);
+  const cleanedEvents = sim.eventsSince(0).filter((e) => e.type === "room.messCleaned");
+  check(
+    `zen: one room.messCleaned per wipe (${cleanedEvents.length} of ${messCountBefore})`,
+    cleanedEvents.length === messCountBefore,
+  );
+  check(
+    "zen: every mess entity is despawned",
+    scanAll(sim, "mess").filter(([, m]) => m.roomEntity === roomEntity).length === 0,
+  );
+  check("zen: roomUnit.messCount is back to 0", sim.getComponent(roomEntity, "roomUnit").messCount === 0);
+  const viewClean = buildScreenWorldView(sim);
+  check(
+    "zen: RESERVA lists the room again once it is wiped",
+    viewClean.data.rooms.some((r) => r.roomEntity === roomEntity),
+  );
+
+  // The zen property: nothing about the DELAY produced a penalty. Messes
+  // never multiplied while dirty, and no penalty-class event exists at all.
+  const penaltyish = sim.eventsSince(0).filter((e) => /penal|fine|decay|expire|worsen|cascade/i.test(e.type));
+  check("zen: zero penalty-class events anywhere in the run", penaltyish.length === 0);
+}
+
+// --- the desk refuses a dirty or broken room, and says why ----------------
+{
+  const sim = new Sim("hotel-h2-zen-deny-1");
+  setupWithConfig(sim, { ...UPKEEP_ON, guestCount: 2 });
+  runUntil(sim, 4000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  const [roomEntity] = findVacantRoom(sim);
+
+  // Dirty the room directly -- the desk's rule is what is under test here,
+  // not the checkout that would normally produce the mess.
+  const room = sim.getComponent(roomEntity, "roomUnit");
+  sim.setComponent(roomEntity, "roomUnit", { ...room, messCount: 1 });
+
+  interactWith(sim, guestEntity);
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  teleportPlayerNextTo(sim, findTerminalEntity(sim));
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check(
+    "zen: accepting onto a dirty room does not decide the reservation",
+    sim.getComponent(resEntity, "reservation").decided === false,
+  );
+  check(
+    "zen: the desk emits desk.denied-room {reason: not-ready}",
+    sim
+      .eventsSince(0)
+      .some((e) => e.type === "desk.denied-room" && e.payload.reason === "not-ready" && e.payload.roomEntity === roomEntity),
+  );
+
+  // Same shape for a broken prop, with the room perfectly clean.
+  sim.setComponent(roomEntity, "roomUnit", { ...sim.getComponent(roomEntity, "roomUnit"), messCount: 0 });
+  const propEntry = scanAll(sim, "prop").find(([, pr]) => pr.roomEntity === roomEntity);
+  sim.setComponent(propEntry[0], "prop", { ...propEntry[1], broken: true, repairProgress: 0 });
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check(
+    "zen: a clean room with a BROKEN prop is also refused",
+    sim.getComponent(resEntity, "reservation").decided === false,
+  );
+  check(
+    "zen: RESERVA excludes a clean room with a broken prop",
+    !buildScreenWorldView(sim).data.rooms.some((r) => r.roomEntity === roomEntity),
+  );
+
+  // Repair it: N presses, visible partial progress, then sellable again.
+  interactWith(sim, propEntry[0]);
+  const midway = sim.getComponent(propEntry[0], "prop");
+  check("zen: one repair press advances repairProgress without finishing", midway.repairProgress === 1 && midway.broken === true);
+  interactWith(sim, propEntry[0]);
+  interactWith(sim, propEntry[0]);
+  const repaired = sim.getComponent(propEntry[0], "prop");
+  check("zen: the third press completes the repair", repaired.broken === false && repaired.repairProgress === 0);
+  check(
+    "zen: prop.repaired fired",
+    sim.eventsSince(0).some((e) => e.type === "prop.repaired" && e.payload.propEntity === propEntry[0]),
+  );
+  interactWith(sim, propEntry[0]);
+  check(
+    "zen: interacting with an unbroken prop is denied, not a free repair",
+    sim.eventsSince(0).some((e) => e.type === "interact-denied" && e.payload.reason === "not-broken"),
+  );
+
+  teleportPlayerNextTo(sim, findTerminalEntity(sim));
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check("zen: the room is sellable once wiped and repaired", sim.getComponent(resEntity, "reservation").decided === true);
+}
+
+// --- partial repair survives a save/restore round trip --------------------
+// "Partial progress persists indefinitely" is a design ruling; restore() is
+// exactly where a half-finished job would silently reset.
+{
+  const sim = new Sim("hotel-h2-zen-restore-1");
+  setupWithConfig(sim, UPKEEP_ON);
+  sim.step();
+  const [propEntity, prop] = scanAll(sim, "prop")[0];
+  sim.setComponent(propEntity, "prop", { ...prop, broken: true, repairProgress: 0 });
+  interactWith(sim, propEntity);
+  const snapshot = sim.snapshot();
+  const restored = new Sim("hotel-h2-zen-restore-1");
+  setupWithConfig(restored, UPKEEP_ON);
+  restored.restore(snapshot);
+  const after = restored.getComponent(propEntity, "prop");
+  check("zen: half-done repair survives snapshot/restore", after.broken === true && after.repairProgress === 1);
+  check("zen: the restored sim hashes identically to the source", restored.stateHash() === snapshot.stateHash);
 }
 
 if (failures > 0) {

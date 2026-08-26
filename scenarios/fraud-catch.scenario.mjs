@@ -59,6 +59,12 @@ export const CONFIG = {
   spawnTickMin: 100,
   fraudRatePermille: 500,
   fixture: "normal",
+  // H2a: this is an H1 gate. Housekeeping is pinned OFF here — the gate's
+  // 8-guests-through-4-rooms turnover (and STAY_TICKS, tuned against it)
+  // is H1 behaviour, and letting an H2 content change dirty the rooms
+  // would silently re-tune it. zen-clean and one-man-week verify the
+  // shipped default (true) instead.
+  upkeep: false,
 };
 
 export function setupFraud(sim) {

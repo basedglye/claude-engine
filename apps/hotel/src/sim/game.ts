@@ -59,6 +59,8 @@ import type {
   LedgerEntry,
   NavSchedule,
   NoticeList,
+  Mess,
+  Prop,
   SaveRestoreDebug,
 } from "./components.js";
 import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
@@ -170,12 +172,35 @@ const ROOM_RATE_MINOR: Record<number, number> = { 1: 5000, 2: 8000 };
 const DAILY_WAGES_MINOR = 3000;
 const DAILY_UTILITIES_MINOR = 1500;
 
+/** Housekeeping/maintenance content (docs/PHASE-H2.md §9, open question 2).
+ *  Comedy flavour only — no system reads the kind. */
+const MESS_KINDS: readonly string[] = [
+  "pizza-box",
+  "mystery-stain",
+  "towel-mountain",
+  "minibar-carnage",
+  "suspicious-glitter",
+];
+const PROP_KINDS: readonly string[] = ["tv", "radiator", "lamp", "icebox"];
+
+/** A checkout leaves 2..4 discrete messes — bounded by spec. */
+const MESS_MIN = 2;
+const MESS_MAX = 4;
+/** Repair is this many `interact` presses. Bounded, no consumables, no
+ *  failure state — the zen ruling's "one verb" (DESIGN §6, H2 spec §9). */
+const REPAIR_STEPS = 3;
+/** Per-prop chance, per night, of breaking. Drawn once per prop at the day
+ *  rollover from forkRng("upkeep"). */
+const BREAKAGE_PERMILLE = 150;
+
 export type InteractDeniedReason =
   | "no-interactable"
   | "out-of-range"
   | "out-of-arc"
   | "not-a-door"
-  | "not-presenting-eligible";
+  | "not-presenting-eligible"
+  | "not-broken"
+  | "not-a-mess";
 
 // -- Scenario config hook (spec: "Scenario config hook") ------------------
 
@@ -193,6 +218,17 @@ export interface ScenarioConfig {
    *  same lane; see the fixture block in setupWithConfig and
    *  scenarios/corridor-headon.scenario.mjs. */
   fixture: "normal" | "headon";
+  /** H2a housekeeping/maintenance. When false, no props are created, no
+   *  checkout leaves a mess, and nothing ever breaks.
+   *
+   *  The H1 gates pin this FALSE, for the same reason determinism rule 8
+   *  pins them to the fixed-schedule spawn path: `checkin-rush`'s whole
+   *  design is 8 guests serialising through 4 rooms, and `STAY_TICKS` was
+   *  tuned against exactly that turnover. Letting checkouts dirty rooms
+   *  would silently re-tune an H1 gate from an H2 content change — the
+   *  opposite of what those gates are for. The shipped default is true,
+   *  and `zen-clean` / `one-man-week` are what verify it. */
+  upkeep: boolean;
 }
 
 // H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
@@ -209,6 +245,7 @@ export const DEFAULTS: ScenarioConfig = {
   spawnTickMin: 100,
   fraudRatePermille: 0,
   fixture: "normal",
+  upkeep: true,
 };
 
 function wrapMdeg(mdeg: number): number {
@@ -256,6 +293,19 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   // sim.forkRng").
   const guestSpawnRng = sim.forkRng("guest-spawn");
   const guestFraudRng = sim.forkRng("guest-fraud");
+  // H2a's four new streams. Registered here, in this order, for every
+  // config — a fork's mere existence draws nothing, and a label set that
+  // varies by config would make snapshots config-specific. Registering
+  // them is what breaks H1 saves at Sim.restore()'s label check, which is
+  // the documented policy (docs/PHASE-H2.md non-goals: no save migration
+  // pre-1.0; the boot path treats a RestoreError as "no save").
+  const demandRng = sim.forkRng("demand");
+  const staffRng = sim.forkRng("staff");
+  const objectivesRng = sim.forkRng("objectives");
+  const upkeepRng = sim.forkRng("upkeep");
+  void demandRng;
+  void staffRng;
+  void objectivesRng;
 
   // -- Player (as H0) ------------------------------------------------------
   const player = sim.spawn(); // == PLAYER_ENTITY: first entity spawned
@@ -319,6 +369,26 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     });
   }
   const bedroomByRoomId = new Map(floor.bedrooms.map((b) => [b.roomId, b]));
+
+  // Every walkable, non-doorway cell of each bedroom, in ascending cell
+  // index. Pure derivation of `floor` (which is a pure function of the
+  // seed), so this is a legal closure capture exactly like
+  // `portalCellsByDoorIndex` — and the placement pool messes and props are
+  // drawn from.
+  const bedroomCellsByRoomId = new Map<number, PathCell[]>();
+  for (const bedroom of floor.bedrooms) {
+    const cells: PathCell[] = [];
+    for (let cz = 0; cz < grid.height; cz++) {
+      for (let cx = 0; cx < grid.width; cx++) {
+        if (floor.rooms[cz * grid.width + cx] !== bedroom.roomId) continue;
+        const cell = cellAt(grid, cx, cz);
+        if ((cell & CELL.WALKABLE) === 0) continue;
+        if (cell & CELL.DOOR) continue;
+        cells.push({ cx, cz });
+      }
+    }
+    bedroomCellsByRoomId.set(bedroom.roomId, cells);
+  }
 
   // -- Front desk terminal ------------------------------------------------
   const terminal = sim.spawn();
@@ -445,6 +515,40 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
           avoidCz: -1,
         });
       }
+    }
+  }
+
+  // -- Props: one breakable prop per bedroom (H2a) -----------------------
+  //
+  // Created AFTER the headon fixture block on purpose: `corridor-headon`
+  // asserts against committed entity ids, and inserting spawns ahead of the
+  // fixture would shift them. (That gate also pins `upkeep: false`, so it
+  // creates none — belt and braces, because the ordering constraint is the
+  // kind of thing a later edit breaks silently.)
+  if (config.upkeep) {
+    for (const bedroom of floor.bedrooms) {
+      const cells = bedroomCellsByRoomId.get(bedroom.roomId) ?? [];
+      if (cells.length === 0) continue;
+      const roomEntity = roomEntityByRoomId.get(bedroom.roomId);
+      if (roomEntity === undefined) continue;
+      const kind = upkeepRng.pick(PROP_KINDS);
+      const cell = upkeepRng.pick(cells);
+      const propEntity = sim.spawn();
+      const mm = cellMm(cell.cx, cell.cz);
+      sim.setComponent<Prop>(propEntity, "prop", {
+        kind,
+        roomEntity,
+        broken: false,
+        repairProgress: 0,
+      });
+      sim.setComponent<Pos>(propEntity, "pos", mm);
+      sim.setComponent<Interactable>(propEntity, "interactable", {
+        kind: "prop",
+        xMm: mm.xMm,
+        zMm: mm.zMm,
+        radiusMm: INTERACTABLE_RADIUS_MM,
+        arcMdeg: INTERACTABLE_ARC_MDEG,
+      });
     }
   }
 
@@ -754,11 +858,57 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (guest.roomEntity !== 0) {
         const room = s.getComponent<RoomUnit>(guest.roomEntity, "roomUnit");
         if (room) s.setComponent<RoomUnit>(guest.roomEntity, "roomUnit", { ...room, occupantEntity: 0 });
+        spawnMessesFor(s, guest.roomEntity);
       }
       s.setComponent<Guest>(entity, "guest", { ...guest, state: "leaving" });
       setGoal(s, entity, streetCell.cx, streetCell.cz);
       s.emit("guest.checkedOut", { guestEntity: entity });
     }
+  }
+
+  /** Is this room sellable right now? Vacant, wiped, and not carrying a
+   *  broken prop. A dirty or broken room is BLOCKED, never punished — the
+   *  cost is the room-night you did not sell, and it lands at the audit
+   *  like every other economic fact (docs/PHASE-H2.md §9). */
+  function roomReady(s: Sim, roomEntity: EntityId): boolean {
+    const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+    if (!room) return false;
+    if (room.occupantEntity !== 0) return false;
+    if (room.messCount > 0) return false;
+    for (const [, prop] of s.withComponent<Prop>("prop")) {
+      if (prop.roomEntity === roomEntity && prop.broken) return false;
+    }
+    return true;
+  }
+
+  /** A checkout leaves 2..4 discrete, visible messes on the room's own
+   *  cells. The player's progress bar is the literal count of objects still
+   *  in front of them — never a meter, never a HUD. */
+  function spawnMessesFor(s: Sim, roomEntity: EntityId): void {
+    if (!config.upkeep) return;
+    const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+    if (!room) return;
+    const cells = bedroomCellsByRoomId.get(room.roomId) ?? [];
+    if (cells.length === 0) return;
+    const count = MESS_MIN + upkeepRng.int(0, MESS_MAX - MESS_MIN);
+    for (let i = 0; i < count; i++) {
+      const kind = upkeepRng.pick(MESS_KINDS);
+      const cell = upkeepRng.pick(cells);
+      const messEntity = s.spawn();
+      const mm = cellMm(cell.cx, cell.cz);
+      s.setComponent<Mess>(messEntity, "mess", { roomEntity, kind });
+      s.setComponent<Pos>(messEntity, "pos", mm);
+      s.setComponent<Interactable>(messEntity, "interactable", {
+        kind: "mess",
+        xMm: mm.xMm,
+        zMm: mm.zMm,
+        radiusMm: INTERACTABLE_RADIUS_MM,
+        arcMdeg: INTERACTABLE_ARC_MDEG,
+      });
+    }
+    const after = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+    if (after) s.setComponent<RoomUnit>(roomEntity, "roomUnit", { ...after, messCount: after.messCount + count });
+    s.emit("room.messSpawned", { roomEntity, count });
   }
 
   function setGoal(s: Sim, entity: EntityId, goalCx: number, goalCz: number): void {
@@ -1109,6 +1259,48 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         continue;
       }
 
+      if (interactable.kind === "mess") {
+        const mess = s.getComponent<Mess>(target, "mess");
+        if (!mess) {
+          s.emit("interact-denied", { reason: "not-a-mess" satisfies InteractDeniedReason });
+          continue;
+        }
+        // ONE wipe, one object gone. No timer, no meter, no partial state:
+        // the world in front of the player IS the progress bar.
+        const room = s.getComponent<RoomUnit>(mess.roomEntity, "roomUnit");
+        if (room) {
+          s.setComponent<RoomUnit>(mess.roomEntity, "roomUnit", {
+            ...room,
+            messCount: Math.max(0, room.messCount - 1),
+          });
+        }
+        s.despawn(target);
+        s.emit("room.messCleaned", { roomEntity: mess.roomEntity, messEntity: target, actor: c.actor });
+        continue;
+      }
+
+      if (interactable.kind === "prop") {
+        const prop = s.getComponent<Prop>(target, "prop");
+        if (!prop) continue;
+        if (!prop.broken) {
+          s.emit("interact-denied", { reason: "not-broken" satisfies InteractDeniedReason });
+          continue;
+        }
+        // Repair advances by a fixed quantum per press and PERSISTS
+        // indefinitely — half-repaired stays half-repaired across days,
+        // saves and interruptions. Nothing decays it back.
+        const progress = prop.repairProgress + 1;
+        if (progress >= REPAIR_STEPS) {
+          s.setComponent<Prop>(target, "prop", { ...prop, broken: false, repairProgress: 0 });
+          s.emit("prop.repaired", { propEntity: target, roomEntity: prop.roomEntity, actor: c.actor });
+          s.emit("incident.resolved", { propEntity: target, roomEntity: prop.roomEntity });
+        } else {
+          s.setComponent<Prop>(target, "prop", { ...prop, repairProgress: progress });
+          s.emit("prop.repairStep", { propEntity: target, progress, of: REPAIR_STEPS, actor: c.actor });
+        }
+        continue;
+      }
+
       if (interactable.kind === "terminal") {
         const terminalComp = s.getComponent<Terminal>(target, "terminal");
         if (!terminalComp) continue;
@@ -1187,6 +1379,13 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (roomEntity === undefined) return;
       const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
       if (!room || room.occupantEntity !== 0) return; // not vacant: no-op, retry later
+      if (!roomReady(s, roomEntity)) {
+        // Dirty or broken: a BLOCK, not a punishment. Nothing is charged,
+        // nothing is flagged, the reservation stays undecided and the desk
+        // can try another room (or the same one once it is wiped).
+        s.emit("desk.denied-room", { reservationEntity, roomEntity, reason: "not-ready" });
+        return;
+      }
       s.setComponent<RoomUnit>(roomEntity, "roomUnit", { ...room, occupantEntity: res.guestEntity });
       s.setComponent<Reservation>(reservationEntity, "reservation", {
         ...res,
@@ -1317,6 +1516,41 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  // 13. upkeepSystem — breakage rolls at the day rollover, one draw per
+  //     prop from forkRng("upkeep"). A broken prop is a broken prop: it
+  //     never worsens, never spreads, and never becomes a flood (incident
+  //     cascade is a Phase 3 system, deliberately absent). An OCCUPIED
+  //     room's broken prop accrues one integer broken-night on its guest,
+  //     cashed out once in the checkout review — nothing dings the player
+  //     mid-day and nothing beeps.
+  function upkeepSystem(s: Sim): void {
+    if (!config.upkeep) return;
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    const { day: newDay } = computePhase(s.tick);
+    if (newDay === hotel.day) return; // rollover only
+
+    for (const [entity, prop] of [...s.withComponent<Prop>("prop")]) {
+      if (prop.broken) {
+        const room = s.getComponent<RoomUnit>(prop.roomEntity, "roomUnit");
+        const occupant = room?.occupantEntity ?? 0;
+        if (occupant !== 0) {
+          const guest = s.getComponent<Guest>(occupant, "guest");
+          if (guest) {
+            s.setComponent<Guest>(occupant, "guest", {
+              ...guest,
+              brokenPropNights: guest.brokenPropNights + 1,
+            });
+          }
+        }
+        continue;
+      }
+      if (upkeepRng.int(0, 999) >= BREAKAGE_PERMILLE) continue;
+      s.setComponent<Prop>(entity, "prop", { ...prop, broken: true, repairProgress: 0 });
+      s.emit("prop.broke", { propEntity: entity, roomEntity: prop.roomEntity, kind: prop.kind });
+    }
+  }
+
   // 10. economySystem — daily flat expenses at the rollover into audit.
   function economySystem(s: Sim): void {
     const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
@@ -1425,6 +1659,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.addSystem(interactSystem);
   sim.addSystem(deskSystem);
   sim.addSystem(screenSystem);
+  sim.addSystem(upkeepSystem);
   sim.addSystem(economySystem);
   sim.addSystem(dayPhaseSystem);
   sim.addSystem(cleanupSystem);

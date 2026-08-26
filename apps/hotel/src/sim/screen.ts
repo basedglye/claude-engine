@@ -12,7 +12,7 @@ import type { IWorld } from "@claude-engine/core";
 import { createShell, type ScreenWorldView } from "@claude-engine/surface-ui";
 import { reservaApp } from "./reserva-app.js";
 import { auditApp } from "./audit-app.js";
-import type { DocumentComp, Guest, Hotel, LedgerEntry, Reservation, RoomUnit } from "./components.js";
+import type { DocumentComp, Guest, Hotel, LedgerEntry, Prop, Reservation, RoomUnit } from "./components.js";
 import type { ScreenQueueView, ScreenRoomView, ScreenViewData } from "./screen-data.js";
 
 export const hotelShell = createShell([reservaApp, auditApp]);
@@ -33,6 +33,7 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
   let presentingGuestEntity: number | undefined;
 
   const ledgerEntries: LedgerEntry[] = [];
+  const brokenRoomEntities = new Set<number>();
 
   // ONE sweep over entities, not two (docs/PHASE-H2.md §12 item 1). The
   // second sweep existed only to total the ledger, which needs `day` from
@@ -53,9 +54,17 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
     if (entry) ledgerEntries.push(entry);
 
     const room = world.getComponent<RoomUnit>(entity, "roomUnit");
-    if (room && room.occupantEntity === 0) {
+    // Vacant AND wiped. A room with a broken prop is filtered after the
+    // sweep (props are found in this same pass). RESERVA showing a room it
+    // cannot actually sell would be a lie the desk then refuses — the
+    // screen's list and `applyDeskDecision`'s `roomReady` check are the
+    // same eligibility rule, seen from two sides.
+    if (room && room.occupantEntity === 0 && room.messCount === 0) {
       rooms.push({ roomEntity: entity, roomId: room.roomId, tier: room.tier });
     }
+
+    const prop = world.getComponent<Prop>(entity, "prop");
+    if (prop && prop.broken) brokenRoomEntities.add(prop.roomEntity);
 
     const doc = world.getComponent<DocumentComp>(entity, "document");
     if (doc) {
@@ -72,7 +81,8 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
       presentingGuestEntity = entity;
     }
   }
-  rooms.sort((a, b) => a.roomId - b.roomId);
+  const sellableRooms = rooms.filter((r) => !brokenRoomEntities.has(r.roomEntity));
+  sellableRooms.sort((a, b) => a.roomId - b.roomId);
 
   let queue: ScreenQueueView | null = null;
   if (presentingGuestEntity !== undefined) {
@@ -98,7 +108,7 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
 
   const data: ScreenViewData = {
     queue,
-    rooms,
+    rooms: sellableRooms,
     ledger: { day, revenueMinor, expenseMinor, closingCashMinor: hotel ? hotel.cash : 0 },
   };
   return { tick: world.tick, data: data as unknown as Record<string, unknown> };

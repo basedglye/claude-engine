@@ -99,7 +99,7 @@ const grid = generateGroundFloor(SEED).grid;
 function setupHeadon(sim) {
   // `upkeep: false` — this is a nav gate; props would add entities (and
   // shift the committed fixture entity ids) for nothing.
-  setupWithConfig(sim, { ...DEFAULTS, fixture: "headon", upkeep: false });
+  setupWithConfig(sim, { ...DEFAULTS, fixture: "headon", upkeep: false, arrivals: "fixed" });
   sim.addSystem((s) => {
     for (const [entity, agent] of s.withComponent("navAgent")) {
       const pos = s.getComponent(entity, "pos");

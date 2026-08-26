@@ -65,6 +65,9 @@ export const CONFIG = {
   // would silently re-tune it. zen-clean and one-man-week verify the
   // shipped default (true) instead.
   upkeep: false,
+  // Same reasoning: this gate owns an H1 spawn stream, so it pins the H1
+  // fixed schedule rather than riding the demand curve.
+  arrivals: "fixed",
 };
 
 export function setupFraud(sim) {

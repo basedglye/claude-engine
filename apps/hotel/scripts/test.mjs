@@ -26,6 +26,24 @@ import {
   buildScreenWorldView,
 } from "../dist-game/sim/game.js";
 import { jitter } from "../dist-game/sim/nav.js";
+import {
+  scoreReview,
+  reputationBySegment,
+  overallReputation,
+  starsFromReputation,
+  MAX_STARS,
+  DEFAULT_REP_PERMILLE,
+} from "../dist-game/sim/reviews.js";
+import {
+  capturePermille,
+  arrivalsForDay,
+  generateObjectives,
+  isValidRate,
+  SEGMENT_POOL,
+  MIN_RATE_MINOR,
+  MAX_RATE_MINOR,
+  RATE_STEP_MINOR,
+} from "../dist-game/sim/economy.js";
 
 let failures = 0;
 
@@ -403,7 +421,7 @@ function runUntil(sim, maxTicks, predicate) {
   return false;
 }
 
-const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false };
+const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" };
 
 // --- Guest FSM: accepted guest reaches inRoom -------------------------------
 {
@@ -482,7 +500,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- Double-entry ledger -----------------------------------------------------
 {
   const sim = new Sim("hotel-h1a-ledger-1");
-  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
+  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   let accepted = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -534,7 +552,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- Queue: distinct slots, chain advances -----------------------------------
 {
   const sim = new Sim("hotel-h1a-queue-1");
-  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
+  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   const allQueued = runUntil(sim, 5000, (s) => {
     let n = 0;
@@ -647,7 +665,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- despawn clears departed guests and their documents ----------------------
 {
   const sim = new Sim("hotel-h1a-despawn-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   const baseline = new Set([...sim.entities()]);
 
@@ -727,7 +745,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- ACCEPT branch: room + ACCEPT clicks check the guest in end to end ---
 {
   const sim = new Sim("hotel-h1b-decision-accept-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -775,7 +793,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- Guard: clicking ACCEPT with no room selected does not decide -------
 {
   const sim = new Sim("hotel-h1b-decision-guard-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -803,7 +821,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- DENY branch: a planted violation is caught and the guest leaves ----
 {
   const sim = new Sim("hotel-h1b-decision-deny-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal", upkeep: false });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -971,7 +989,7 @@ function interactWith(sim, targetEntity) {
   sim.step();
 }
 
-const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixture: "normal", upkeep: true };
+const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixture: "normal", upkeep: true, arrivals: "fixed" };
 
 // --- the component shapes ARE the zen ruling ------------------------------
 // DESIGN §6 / H2 spec §9: "no per-room timer ... consequences only at day
@@ -1134,6 +1152,222 @@ const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixtur
   const after = restored.getComponent(propEntity, "prop");
   check("zen: half-done repair survives snapshot/restore", after.broken === true && after.repairProgress === 1);
   check("zen: the restored sim hashes identically to the source", restored.stateHash() === snapshot.stateHash);
+}
+
+// ============================================================================
+// H2a: reviews, reputation, stars, demand, objectives (docs/PHASE-H2.md §10)
+// ============================================================================
+
+// --- scoreReview is a pure function of objective stay facts --------------
+{
+  const perfect = { waitedTicks: 0, brokenPropNights: 0, paidMinor: 5000, tierBaselineMinor: 5000 };
+  check("review: a flawless stay at the baseline rate scores 5", scoreReview(perfect).score === 5);
+
+  const waited = scoreReview({ ...perfect, waitedTicks: 700 });
+  check("review: a long wait costs a star and names itself", waited.score === 4 && waited.factors.includes("waited-long"));
+  const waitedMore = scoreReview({ ...perfect, waitedTicks: 1300 });
+  check("review: a very long wait costs two", waitedMore.score === 3 && waitedMore.factors.includes("waited-very-long"));
+
+  const broken = scoreReview({ ...perfect, brokenPropNights: 1 });
+  check("review: a broken-prop night costs a star", broken.score === 4 && broken.factors.includes("broken-prop"));
+  check(
+    "review: broken-prop damage CAPS at two stars, however many nights (no cascade)",
+    scoreReview({ ...perfect, brokenPropNights: 2 }).score === scoreReview({ ...perfect, brokenPropNights: 9 }).score,
+  );
+
+  const gouged = scoreReview({ ...perfect, paidMinor: 7000 });
+  check("review: charging well over baseline costs a star", gouged.score === 4 && gouged.factors.includes("overpriced"));
+  const bargain = scoreReview({ ...perfect, waitedTicks: 700, paidMinor: 3000 });
+  check(
+    "review: a bargain buys back at most one star",
+    bargain.score === 5 && bargain.factors.includes("good-value"),
+  );
+
+  check("review: the score never leaves 1..5", scoreReview({ waitedTicks: 99999, brokenPropNights: 9, paidMinor: 25000, tierBaselineMinor: 5000 }).score === 1);
+
+  // The anti-dark-pattern requirement, asserted: the same stay always
+  // scores the same. A randomised review score would be a variable-ratio
+  // schedule, which DESIGN §6 explicitly rules out.
+  const a = scoreReview({ waitedTicks: 640, brokenPropNights: 1, paidMinor: 6100, tierBaselineMinor: 5000 });
+  const b = scoreReview({ waitedTicks: 640, brokenPropNights: 1, paidMinor: 6100, tierBaselineMinor: 5000 });
+  check("review: scoring is deterministic — identical facts, identical outcome", JSON.stringify(a) === JSON.stringify(b));
+}
+
+// --- reputation is recomputed from a rolling window, in integers ---------
+{
+  const rows = [
+    { day: 10, segment: "business", score: 5 },
+    { day: 10, segment: "business", score: 3 },
+    { day: 10, segment: "leisure", score: 1 },
+    // Older than the window from day 10 — must be ignored.
+    { day: 2, segment: "business", score: 1 },
+  ];
+  const rep = reputationBySegment(rows, 10);
+  check("reputation: 5 and 3 average to 750 permille (integer, truncating)", rep.business === 750);
+  check("reputation: a 1-star review is 0 permille", rep.leisure === 0);
+  check("reputation: reviews outside the 7-day window are excluded", Object.keys(rep).length === 2);
+  check(
+    "reputation: every value is an integer",
+    Object.keys(rep).every((k) => Number.isInteger(rep[k])),
+  );
+  check(
+    "reputation: the key order is sorted, so the hashed component order depends only on the names",
+    JSON.stringify(Object.keys(rep)) === JSON.stringify(["business", "leisure"]),
+  );
+  check("reputation: no reviews at all falls back to the neutral default", overallReputation({}) === DEFAULT_REP_PERMILLE);
+}
+
+// --- stars: a tier is earned, and the floor is 1 -------------------------
+{
+  check("stars: one glowing review does not promote a hotel", starsFromReputation(1000, 1) === 1);
+  check("stars: enough good reviews reach 2", starsFromReputation(750, 5) === 2);
+  check("stars: a mediocre record stays at 1", starsFromReputation(400, 9) === 1);
+  check(
+    `stars: capped at MAX_STARS (${MAX_STARS}) this phase, because that is how far the CONTENT goes`,
+    starsFromReputation(1000, 50) === MAX_STARS,
+  );
+  check("stars: the floor is 1, never 0 (the recoverable one-man show)", starsFromReputation(0, 50) === 1);
+}
+
+// --- demand: price, reputation and stars move capture the right way ------
+{
+  const cheap = capturePermille(3000, 6000, 500, 1);
+  const dear = capturePermille(12000, 6000, 500, 1);
+  check("demand: a cheaper rate captures more of a segment", cheap > dear);
+  const liked = capturePermille(6000, 6000, 900, 1);
+  const disliked = capturePermille(6000, 6000, 100, 1);
+  check("demand: a better-liked hotel captures more at the same price", liked > disliked);
+  check("demand: a star tier is worth something", capturePermille(6000, 6000, 500, 2) > capturePermille(6000, 6000, 500, 1));
+  check(
+    "demand: capture stays in 0..1000 at the extremes",
+    capturePermille(MAX_RATE_MINOR, 1000, 0, 1) >= 0 && capturePermille(MIN_RATE_MINOR, 25000, 1000, 5) <= 1000,
+  );
+  check(
+    "demand: every capture value is an integer (no floats reach sim state)",
+    [cheap, dear, liked, disliked].every((v) => Number.isInteger(v)),
+  );
+
+  // Draw-at-generation: the same Rng state produces the same day.
+  const one = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE);
+  const two = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE);
+  check("demand: arrivalsForDay is deterministic for a given Rng state", JSON.stringify(one) === JSON.stringify(two));
+  check(
+    "demand: arrivals are integers and bounded by the segment pools",
+    Object.keys(one).every((k) => Number.isInteger(one[k]) && one[k] >= 0 && one[k] <= SEGMENT_POOL[k]),
+  );
+}
+
+// --- pricing bounds ------------------------------------------------------
+{
+  check("pricer: the opening rates are valid", isValidRate(5000) && isValidRate(8000));
+  check("pricer: below the floor is invalid", !isValidRate(MIN_RATE_MINOR - RATE_STEP_MINOR));
+  check("pricer: above the ceiling is invalid", !isValidRate(MAX_RATE_MINOR + RATE_STEP_MINOR));
+  check("pricer: an off-step rate is invalid", !isValidRate(MIN_RATE_MINOR + 1));
+  check("pricer: a non-integer rate is invalid", !isValidRate(5000.5));
+}
+
+// --- objectives: sim-derived targets, no punishment ----------------------
+{
+  const specs = generateObjectives(new Rng("obj-1"), 6, 4);
+  check("objectives: exactly three are posted", specs.length === 3);
+  check(
+    "objectives: every target is a positive integer and every reward is a positive integer",
+    specs.every((o) => Number.isInteger(o.target) && o.target >= 1 && Number.isInteger(o.rewardMinor) && o.rewardMinor > 0),
+  );
+  check(
+    "objectives: the check-in target never exceeds what could actually arrive",
+    specs.find((o) => o.kind === "check-in-guests").target <= 6,
+  );
+  check(
+    "objectives: the fraud objective is always 1 — never a quota that punishes a clean day",
+    specs.find((o) => o.kind === "catch-fraud").target === 1,
+  );
+  check(
+    "objectives: generation is deterministic for a given Rng state",
+    JSON.stringify(generateObjectives(new Rng("obj-1"), 6, 4)) === JSON.stringify(specs),
+  );
+  // A slow day must not post an impossible target.
+  const slow = generateObjectives(new Rng("obj-2"), 1, 4);
+  check("objectives: a one-arrival day posts a reachable check-in target", slow.find((o) => o.kind === "check-in-guests").target === 1);
+}
+
+// --- the audit recomputes from truth, and survives a restore -------------
+{
+  const sim = new Sim("hotel-h2-audit-1");
+  setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+
+  // Plant a week of strong reviews directly — the audit's job is to
+  // RECOMPUTE from these, so they are the input under test.
+  for (let i = 0; i < 5; i++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "review", { day: 1, segment: "business", score: 5, factors: [] });
+  }
+  const untilRollover = 6000 - sim.tick;
+  for (let t = 0; t < untilRollover; t++) sim.step();
+
+  const hotel = sim.getComponent(hotelEntity, "hotel");
+  check("audit: stars recomputed from the review window (5x five-star -> 2 stars)", hotel.stars === 2);
+  check("audit: repBySegment recomputed and non-default", hotel.repBySegment.business === 1000);
+  const starsChanged = sim.eventsSince(0).filter((e) => e.type === "hotel.starsChanged");
+  check("audit: hotel.starsChanged {1 -> 2} fired exactly once", starsChanged.length === 1 && starsChanged[0].payload.from === 1 && starsChanged[0].payload.to === 2);
+  const audit = sim.eventsSince(0).find((e) => e.type === "econ.audit");
+  check(
+    "audit: econ.audit carries stars, repBySegment, forecastArrivals, objectives and the printed hire threshold",
+    audit !== undefined &&
+      audit.payload.stars === 2 &&
+      typeof audit.payload.repBySegment === "object" &&
+      typeof audit.payload.forecastArrivals === "number" &&
+      Array.isArray(audit.payload.objectives) &&
+      audit.payload.objectives.length === 3 &&
+      audit.payload.hireThresholdMinor > 0,
+  );
+  check("audit: three objectives posted for the new day", [...sim.withComponent("objective")].length === 3);
+  check(
+    "audit: objective.posted fired once per objective",
+    sim.eventsSince(0).filter((e) => e.type === "objective.posted").length === 3,
+  );
+
+  // Recompute-from-truth means a restore mid-week is trivially correct: a
+  // fresh sim restored to this snapshot recomputes the SAME stars at the
+  // next audit, because nothing was accumulated anywhere.
+  const snapshot = sim.snapshot();
+  const restored = new Sim("hotel-h2-audit-1");
+  setupWithConfig(restored, { guestCount: 0, spawnTickMin: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+  restored.restore(snapshot);
+  check("audit: the restored sim hashes identically", restored.stateHash() === snapshot.stateHash);
+  for (let t = 0; t < 6000; t++) {
+    sim.step();
+    restored.step();
+  }
+  check(
+    "audit: a sim restored mid-week recomputes the identical stars and reputation a day later",
+    sim.stateHash() === restored.stateHash() &&
+      sim.getComponent(hotelEntity, "hotel").stars === restored.getComponent(hotelEntity, "hotel").stars,
+  );
+}
+
+// --- wages appear on the expense line only once someone is hired ---------
+{
+  const sim = new Sim("hotel-h2-wages-1");
+  setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+  for (let t = sim.tick; t < 6000; t++) sim.step();
+  const beforeStaffEntries = [...sim.withComponent("ledgerEntry")].filter(([, e]) => e.debitAccount === "expense:staff");
+  check("wages: no staff expense line before anyone is hired", beforeStaffEntries.length === 0);
+
+  const clerk = sim.spawn();
+  sim.setComponent(clerk, "staffed", {
+    job: "clerk",
+    wage: 2500,
+    skillPermille: 800,
+    moralePermille: 500,
+    quirk: "hums",
+    hiredDay: 2,
+    seed: 7,
+  });
+  for (let t = sim.tick; t < 12000; t++) sim.step();
+  const staffEntries = [...sim.withComponent("ledgerEntry")].filter(([, e]) => e.debitAccount === "expense:staff");
+  check("wages: a hired clerk's wage lands on the expense line at the next audit", staffEntries.length === 1 && staffEntries[0][1].amountMinor === 2500);
 }
 
 if (failures > 0) {

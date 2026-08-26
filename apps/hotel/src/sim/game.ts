@@ -61,6 +61,10 @@ import type {
   NoticeList,
   Mess,
   Prop,
+  Review,
+  Objective,
+  Staffed,
+  Mail,
   SaveRestoreDebug,
 } from "./components.js";
 import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
@@ -74,6 +78,24 @@ import {
   type ResFields,
 } from "./rules.js";
 import { pickArchetype, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
+import {
+  scoreReview,
+  reputationBySegment,
+  overallReputation,
+  starsFromReputation,
+  REVIEW_WINDOW_DAYS,
+  DEFAULT_REP_PERMILLE,
+  type ReviewRow,
+} from "./reviews.js";
+import {
+  arrivalsForDay,
+  totalArrivals,
+  generateObjectives,
+  OBJECTIVE_KINDS,
+  HIRE_THRESHOLD_MINOR,
+  DAILY_UTILITIES_MINOR as UTILITIES_MINOR,
+  DAILY_OVERHEAD_MINOR,
+} from "./economy.js";
 import { hotelShell, buildScreenWorldView } from "./screen.js";
 import type { ScreenInput, ScreenEffect } from "@claude-engine/surface-ui";
 
@@ -169,8 +191,12 @@ const HEADON_Z_HALF_SPAN = 3;
  *  it back through a number key would silently miss. */
 const DEFAULT_RATE_BY_TIER: Record<string, number> = { "1": 5000, "2": 8000 };
 const ROOM_RATE_MINOR: Record<number, number> = { 1: 5000, 2: 8000 };
-const DAILY_WAGES_MINOR = 3000;
-const DAILY_UTILITIES_MINOR = 1500;
+/** H1 shipped a flat "wages" line even with no staff. H2a splits it: the
+ *  owner's own draw is overhead, and WAGES are the sum of the `staffed`
+ *  components — so hiring shows up on the expense line as a real change,
+ *  which is the whole point of the first-hire beat's economics. */
+const DAILY_WAGES_MINOR = DAILY_OVERHEAD_MINOR;
+const DAILY_UTILITIES_MINOR = UTILITIES_MINOR;
 
 /** Housekeeping/maintenance content (docs/PHASE-H2.md §9, open question 2).
  *  Comedy flavour only — no system reads the kind. */
@@ -229,6 +255,12 @@ export interface ScenarioConfig {
    *  opposite of what those gates are for. The shipped default is true,
    *  and `zen-clean` / `one-man-week` are what verify it. */
   upkeep: boolean;
+  /** H2a arrivals. "fixed" is H1's schedule (`guestCount` guests, first at
+   *  `spawnTickMin`, then every 50-150 ticks) — pinned by the H1 gates so
+   *  their spawn streams stay byte-identical (determinism rule 8).
+   *  "demand" is the shipped path: a per-day quota computed at the rollover
+   *  from price, per-segment reputation and stars. */
+  arrivals: "fixed" | "demand";
 }
 
 // H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
@@ -246,6 +278,7 @@ export const DEFAULTS: ScenarioConfig = {
   fraudRatePermille: 0,
   fixture: "normal",
   upkeep: true,
+  arrivals: "demand",
 };
 
 function wrapMdeg(mdeg: number): number {
@@ -303,9 +336,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   const staffRng = sim.forkRng("staff");
   const objectivesRng = sim.forkRng("objectives");
   const upkeepRng = sim.forkRng("upkeep");
-  void demandRng;
   void staffRng;
-  void objectivesRng;
 
   // -- Player (as H0) ------------------------------------------------------
   const player = sim.spawn(); // == PLAYER_ENTITY: first entity spawned
@@ -417,7 +448,15 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     stars: 1,
     repBySegment: {},
     rateByTier: { ...DEFAULT_RATE_BY_TIER },
-    arrivalsToday: 0,
+    // Day 1 has no rollover behind it, so its quota is drawn here — the
+    // same call, the same fork, one day earlier. Without this the shipped
+    // demand path would open on an empty first day.
+    arrivalsToday:
+      config.arrivals === "demand"
+        ? totalArrivals(
+            arrivalsForDay(demandRng, { ...DEFAULT_RATE_BY_TIER }, {}, 1, DEFAULT_REP_PERMILLE)
+          )
+        : 0,
     arrivalsSpawned: 0,
     hireUnlocked: false,
   });
@@ -661,7 +700,11 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     if (!hotel) return;
     // Check-in phases: morning (0) and day (1).
     if (hotel.phaseId !== 0 && hotel.phaseId !== 1) return;
-    if (hotel.guestsSpawned >= config.guestCount) return;
+    if (config.arrivals === "demand") {
+      if (hotel.arrivalsSpawned >= hotel.arrivalsToday) return;
+    } else if (hotel.guestsSpawned >= config.guestCount) {
+      return;
+    }
     if (s.tick < hotel.nextGuestAtTick) return;
 
     const archetype = pickArchetype(guestSpawnRng);
@@ -752,6 +795,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     s.setComponent<Hotel>(hotelEntity, "hotel", {
       ...hotel,
       guestsSpawned: hotel.guestsSpawned + 1,
+      arrivalsSpawned: hotel.arrivalsSpawned + 1,
       nextGuestAtTick: s.tick + interval,
     });
   }
@@ -780,7 +824,17 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       const d = a[1].queueIndex - b[1].queueIndex;
       return d !== 0 ? d : a[0] - b[0];
     });
-    active.forEach(([entity, guest], i) => {
+    // Queue time is a stay FACT, accumulated on the guest and cashed out
+    // once at the checkout review. Not a meter, not visible, not a running
+    // score — day-granularity consequences (DESIGN §6).
+    for (const [entity, guest] of active) {
+      s.setComponent<Guest>(entity, "guest", { ...guest, waitedTicks: guest.waitedTicks + 1 });
+    }
+    const activeAfterWait: [EntityId, Guest][] = active.map(([entity]) => [
+      entity,
+      s.getComponent<Guest>(entity, "guest")!,
+    ]);
+    activeAfterWait.forEach(([entity, guest], i) => {
       if (guest.queueIndex === i) return;
       s.setComponent<Guest>(entity, "guest", { ...guest, queueIndex: i });
       // ...and WALK to the new slot. Compacting `queueIndex` without
@@ -864,6 +918,16 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       setGoal(s, entity, streetCell.cx, streetCell.cz);
       s.emit("guest.checkedOut", { guestEntity: entity });
     }
+  }
+
+  /** Post one piece of mail. MAILBOX content is world state, created by
+   *  the systems that have something to say; `read` is set by the player's
+   *  `mailbox.read` effect and by nothing else. Bulletins take effect at
+   *  DELIVERY, never on read — see mailSystem. */
+  function queueMail(s: Sim, day: number, kind: Mail["kind"], subjectKey: string, fields: Record<string, string>): void {
+    const entity = s.spawn();
+    s.setComponent<Mail>(entity, "mail", { day, kind, subjectKey, fields, read: false });
+    s.emit("mail.delivered", { mailEntity: entity, kind, day });
   }
 
   /** Is this room sellable right now? Vacant, wiped, and not carrying a
@@ -1393,8 +1457,12 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         accepted: true,
         roomEntity,
       });
-      const rate = ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
+      // The live rate is whatever PRICER last set for this tier; the
+      // committed opening table is the fallback for a tier PRICER has never
+      // touched.
+      const rate = hotel.rateByTier[String(room.tier)] ?? ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
       s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash + rate });
+      s.setComponent<Guest>(res.guestEntity, "guest", { ...guest, paidMinor: rate });
       const ledger = s.spawn();
       s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
         day: hotel.day,
@@ -1516,6 +1584,44 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  // 14. reviewSystem — one review per checkout, scored from integer stay
+  //     facts. Runs after guestBrainSystem (which emits guest.checkedOut
+  //     earlier in the same tick), so this tick's checkouts are visible in
+  //     the event log by the time we read it.
+  function reviewSystem(s: Sim): void {
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    for (const event of s.eventsSince(s.tick)) {
+      if (event.type !== "guest.checkedOut") continue;
+      const guestEntity = (event.payload as { guestEntity: EntityId }).guestEntity;
+      const guest = s.getComponent<Guest>(guestEntity, "guest");
+      if (!guest) continue;
+      const tierBaseline = ROOM_RATE_MINOR[1]!;
+      const outcome = scoreReview({
+        waitedTicks: guest.waitedTicks,
+        brokenPropNights: guest.brokenPropNights,
+        paidMinor: guest.paidMinor,
+        tierBaselineMinor: tierBaseline,
+      });
+      const reviewEntity = s.spawn();
+      s.setComponent<Review>(reviewEntity, "review", {
+        day: hotel.day,
+        segment: guest.segment,
+        score: outcome.score,
+        factors: outcome.factors,
+      });
+      s.emit("guest.reviewed", { guestEntity, score: outcome.score, segment: guest.segment, factors: outcome.factors });
+      if (outcome.score <= 2) {
+        s.emit("guest.complained", { guestEntity, score: outcome.score, segment: guest.segment, factors: outcome.factors });
+        queueMail(s, hotel.day, "complaint", "mail.complaint", {
+          segment: guest.segment,
+          score: String(outcome.score),
+          factors: outcome.factors.join(","),
+        });
+      }
+    }
+  }
+
   // 13. upkeepSystem — breakage rolls at the day rollover, one draw per
   //     prop from forkRng("upkeep"). A broken prop is a broken prop: it
   //     never worsens, never spreads, and never becomes a flood (incident
@@ -1555,18 +1661,75 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   function economySystem(s: Sim): void {
     const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
     if (!hotel) return;
+
+    // Objective progress, every tick, from THIS tick's events. Progress
+    // lives on the component (never a closure counter), so a mid-day
+    // restore() resumes with exactly the progress the snapshot recorded.
+    const todaysEvents = s.eventsSince(s.tick);
+    if (todaysEvents.length > 0) {
+      for (const [entity, objective] of [...s.withComponent<Objective>("objective")]) {
+        if (objective.done || objective.day !== hotel.day) continue;
+        const template = OBJECTIVE_KINDS.find((t) => t.kind === objective.kind);
+        if (!template) continue;
+        let hits = 0;
+        for (const event of todaysEvents) if (event.type === template.event) hits++;
+        if (hits === 0) continue;
+        const progress = objective.progress + hits;
+        const done = progress >= objective.target;
+        s.setComponent<Objective>(entity, "objective", { ...objective, progress, done });
+        if (done) s.emit("objective.completed", { objectiveEntity: entity, kind: objective.kind, day: objective.day });
+      }
+    }
+
     const { day: newDay } = computePhase(s.tick);
     if (newDay === hotel.day) return; // no rollover this tick
-    const expense = DAILY_WAGES_MINOR + DAILY_UTILITIES_MINOR;
-    s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash - expense });
-    const wages = s.spawn();
-    s.setComponent<LedgerEntry>(wages, "ledgerEntry", {
+
+    // Settle the day's objectives: completed ones pay, missed ones just
+    // close. There is no penalty for a missed objective anywhere in this
+    // system — "punishing absence" is on the explicit avoid-list.
+    let rewardTotal = 0;
+    for (const [entity, objective] of [...s.withComponent<Objective>("objective")]) {
+      if (objective.day !== hotel.day) continue;
+      if (!objective.done) {
+        s.emit("objective.failed", { objectiveEntity: entity, kind: objective.kind, day: objective.day });
+        continue;
+      }
+      rewardTotal += objective.rewardMinor;
+    }
+    if (rewardTotal > 0) {
+      const reward = s.spawn();
+      s.setComponent<LedgerEntry>(reward, "ledgerEntry", {
+        day: hotel.day,
+        debitAccount: "cash",
+        creditAccount: "revenue:objectives",
+        amountMinor: rewardTotal,
+        memo: "daily objectives",
+      });
+    }
+
+    let wagesMinor = 0;
+    for (const [, staffed] of s.withComponent<Staffed>("staffed")) wagesMinor += staffed.wage;
+    const expense = DAILY_WAGES_MINOR + DAILY_UTILITIES_MINOR + wagesMinor;
+
+    s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash - expense + rewardTotal });
+    const overhead = s.spawn();
+    s.setComponent<LedgerEntry>(overhead, "ledgerEntry", {
       day: hotel.day,
       debitAccount: "expense:wages",
       creditAccount: "cash",
       amountMinor: DAILY_WAGES_MINOR,
       memo: "daily wages",
     });
+    if (wagesMinor > 0) {
+      const staffWages = s.spawn();
+      s.setComponent<LedgerEntry>(staffWages, "ledgerEntry", {
+        day: hotel.day,
+        debitAccount: "expense:staff",
+        creditAccount: "cash",
+        amountMinor: wagesMinor,
+        memo: "staff wages",
+      });
+    }
     const utilities = s.spawn();
     s.setComponent<LedgerEntry>(utilities, "ledgerEntry", {
       day: hotel.day,
@@ -1590,15 +1753,80 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       let expenseMinor = 0;
       for (const [, entry] of s.withComponent<LedgerEntry>("ledgerEntry")) {
         if (entry.day !== hotel.day) continue;
-        if (entry.creditAccount === "revenue:rooms") revenueMinor += entry.amountMinor;
+        if (entry.creditAccount.startsWith("revenue:")) revenueMinor += entry.amountMinor;
         if (entry.debitAccount.startsWith("expense:")) expenseMinor += entry.amountMinor;
       }
-      s.emit("econ.audit", { day: hotel.day, revenueMinor, expenseMinor, closingCashMinor: hotel.cash });
+
+      // Reputation and stars: RECOMPUTED from the rolling review window,
+      // never accumulated. A mid-week restore() is trivially correct
+      // because there is no running total to be out of step with.
+      const windowRows: ReviewRow[] = [];
+      for (const [, review] of s.withComponent<Review>("review")) {
+        windowRows.push({ day: review.day, segment: review.segment, score: review.score });
+      }
+      const repBySegment = reputationBySegment(windowRows, hotel.day);
+      const reviewsInWindow = windowRows.filter((r) => r.day > hotel.day - REVIEW_WINDOW_DAYS).length;
+      const stars = starsFromReputation(overallReputation(repBySegment), reviewsInWindow);
+      if (stars !== hotel.stars) s.emit("hotel.starsChanged", { from: hotel.stars, to: stars, day: hotel.day });
+
+      // Tomorrow's demand, then tomorrow's objectives. Both draw ONCE,
+      // here, at generation time (H2 determinism rule 3).
+      const arrivalsBySegment =
+        config.arrivals === "demand"
+          ? arrivalsForDay(demandRng, hotel.rateByTier, repBySegment, stars, DEFAULT_REP_PERMILLE)
+          : {};
+      const forecastArrivals = config.arrivals === "demand" ? totalArrivals(arrivalsBySegment) : 0;
+
+      const roomCount = [...s.withComponent<RoomUnit>("roomUnit")].length;
+      const objectiveSpecs = generateObjectives(objectivesRng, Math.max(1, forecastArrivals), roomCount);
+      const objectivePayload: { kind: string; target: number; rewardMinor: number }[] = [];
+      for (const spec of objectiveSpecs) {
+        const entity = s.spawn();
+        s.setComponent<Objective>(entity, "objective", {
+          day: newDay,
+          kind: spec.kind,
+          target: spec.target,
+          progress: 0,
+          done: false,
+          rewardMinor: spec.rewardMinor,
+        });
+        objectivePayload.push({ kind: spec.kind, target: spec.target, rewardMinor: spec.rewardMinor });
+        s.emit("objective.posted", { objectiveEntity: entity, kind: spec.kind, target: spec.target, day: newDay });
+      }
+
+      const hireUnlocked = hotel.hireUnlocked || hotel.cash >= HIRE_THRESHOLD_MINOR;
+      if (hireUnlocked && !hotel.hireUnlocked) {
+        s.emit("econ.hireUnlocked", { day: hotel.day, thresholdMinor: HIRE_THRESHOLD_MINOR });
+      }
+
+      // The audit is the ritual close AND the "one more day" hook: the
+      // forecast line is the hook, and the STAFF BUDGET gap is printed
+      // whether or not it has been reached (DESIGN §6 transparency).
+      s.emit("econ.audit", {
+        day: hotel.day,
+        revenueMinor,
+        expenseMinor,
+        closingCashMinor: hotel.cash,
+        stars,
+        repBySegment,
+        forecastArrivals,
+        objectives: objectivePayload,
+        hireUnlocked,
+        hireThresholdMinor: HIRE_THRESHOLD_MINOR,
+      });
+
       s.setComponent<Hotel>(hotelEntity, "hotel", {
         ...hotel,
         day: newDay,
         phaseId: newPhaseId,
         phaseStartTick: s.tick,
+        stars,
+        repBySegment,
+        arrivalsToday: forecastArrivals,
+        arrivalsSpawned: 0,
+        guestsSpawned: config.arrivals === "demand" ? 0 : hotel.guestsSpawned,
+        nextGuestAtTick: s.tick + config.spawnTickMin,
+        hireUnlocked,
       });
     } else if (newPhaseId !== hotel.phaseId) {
       s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, phaseId: newPhaseId, phaseStartTick: s.tick });
@@ -1660,6 +1888,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.addSystem(deskSystem);
   sim.addSystem(screenSystem);
   sim.addSystem(upkeepSystem);
+  sim.addSystem(reviewSystem);
   sim.addSystem(economySystem);
   sim.addSystem(dayPhaseSystem);
   sim.addSystem(cleanupSystem);

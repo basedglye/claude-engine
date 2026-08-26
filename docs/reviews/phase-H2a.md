@@ -92,3 +92,56 @@ Nothing blocking. The one genuinely new residual this review found — the write
 6. **Phase 3+ carries, triggers unchanged:** `space` A* extraction (second consumer/crowd scale); doors; `debug.*` server rejection (Phase 5, before any remote actor).
 
 **Phase H2a is clear to merge to `main`.**
+
+---
+
+## Post-verdict addendum (implementer, before merge)
+
+The verdict is PASS and none of the five items blocked. Four of them were
+cheap enough that carrying them would have been laziness rather than
+scheduling, so they were closed on this branch before the merge. This
+section is the implementer's record of what changed after the verdict
+commit; the verdict above is untouched.
+
+**Item 1 — objectives are now on a screen.** AUDIT paints the day's three
+objectives with their targets, progress, rewards and a done marker, plus
+the line "A missed objective costs nothing." (the no-penalty ruling, said
+out loud rather than merely implemented). `screen-data.ts`'s budget table
+was already claiming AUDIT read the key; it is now true rather than
+corrected away, because the reviewer is right that a sim-real feature no
+screen shows is the "verified but invisible" shape this project keeps
+catching.
+
+**Item 2 — the healing window is documented honestly AND narrowed.** The
+comment on `stateHashSlow()` now states the limit the review measured: a
+violator is caught only while its stale digest is still cached, so one that
+is the entry's LAST writer is caught (the permanent, dangerous class) and
+one followed by any normal write to the same entry is not. Beyond
+documenting it, the harness now cross-checks every
+`HASH_CROSSCHECK_INTERVAL_TICKS` (500) as well as at the end, on BOTH the
+live and the replay legs, and the first divergence wins over a later
+agreement. Verified against the review's own P1 — the perturbation that
+went undetected: `applyDeskDecision`'s cash write converted to in-place
+`hotel.cash = hotel.cash + rate` in the built sim now makes
+`checkin-rush --verify-replay` exit 3 on both legs with the divergence
+message, where before it exited 0 clean. Restored by clean rebuild and
+re-verified green. The window is bounded to 500 ticks, not closed; closing
+it means the full walk every tick, which is the cost the change exists to
+remove, and the comment says so.
+
+**Item 3 — `available: false` is now an infra failure.** The browser leg
+exits 2 with a message naming the cause if the page's world does not expose
+`stateHashSlow()`. "The check could not run" is no longer reported as "the
+check passed".
+
+**Item 4 — the perf methodology is recorded** in ARCHITECTURE B8, beside
+the numbers: the harness's single-run `avgTickMs` is cold-start dominated,
+warm in-process medians are what before/after comparisons must use, and
+both the carried `checkin-rush` figure and `one-man-week`'s 0.446 are
+written down with the method that produced them.
+
+**Item 5** needed no action and stands as recorded.
+
+The H2b deferral list above is therefore reduced to items 1, 5 and 6 —
+the upkeep-click browser gate, the H1b carries, and the Phase 3+ carries.
+

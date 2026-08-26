@@ -298,6 +298,20 @@ async function runBrowserMode(
   };
 
   if (shouldVerifyReplay) {
+    // A page world with no stateHashSlow reports `available: false`
+    // honestly, but nothing downstream reads it — so the browser leg of the
+    // write-through invariant would evaporate silently the day an app hands
+    // the hook a wrapper IWorld instead of its Sim. Infra failure, exit 2:
+    // "the check could not run" is not "the check passed".
+    if (!result.browser.liveHashCheck.available) {
+      console.error(
+        `Browser-mode infra failure for "${scenario.name}": the page's world does not expose stateHashSlow(), ` +
+          `so the incremental-hash cross-check (CLAUDE.md invariant 6) cannot run there. ` +
+          `Hand the test hook the real Sim, or this leg of --verify-replay is vacuous.`
+      );
+      process.exit(2);
+      return;
+    }
     const check = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands, result.browser.finalTick);
     verdict.replayCheck = { verified: check.verified, expectedHash: check.expectedHash, actualHash: check.actualHash };
     verdict.hashCheck = {

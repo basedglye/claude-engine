@@ -241,6 +241,26 @@ export class Sim implements IWorld {
    * (see stateHash()'s contract note), which is a P0 determinism bug, not a
    * hashing detail. Kept as the --verify slow path per ARCHITECTURE B8's
    * fix-order item 2.
+   *
+   * WHAT THIS DETECTOR DOES NOT CATCH — stated precisely, because the first
+   * version of this comment understated it and the H2a review proved it
+   * (verdict item 2). Comparing the two hashes at a point in time catches an
+   * in-place mutation only while the stale digest is still cached. Any later
+   * LEGITIMATE setComponent() on the same (component, entity) invalidates
+   * the entry, the next hash recomputes it from the already-mutated object,
+   * and the violation heals silently. So:
+   *
+   *   - a violator that is the entry's LAST writer before the check is
+   *     caught — and that is the dangerous class, because its staleness is
+   *     permanent;
+   *   - a violator followed by any normal write to the same entry is not.
+   *
+   * The harness therefore cross-checks periodically as well as at the end
+   * (see HASH_CROSSCHECK_INTERVAL_TICKS in @claude-engine/harness), which
+   * shrinks the window to that interval rather than the whole run. It does
+   * not close it: closing it means running the full walk every tick, which
+   * is the cost this whole change exists to remove. The rule is enforced by
+   * review and by house style; this is the backstop, not the proof.
    */
   stateHashSlow(): number {
     return this.combineStateHash(false);

@@ -131,7 +131,8 @@ export interface ScreenViewData {
   ledger: ScreenLedgerView;
   /** Closed days, ascending. */
   ledgerDays: ScreenLedgerDayView[];
-  /** Today's objectives, in posting order. */
+  /** Today's objectives, in posting order. Painted by AUDIT — the night
+   *  ritual is where every other day-granularity fact lands. */
   objectives: ScreenObjectiveView[];
   pricing: ScreenPricingView;
   /** Newest first — the order MAILBOX lists them in. */

@@ -4,6 +4,7 @@
  * interaction, is acceptable."). Pure, same purity root as reserva-app.ts.
  */
 import type { PaintNode, ScreenAppDef } from "@claude-engine/surface-ui";
+import { GLYPH_H } from "@claude-engine/surface-ui";
 import type { ScreenViewData } from "./screen-data.js";
 
 /** No interactive state to hash beyond a placeholder — AUDIT has no
@@ -38,6 +39,32 @@ export const auditApp: ScreenAppDef<AuditState> = {
     nodes.push({ kind: "text", x: 8, y: 48, text: `Expenses: ${ledger.expenseMinor}`, color: 10 });
     nodes.push({ kind: "hline", x: 8, y: 60, w: 200, color: 14 });
     nodes.push({ kind: "text", x: 8, y: 68, text: `Closing cash: ${ledger.closingCashMinor}`, color: 8 });
+
+    // The day's objectives. Added in the H2a review pass: they were sim-real
+    // — posted, progressed, settled, carried in `econ.audit`'s payload and
+    // gate-asserted — and shown on no screen at all, which is the
+    // "verified but invisible" shape this project keeps catching. The audit
+    // is where every other day-granularity fact lands, so it is where these
+    // belong. Targets and rewards are printed verbatim: the player is meant
+    // to know exactly what earns what (DESIGN §6).
+    nodes.push({ kind: "text", x: 8, y: 92, text: "TODAY'S OBJECTIVES", color: 12 });
+    if (data.objectives.length === 0) {
+      nodes.push({ kind: "text", x: 8, y: 108, text: "None posted.", color: 14 });
+      return nodes;
+    }
+    let y = 108;
+    for (const objective of data.objectives) {
+      const mark = objective.done ? "[x]" : "[ ]";
+      nodes.push({
+        kind: "text",
+        x: 8,
+        y,
+        text: `${mark} ${objective.kind}: ${objective.progress}/${objective.target} - pays ${objective.rewardMinor}`,
+        color: objective.done ? 9 : 8,
+      });
+      y += GLYPH_H + 4;
+    }
+    nodes.push({ kind: "text", x: 8, y: y + 4, text: "A missed objective costs nothing.", color: 14 });
     return nodes;
   },
 };

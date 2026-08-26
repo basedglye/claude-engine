@@ -42,6 +42,7 @@ import {
   arrivalsForDay,
   generateObjectives,
   isValidRate,
+  OBJECTIVE_KINDS,
   SEGMENT_POOL,
   MIN_RATE_MINOR,
   MAX_RATE_MINOR,
@@ -920,6 +921,19 @@ function focusTerminal(sim, terminalEntity) {
         // screen. Worst case is the highest reachable tier.
         stars: MAX_STARS,
         ledger: { day: 99999, revenueMinor: 999999999, expenseMinor: 999999999, closingCashMinor: -999999999 },
+        // AUDIT paints the day's objectives as of the H2a review pass, so a
+        // view WITHOUT this key stops testing the widest rows on that
+        // screen — the same silent hole the missing `stars` key opened in
+        // RESERVA. Worst case is three objectives with the longest kind
+        // slug and absurd figures.
+        objectives: OBJECTIVE_KINDS.map((t) => ({
+          day: 99999,
+          kind: t.kind,
+          target: 999999,
+          progress: 999999,
+          done: false,
+          rewardMinor: 999999999,
+        })),
       },
     };
   }
@@ -938,8 +952,12 @@ function focusTerminal(sim, terminalEntity) {
   if (reservaViolations.length > 0) console.log(JSON.stringify(reservaViolations, null, 2));
 
   const auditNodes = auditApp.paintSpec(auditApp.init(), view);
+  check(
+    "overflow-gate setup: the worst-case AUDIT paint actually contains all three objective rows",
+    OBJECTIVE_KINDS.every((t) => JSON.stringify(auditNodes).includes(t.kind)),
+  );
   const auditViolations = findOverflowingNodes(auditNodes);
-  check("AUDIT: worst-case ledger figures have zero surface overflows", auditViolations.length === 0);
+  check("AUDIT: worst-case ledger figures and objective rows have zero surface overflows", auditViolations.length === 0);
   if (auditViolations.length > 0) console.log(JSON.stringify(auditViolations, null, 2));
 
   // Negative control: the checker must actually be capable of catching an

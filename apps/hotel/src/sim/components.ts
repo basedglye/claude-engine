@@ -35,9 +35,23 @@ export interface Player {
   actor: string;
 }
 
+/** H2a — the actor-identity component (docs/PHASE-H2.md §6, ARCHITECTURE
+ *  B9). Any system resolving "who acted" scans THIS, never `player`: the
+ *  human's avatar carries `player` AND `actorId{actor:"player"}`, a hired
+ *  clerk carries `actorId{actor:"staff:<entity>"}` and no `player`. That is
+ *  what makes the second actor kind a data difference instead of a code
+ *  branch — nothing in a decision or validation path may test for the
+ *  literal "player". */
+export interface ActorId {
+  actor: string;
+}
+
 /** H1a widens `interactable.kind`: "door" (H0), "terminal" (the front-desk
  *  terminal), "guest" (a presenting-eligible guest at the queue head). */
-export type InteractableKind = "door" | "terminal" | "guest";
+/** H2a widens `interactable.kind` again: "mess" (wipe), "prop" (repair
+ *  step), "candidate" (begin the interview), "document" (pick up / put down
+ *  a printed resume). */
+export type InteractableKind = "door" | "terminal" | "guest" | "mess" | "prop" | "candidate" | "document";
 export interface Interactable {
   kind: InteractableKind;
   xMm: number;
@@ -61,6 +75,14 @@ export interface Guest {
    *  guestBrainSystem — never cached elsewhere (see game.ts). */
   queueIndex: number;
   patienceTicks: number;
+  /** H2a stay facts, integer, accumulated on the guest and cashed out ONCE
+   *  by `reviewSystem` at checkout (never a running score, never a meter
+   *  the player can see mid-stay — DESIGN's day-granularity ruling). */
+  waitedTicks: number;
+  brokenPropNights: number;
+  /** What this stay was actually charged, in minor units — the review
+   *  compares it against the tier baseline. 0 until check-in. */
+  paidMinor: number;
 }
 
 export interface PathCell {
@@ -91,7 +113,10 @@ export interface NavAgent {
   avoidCz: number;
 }
 
-export type DocType = "id" | "resSlip";
+/** H2a widens `DocType` with "resume" — a candidate's printed resume is a
+ *  real document entity on the printer tray, picked up and read through the
+ *  exact held-item path IDs already use. */
+export type DocType = "id" | "resSlip" | "resume";
 export interface DocumentComp {
   docType: DocType;
   fields: Record<string, string>;
@@ -115,6 +140,95 @@ export interface RoomUnit {
   tier: number;
   /** 0 = vacant. */
   occupantEntity: number;
+  /** How many `mess` entities currently sit in this room. Kept in step by
+   *  the systems that spawn and despawn messes; the hotel suite asserts it
+   *  against a live `mess` scan so the two can never quietly diverge.
+   *  Check-in eligibility is `occupantEntity === 0 && messCount === 0 && no
+   *  broken prop in the room`. */
+  messCount: number;
+}
+
+/** H2a — one discrete, visible piece of mess left by a checkout. `interact`
+ *  removes it: one wipe, one object gone. There is deliberately NO
+ *  timestamp field anywhere in this shape — nothing here CAN decay,
+ *  compound or expire, which is how DESIGN's zen ruling ("no per-room
+ *  timer") is enforced by construction rather than by discipline. */
+export interface Mess {
+  roomEntity: number;
+  kind: string;
+}
+
+/** H2a — one breakable prop per bedroom. Repair is N `interact` presses;
+ *  again, no timestamp: a broken prop never worsens and never cascades. */
+export interface Prop {
+  kind: string;
+  roomEntity: number;
+  broken: boolean;
+  repairProgress: number;
+}
+
+/** H2a — a hired staff member. `seed` feeds the STATELESS decision-error
+ *  hash (never an Rng draw: decision frequency must not perturb a stream —
+ *  H2 determinism rule 3). `moralePermille` exists as data and is read by
+ *  no system this phase, by design. */
+export interface Staffed {
+  job: "clerk";
+  wage: number;
+  skillPermille: number;
+  moralePermille: number;
+  quirk: string;
+  hiredDay: number;
+  seed: number;
+}
+
+export type CandidateState = "arriving" | "waiting" | "interviewing" | "hired" | "rejected";
+
+/** H2a — a job candidate NPC. Walks in the street door like a guest, waits
+ *  in the lobby instead of queueing, and is interviewed in person. */
+export interface Candidate {
+  wageAsk: number;
+  skillPermille: number;
+  quirk: string;
+  state: CandidateState;
+  /** The `document` entity holding this candidate's printed resume, or 0. */
+  resumeEntity: number;
+}
+
+/** H2a — one review, spawned at checkout. Reputation and stars are
+ *  RECOMPUTED from a rolling window of these at each audit, never
+ *  accumulated in place, so a mid-week restore() is trivially correct. */
+export interface Review {
+  day: number;
+  segment: string;
+  /** 1..5. */
+  score: number;
+  /** Slugs naming what drove the score, for MAILBOX complaint text. */
+  factors: string[];
+}
+
+export type MailKind = "complaint" | "bulletin" | "applications" | "spam";
+
+/** H2a — MAILBOX's content. Bulletins take effect at DELIVERY, not on
+ *  read: reading is how the player learns, never how rules activate, so
+ *  ignoring your mail can never dodge escalation. */
+export interface Mail {
+  day: number;
+  kind: MailKind;
+  /** i18n key, per house style — English only in source. */
+  subjectKey: string;
+  fields: Record<string, string>;
+  read: boolean;
+}
+
+/** H2a — one of the three daily objectives, posted at the morning rollover
+ *  and settled at the night audit. */
+export interface Objective {
+  day: number;
+  kind: string;
+  target: number;
+  progress: number;
+  done: boolean;
+  rewardMinor: number;
 }
 
 export interface Terminal {
@@ -147,6 +261,24 @@ export interface Hotel {
    *  (see game.ts's "no closure state" note) — this is what lets restore()
    *  resume spawning correctly. */
   guestsSpawned: number;
+  // -- H2a --
+  /** Star tier. Recomputed at the audit ONLY (day granularity: the rule set
+   *  a shift starts with is the rule set it ends with). Reachable range
+   *  this phase is 1..2. */
+  stars: number;
+  /** Per-segment reputation in permille, recomputed at each audit from the
+   *  rolling review window. */
+  repBySegment: Record<string, number>;
+  /** Nightly room rate per tier, in minor units — what PRICER sets. */
+  rateByTier: Record<string, number>;
+  /** Today's arrival quota, computed at the day rollover from the demand
+   *  curve; `arrivalsSpawned` is how many of it have arrived so far. The
+   *  H1 gates pin the fixed-schedule path instead (see ScenarioConfig). */
+  arrivalsToday: number;
+  arrivalsSpawned: number;
+  /** True once closing cash has crossed the hire threshold. Diegetic and
+   *  printed — LEDGER shows the locked line and the gap every night. */
+  hireUnlocked: boolean;
 }
 
 export interface LedgerEntry {

@@ -45,6 +45,7 @@ import type {
   Door,
   Interactable,
   Player,
+  ActorId,
   Guest,
   NavAgent,
   PathCell,
@@ -61,7 +62,15 @@ import type {
   SaveRestoreDebug,
 } from "./components.js";
 import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
-import { H1_RULES, plantViolation, type RuleDoc, type ResFields } from "./rules.js";
+import {
+  H1_RULES,
+  plantViolation,
+  plantableRules,
+  rulesForStars,
+  type RuleContext,
+  type RuleDoc,
+  type ResFields,
+} from "./rules.js";
 import { pickArchetype, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
 import { hotelShell, buildScreenWorldView } from "./screen.js";
 import type { ScreenInput, ScreenEffect } from "@claude-engine/surface-ui";
@@ -74,6 +83,7 @@ export type {
   Interactable,
   InteractableKind,
   Player,
+  ActorId,
   Guest,
   GuestState,
   NavAgent,
@@ -88,6 +98,13 @@ export type {
   LedgerEntry,
   NavSchedule,
   NoticeList,
+  Mess,
+  Prop,
+  Staffed,
+  Candidate,
+  Review,
+  Mail,
+  Objective,
   SaveRestoreDebug,
 } from "./components.js";
 
@@ -143,6 +160,12 @@ const STAY_TICKS = 1600;
  *  block in setupWithConfig. */
 const HEADON_Z_HALF_SPAN = 3;
 
+/** Opening nightly rates per tier, in minor units. H2a moves the live
+ *  rates into `hotel.rateByTier` (PRICER edits them); this is the starting
+ *  table and the fallback when a tier is missing. Keys are strings because
+ *  the component is JSON-plain and JSON object keys are strings — reading
+ *  it back through a number key would silently miss. */
+const DEFAULT_RATE_BY_TIER: Record<string, number> = { "1": 5000, "2": 8000 };
 const ROOM_RATE_MINOR: Record<number, number> = { 1: 5000, 2: 8000 };
 const DAILY_WAGES_MINOR = 3000;
 const DAILY_UTILITIES_MINOR = 1500;
@@ -242,6 +265,10 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.setComponent<Yaw>(player, "prevYaw", { mdeg: wrapMdeg(floor.spawn.yawMdeg) });
   sim.setComponent<Collider>(player, "collider", { radiusMm: PLAYER_RADIUS_MM });
   sim.setComponent<Player>(player, "player", { actor: PLAYER_ACTOR });
+  // The human's avatar carries BOTH: `player` still marks "this is the
+  // local human's body" (movement/face input target), while `actorId` is
+  // what every who-acted lookup resolves through — see findActorEntity.
+  sim.setComponent<ActorId>(player, "actorId", { actor: PLAYER_ACTOR });
 
   // -- Doors ----------------------------------------------------------------
   // Doors default CLOSED (open:false), exactly as H0. First judgment call
@@ -288,6 +315,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       roomId: bedroom.roomId,
       tier: bedroom.tier,
       occupantEntity: 0,
+      messCount: 0,
     });
   }
   const bedroomByRoomId = new Map(floor.bedrooms.map((b) => [b.roomId, b]));
@@ -316,6 +344,12 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     phaseStartTick: 0,
     nextGuestAtTick: config.spawnTickMin,
     guestsSpawned: 0,
+    stars: 1,
+    repBySegment: {},
+    rateByTier: { ...DEFAULT_RATE_BY_TIER },
+    arrivalsToday: 0,
+    arrivalsSpawned: 0,
+    hireUnlocked: false,
   });
 
   // -- Nav schedule singleton (the repath cursor — a component, not a
@@ -507,6 +541,13 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  /** The `RuleContext` for this tick — rebuilt from the tick index's
+   *  `noticeList` scan every time it is asked for, never cached across
+   *  ticks (H2 determinism rule 3). */
+  function ruleCtx(s: Sim, hotel: Hotel): RuleContext {
+    return { day: hotel.day, lists: ctxFor(s).lists };
+  }
+
   // 3. guestSpawnSystem — spawn guest + documents + reservation from
   //    forkRng("guest-spawn"); plant a violation via forkRng("guest-fraud")
   //    per the configured rate.
@@ -534,7 +575,15 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     const plantedViolations: string[] = [];
 
     if (guestFraudRng.int(0, 999) < config.fraudRatePermille) {
-      const planted = plantViolation(H1_RULES, guestFraudRng, ruleDocs, resFields);
+      // Plant only among rows that are BOTH active at the current star tier
+      // and violable in this world right now (docs/PHASE-H2.md deferral
+      // 4d): a `listed`/absent row with an empty list has no value that
+      // would violate it, so planting it would hand the desk an
+      // uncatchable "fraud". H1's gates run at stars 1 with no lists, so
+      // this filters to exactly H1's five rows and their streams are
+      // unchanged.
+      const activeRules = plantableRules(rulesForStars(H1_RULES, hotel.stars), ruleCtx(s, hotel));
+      const planted = plantViolation(activeRules, guestFraudRng, ruleDocs, resFields, ruleCtx(s, hotel));
       ruleDocs = planted.docs;
       resFields = planted.resFields;
       plantedViolations.push(planted.failFlag);
@@ -567,6 +616,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       stayUntilTick: 0,
       queueIndex: -1,
       patienceTicks: 0,
+      waitedTicks: 0,
+      brokenPropNights: 0,
+      paidMinor: 0,
     });
     const spawnMm = cellMm(streetCell.cx, streetCell.cz);
     s.setComponent<Pos>(guestEntity, "pos", spawnMm);
@@ -730,9 +782,14 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     return undefined;
   }
 
+  /** Who acted. Scans `actorId`, NOT `player` (ARCHITECTURE B9 / H2a): the
+   *  hired clerk is an actor with no `player` component, and every
+   *  validation path — interact, desk.decision, screen.* — must resolve it
+   *  the same way it resolves the human. There is deliberately no branch on
+   *  the literal "player" anywhere below this line. */
   function findActorEntity(s: Sim, actor: string): EntityId | undefined {
-    for (const [entity, p] of s.withComponent<Player>("player")) {
-      if (p.actor === actor) return entity;
+    for (const [entity, a] of s.withComponent<ActorId>("actorId")) {
+      if (a.actor === actor) return entity;
     }
     return undefined;
   }

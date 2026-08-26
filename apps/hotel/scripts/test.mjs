@@ -5,7 +5,14 @@
 // a test framework.
 import { Rng, Sim } from "@claude-engine/core";
 import { findOverflowingNodes } from "@claude-engine/surface-ui";
-import { H1_RULES, evaluateRules, plantViolation, rulesForStars, describeRule } from "../dist-game/sim/rules.js";
+import {
+  H1_RULES,
+  evaluateRules,
+  plantViolation,
+  plantableRules,
+  rulesForStars,
+  describeRule,
+} from "../dist-game/sim/rules.js";
 import { ARCHETYPES } from "../dist-game/sim/guests.js";
 import { reservaApp } from "../dist-game/sim/reserva-app.js";
 import { auditApp } from "../dist-game/sim/audit-app.js";
@@ -43,6 +50,38 @@ function cleanRes() {
 }
 
 const ctx = { day: 100, lists: {} };
+/** The fixture blacklist the H2a `listed` rows are planted and evaluated
+ *  against. Contains the clean fixture's own guest name plus decoys, so
+ *  planting has a real value to choose and evaluation has a real list to
+ *  miss. */
+const BLACKLIST_FIXTURE = ["Vex Harrow", "Ines Calloway", "Ruben Tasse"];
+const ctxWithBlacklist = { day: 100, lists: { blacklist: BLACKLIST_FIXTURE } };
+
+/**
+ * An Rng whose FIRST pick() returns a chosen rule and whose every other
+ * draw is the real seeded stream. Lets the round-trip property force one
+ * specific row while still handing `plantViolation` the FULL rule table —
+ * which matters, because the planter's cross-row propagation (keeping a
+ * planted blacklist name from also breaking `name-match`) is driven by that
+ * table. The old single-row-table trick silently removed the very rows the
+ * propagation has to see.
+ */
+function forcedRng(rule, seed) {
+  const real = new Rng(seed);
+  let firstPick = true;
+  return {
+    pick(arr) {
+      if (firstPick) {
+        firstPick = false;
+        return rule;
+      }
+      return real.pick(arr);
+    },
+    int(min, max) {
+      return real.int(min, max);
+    },
+  };
+}
 
 // --- H1_RULES shape ----------------------------------------------------
 {
@@ -63,7 +102,14 @@ const ctx = { day: 100, lists: {} };
     H1_RULES.some((r) => r.check.kind === "fieldMatch" && r.check.docField === "resCode"),
   );
   check("H1_RULES has a notExpired on the ID", H1_RULES.some((r) => r.check.kind === "notExpired" && r.check.docType === "id"));
-  check("H1_RULES rows are all minStars 1 in H1", H1_RULES.every((r) => r.minStars === 1));
+  // H2a appends the blacklist row at minStars 2 — the first row the star
+  // tier actually gates. Everything H1 shipped stays at 1.
+  check(
+    "the rule table is H1's five minStars-1 rows plus exactly one minStars-2 row (H2a's blacklist)",
+    H1_RULES.filter((r) => r.minStars === 1).length === 5 &&
+      H1_RULES.filter((r) => r.minStars === 2).length === 1 &&
+      H1_RULES.filter((r) => r.minStars === 2)[0].id === "blacklist",
+  );
   const ids = new Set(H1_RULES.map((r) => r.id));
   check("H1_RULES ids are unique", ids.size === H1_RULES.length);
   const flags = new Set(H1_RULES.map((r) => r.failFlag));
@@ -129,7 +175,7 @@ const ctx = { day: 100, lists: {} };
   const star2 = rulesForStars(tieredRules, 2);
   check("minStars filtering excludes higher-tier rows at star 1", !star1.some((r) => r.id === "loyalty-tier-check"));
   check("minStars filtering includes the higher-tier row at star 2", star2.some((r) => r.id === "loyalty-tier-check"));
-  check("minStars filtering keeps all H1 rows at star 1", star1.length === H1_RULES.length);
+  check("minStars filtering keeps every minStars-1 row at star 1", star1.length === H1_RULES.filter((r) => r.minStars === 1).length);
 
   // A guest who fails the star-2-only rule must NOT show up as a violation
   // when evaluated at star 1 (the row isn't even in the table passed in).
@@ -189,8 +235,8 @@ const ctx = { day: 100, lists: {} };
 {
   const rngA = new Rng("plant-determinism-seed");
   const rngB = new Rng("plant-determinism-seed");
-  const a = plantViolation(H1_RULES, rngA, cleanDocs(), cleanRes());
-  const b = plantViolation(H1_RULES, rngB, cleanDocs(), cleanRes());
+  const a = plantViolation(H1_RULES, rngA, cleanDocs(), cleanRes(), ctxWithBlacklist);
+  const b = plantViolation(H1_RULES, rngB, cleanDocs(), cleanRes(), ctxWithBlacklist);
   check("plantViolation is deterministic for a given Rng state", JSON.stringify(a) === JSON.stringify(b));
 }
 
@@ -206,15 +252,13 @@ const ctx = { day: 100, lists: {} };
   for (let seedIdx = 0; seedIdx < SEEDS; seedIdx++) {
     for (const rule of H1_RULES) {
       const seed = `plant-property-seed-${seedIdx}`;
-      // Force the Rng to pick THIS rule: use a single-row table so
-      // rng.pick always selects it, isolating "does this rule's planter
-      // produce exactly this rule's flag" from "does rng.pick distribute
-      // correctly" (rng.pick itself is exercised by the multi-row
-      // determinism test above and by packages/core's own rng tests).
-      const rng = new Rng(seed);
-      const singleRowTable = [rule];
-      const planted = plantViolation(singleRowTable, rng, cleanDocs(), cleanRes());
-      const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctx);
+      // Force the Rng to pick THIS rule while still passing the FULL
+      // table, isolating "does this rule's planter produce exactly this
+      // rule's flag" from "does rng.pick distribute correctly" (rng.pick
+      // itself is exercised by the multi-row determinism test above and by
+      // packages/core's own rng tests).
+      const planted = plantViolation(H1_RULES, forcedRng(rule, seed), cleanDocs(), cleanRes(), ctxWithBlacklist);
+      const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctxWithBlacklist);
       ranSeedRowPairs++;
       const exact = flags.length === 1 && flags[0] === rule.failFlag;
       if (!exact && firstFailure === null) {
@@ -225,9 +269,16 @@ const ctx = { day: 100, lists: {} };
   }
 
   check(
-    `plant/evaluate property holds exactly for ${SEEDS} seeds x ${H1_RULES.length} rules (${ranSeedRowPairs} pairs)`,
+    `plant/evaluate property holds exactly for ${SEEDS} seeds x ${H1_RULES.length} rules (${ranSeedRowPairs} pairs), INCLUDING the listed/absent blacklist row against a fixture list`,
     allExact,
   );
+  // The property above is only meaningful for the blacklist row if that row
+  // was actually exercised. H1a's version silently could not cover a
+  // `listed` row at all (the planter wrote a sentinel that was on no list,
+  // so the row passed and the "planted" fraud was uncatchable). Assert the
+  // row is in the table and its flag was one of the ones round-tripped.
+  const listedRow = H1_RULES.find((r) => r.check.kind === "listed");
+  check("round-trip actually covered a listed row (the H1a committed-wrong branch)", listedRow !== undefined);
   if (!allExact) {
     console.log("First failure:", JSON.stringify(firstFailure));
   }
@@ -239,12 +290,72 @@ const ctx = { day: 100, lists: {} };
   let allExact = true;
   for (let seedIdx = 0; seedIdx < SEEDS; seedIdx++) {
     const rng = new Rng(`plant-full-table-seed-${seedIdx}`);
-    const planted = plantViolation(H1_RULES, rng, cleanDocs(), cleanRes());
-    const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctx);
+    const planted = plantViolation(H1_RULES, rng, cleanDocs(), cleanRes(), ctxWithBlacklist);
+    const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctxWithBlacklist);
     const exact = flags.length === 1 && flags[0] === planted.failFlag;
     if (!exact) allExact = false;
   }
   check(`plant/evaluate property also holds when rng.pick selects the rule (${SEEDS} seeds, full table)`, allExact);
+}
+
+// --- plantableRules: a listed/absent row is only plantable with a list ----
+// H1a review item 3's other half. Planting the blacklist row against an
+// EMPTY blacklist is unsatisfiable — there is no value that is on an empty
+// list — so the row must not be offered to the planter at all, or the desk
+// gets handed a "fraud" no check can catch.
+{
+  const listedRow = H1_RULES.find((r) => r.check.kind === "listed");
+  const emptyCtx = { day: 100, lists: {} };
+  check(
+    "plantableRules: the listed/absent row is EXCLUDED when its list is empty",
+    !plantableRules(H1_RULES, emptyCtx).some((r) => r.id === listedRow.id),
+  );
+  check(
+    "plantableRules: the listed/absent row is INCLUDED once the list is non-empty",
+    plantableRules(H1_RULES, ctxWithBlacklist).some((r) => r.id === listedRow.id),
+  );
+  check(
+    "plantableRules: every non-listed row is always plantable",
+    plantableRules(H1_RULES, emptyCtx).length === H1_RULES.length - 1,
+  );
+  // And the planter refuses rather than planting something uncatchable.
+  let threw = false;
+  try {
+    plantViolation([listedRow], forcedRng(listedRow, "plant-empty-list"), cleanDocs(), cleanRes(), emptyCtx);
+  } catch {
+    threw = true;
+  }
+  check("plantViolation throws rather than plant a listed/absent row with an empty list", threw);
+
+  // The planted value must come FROM the list — that is what makes it
+  // catchable — and it must not break the name-match row on the way.
+  const planted = plantViolation(H1_RULES, forcedRng(listedRow, "plant-blacklist-1"), cleanDocs(), cleanRes(), ctxWithBlacklist);
+  const idDoc = planted.docs.find((d) => d.docType === "id");
+  check(
+    "plantViolation(listed/absent) writes a value that IS on the list",
+    BLACKLIST_FIXTURE.includes(idDoc.fields.name),
+  );
+  check(
+    "plantViolation(listed/absent) moves the reservation and slip with it, so name-match still passes",
+    planted.resFields.guestName === idDoc.fields.name &&
+      planted.docs.find((d) => d.docType === "resSlip").fields.guestName === idDoc.fields.name,
+  );
+  check(
+    "plantViolation(listed/absent) is caught by evaluateRules as EXACTLY the blacklist flag",
+    JSON.stringify(evaluateRules(H1_RULES, planted.docs, planted.resFields, ctxWithBlacklist)) ===
+      JSON.stringify([listedRow.failFlag]),
+  );
+  check(
+    "the same planted documents are CLEAN against an empty blacklist (the row is data-driven, not baked in)",
+    evaluateRules(H1_RULES, planted.docs, planted.resFields, emptyCtx).length === 0,
+  );
+}
+
+// --- star tiers gate the blacklist row -----------------------------------
+{
+  check("rulesForStars(1) excludes the blacklist row", !rulesForStars(H1_RULES, 1).some((r) => r.id === "blacklist"));
+  check("rulesForStars(2) includes the blacklist row", rulesForStars(H1_RULES, 2).some((r) => r.id === "blacklist"));
+  check("rulesForStars(1) is exactly H1's five rows", rulesForStars(H1_RULES, 1).length === 5);
 }
 
 // ============================================================================

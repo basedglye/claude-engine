@@ -275,6 +275,19 @@ export interface ScenarioConfig {
    *  "demand" is the shipped path: a per-day quota computed at the rollover
    *  from price, per-segment reputation and stars. */
   arrivals: "fixed" | "demand";
+  /** Opening cash, in minor units. Exists so a gate can start the hotel at
+   *  a state that would otherwise take days of play to reach (the
+   *  `first-hire` gate pins it above HIRE_THRESHOLD_MINOR so the day-1
+   *  audit unlocks the staff budget). Default 0 — H1's opening balance. */
+  startingCashMinor: number;
+  /** Gap between fixed-schedule arrivals, in ticks: `min + rng.int(0, max -
+   *  min)`. Defaults reproduce H1's exact draw (`50 + rng.int(0, 100)`), so
+   *  leaving them alone leaves every H1 spawn stream byte-identical. A gate
+   *  that needs arrivals spread across DAYS rather than minutes widens
+   *  them — `escalation-stars` does, because it needs guests on both sides
+   *  of a bulletin that is only delivered at a day rollover. */
+  spawnIntervalMinTicks: number;
+  spawnIntervalMaxTicks: number;
 }
 
 // H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
@@ -293,6 +306,9 @@ export const DEFAULTS: ScenarioConfig = {
   fixture: "normal",
   upkeep: true,
   arrivals: "demand",
+  startingCashMinor: 0,
+  spawnIntervalMinTicks: 50,
+  spawnIntervalMaxTicks: 150,
 };
 
 function wrapMdeg(mdeg: number): number {
@@ -453,7 +469,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   const hotelEntity = sim.spawn();
   const { day: day0, phaseId: phaseId0 } = computePhase(0);
   sim.setComponent<Hotel>(hotelEntity, "hotel", {
-    cash: 0,
+    cash: config.startingCashMinor ?? 0,
     day: day0,
     phaseId: phaseId0,
     phaseStartTick: 0,
@@ -907,7 +923,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     spawnCtx.occupancy.set(streetCell.cz * grid.width + streetCell.cx, guestEntity);
     s.emit("guest.arrived", { guestEntity });
 
-    const interval = 50 + guestSpawnRng.int(0, 100);
+    const intervalMin = config.spawnIntervalMinTicks ?? 50;
+    const intervalMax = config.spawnIntervalMaxTicks ?? 150;
+    const interval = intervalMin + guestSpawnRng.int(0, intervalMax - intervalMin);
     s.setComponent<Hotel>(hotelEntity, "hotel", {
       ...hotel,
       guestsSpawned: hotel.guestsSpawned + 1,
@@ -1583,7 +1601,28 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
     const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
     if (!hotel) return;
-    const wasPlanted = res.plantedViolations.length > 0;
+
+    // GROUND TRUTH IS THE RULE TABLE, not the planting record. H1 shipped
+    // `plantedViolations.length > 0` as the "is this fraud?" test, which was
+    // indistinguishable while every violation in the game was planted. H2a
+    // breaks that: a guest whose real name is on the blacklist bulletin
+    // violates the `blacklist` row without anything having been planted on
+    // them, and the old test called denying them a `desk.falseDeny` — the
+    // event for punishing an innocent guest. (Observed: six of them in a
+    // clean seven-day run.) `plantedViolations` is still carried in the
+    // payload, because "what was planted" and "what the rules say" being
+    // separately visible is exactly what makes the fraud gates meaningful.
+    const truthDocs: RuleDoc[] = [];
+    for (const [, doc] of s.withComponent<DocumentComp>("document")) {
+      if (doc.ownerEntity === res.guestEntity) truthDocs.push({ docType: doc.docType, fields: doc.fields });
+    }
+    const actualViolations = evaluateRules(
+      rulesForStars(H1_RULES, hotel.stars),
+      truthDocs,
+      res.fields,
+      ruleCtx(s, hotel),
+    );
+    const wasPlanted = actualViolations.length > 0;
 
     if (accept) {
       if (roomEntity === undefined) return;
@@ -1621,7 +1660,14 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       // structurally, from the record: a check-in attributed to `staff:*`
       // is one the player did not make.
       s.emit("guest.checkedIn", { guestEntity: res.guestEntity, roomEntity, actor });
-      if (wasPlanted) s.emit("desk.fraudMissed", { reservationEntity, violations: res.plantedViolations, actor });
+      if (wasPlanted) {
+        s.emit("desk.fraudMissed", {
+          reservationEntity,
+          violations: actualViolations,
+          plantedViolations: res.plantedViolations,
+          actor,
+        });
+      }
     } else {
       s.setComponent<Reservation>(reservationEntity, "reservation", {
         ...res,
@@ -1630,8 +1676,16 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         roomEntity: 0,
       });
       s.emit("guest.denied", { guestEntity: res.guestEntity, actor });
-      if (wasPlanted) s.emit("desk.fraudCaught", { reservationEntity, violations: res.plantedViolations, actor });
-      else s.emit("desk.falseDeny", { reservationEntity, actor });
+      if (wasPlanted) {
+        s.emit("desk.fraudCaught", {
+          reservationEntity,
+          violations: actualViolations,
+          plantedViolations: res.plantedViolations,
+          actor,
+        });
+      } else {
+        s.emit("desk.falseDeny", { reservationEntity, actor });
+      }
     }
   }
 
@@ -2376,7 +2430,11 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         arrivalsToday: forecastArrivals,
         arrivalsSpawned: 0,
         guestsSpawned: config.arrivals === "demand" ? 0 : hotel.guestsSpawned,
-        nextGuestAtTick: s.tick + config.spawnTickMin,
+        // Only the demand path re-arms the spawn clock at the rollover. In
+        // FIXED mode `spawnTickMin` is an absolute first-guest tick, not an
+        // interval, so re-arming it would silently push the whole schedule
+        // a day into the future every midnight.
+        nextGuestAtTick: config.arrivals === "demand" ? s.tick + config.spawnTickMin : hotel.nextGuestAtTick,
         hireUnlocked,
       });
     } else if (newPhaseId !== hotel.phaseId) {

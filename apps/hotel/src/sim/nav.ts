@@ -138,7 +138,10 @@ function hasClearance(grid: NavGrid, cx: number, cz: number): boolean {
   return true;
 }
 
-function isOccupiable(grid: NavGrid, cx: number, cz: number, isOpen: (cx: number, cz: number) => boolean): boolean {
+/** Exported as `isOccupiableCell` for game.ts's clerk-work-cell derivation:
+ *  a cell an NPC is asked to STAND on must satisfy exactly the rule A* uses
+ *  to route onto it, or the goal is unreachable and the agent wanders. */
+export function isOccupiable(grid: NavGrid, cx: number, cz: number, isOpen: (cx: number, cz: number) => boolean): boolean {
   if (cx < 0 || cz < 0 || cx >= grid.width || cz >= grid.height) return false;
   const cell = cellAt(grid, cx, cz);
   if (cell & CELL.SOLID) return false;

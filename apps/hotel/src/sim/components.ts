@@ -181,6 +181,24 @@ export interface Staffed {
   seed: number;
 }
 
+/** H2a — a named NPC: candidates and hired staff. Guests deliberately do
+ *  NOT carry this: a guest's name lives on their documents, because the
+ *  whole desk game is reading it off paper rather than off a label. */
+export interface Person {
+  kind: "candidate" | "staff";
+  name: string;
+  seed: number;
+}
+
+/** H2a — the hired clerk's in-progress decision. A COMPONENT, never a
+ *  closure timer: Sim.restore() reruns setup() fresh, so a deliberation
+ *  half-finished at the save tick has to be recoverable from state or the
+ *  clerk silently forgets who it was serving. `reservationEntity` 0 = idle. */
+export interface StaffWork {
+  reservationEntity: number;
+  decideAtTick: number;
+}
+
 export type CandidateState = "arriving" | "waiting" | "interviewing" | "hired" | "rejected";
 
 /** H2a — a job candidate NPC. Walks in the street door like a guest, waits

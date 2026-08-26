@@ -24,6 +24,9 @@ import {
   screenClickCommand,
   hotelShell,
   buildScreenWorldView,
+  HOTEL_APPS,
+  pricerSetRateCommand,
+  staffHireCommand,
 } from "../dist-game/sim/game.js";
 import { jitter } from "../dist-game/sim/nav.js";
 import {
@@ -911,6 +914,11 @@ function focusTerminal(sim, terminalEntity) {
           resFields: { guestName, resCode: worstResCode },
         },
         rooms: worstRooms,
+        // H2a: RESERVA derives its procedures card from `stars` now, so a
+        // view WITHOUT this key paints zero procedure lines and the
+        // overflow gate silently stops testing the widest thing on the
+        // screen. Worst case is the highest reachable tier.
+        stars: MAX_STARS,
         ledger: { day: 99999, revenueMinor: 999999999, expenseMinor: 999999999, closingCashMinor: -999999999 },
       },
     };
@@ -918,6 +926,10 @@ function focusTerminal(sim, terminalEntity) {
 
   const view = worstCaseView(longestName);
   const reservaNodes = reservaApp.paintSpec(reservaApp.init(), view);
+  check(
+    `overflow-gate setup: the worst-case paint actually contains all ${widestRules.length} procedure lines`,
+    widestRules.every((rule) => JSON.stringify(reservaNodes).includes(rule.description.slice(0, 24))),
+  );
   const reservaViolations = findOverflowingNodes(reservaNodes);
   check(
     `RESERVA: worst-case data (name=${JSON.stringify(longestName)}, all ${widestRules.length} rules, 4 vacant rooms) has zero surface overflows`,
@@ -1368,6 +1380,400 @@ const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixtur
   for (let t = sim.tick; t < 12000; t++) sim.step();
   const staffEntries = [...sim.withComponent("ledgerEntry")].filter(([, e]) => e.debitAccount === "expense:staff");
   check("wages: a hired clerk's wage lands on the expense line at the next audit", staffEntries.length === 1 && staffEntries[0][1].amountMinor === 2500);
+}
+
+// ============================================================================
+// H2a: the app decision-path suite (docs/PHASE-H2.md exit gate 5).
+//
+// The H1b pattern obligation, applied to all four new apps: clicks at
+// coordinates derived from `hotelShell.layout()` at runtime (never pixel
+// literals), BOTH branches of every decision, and the guard. Every one of
+// these drives the same seam a human does — screen.click -> shell.reduce ->
+// app.reduce -> effect -> the sim's validated apply function.
+// ============================================================================
+
+function shellRects(sim, terminalEntity) {
+  const screenApp = sim.getComponent(terminalEntity, "screenApp");
+  return hotelShell.layout(screenApp.state, buildScreenWorldView(sim));
+}
+
+/** Click a rect by key, deriving its centre fresh from layout() first. */
+function clickRect(sim, terminalEntity, key) {
+  const rects = shellRects(sim, terminalEntity);
+  const rect = rects[key];
+  if (!rect) throw new Error(`no rect ${key} in layout(): ${Object.keys(rects).join(",")}`);
+  const point = rectClickPoint(rect);
+  sim.submit(screenClickCommand(sim.tick + 1, point.px, point.py));
+  sim.step();
+}
+
+function openApp(sim, terminalEntity, appId) {
+  clickRect(sim, terminalEntity, `taskbar:${appId}`);
+}
+
+/** A sim with the player parked at the terminal, focused, and nothing else
+ *  going on — the smallest world in which a screen decision is legal. */
+function terminalSim(seed, extraConfig) {
+  const sim = new Sim(seed);
+  setupWithConfig(sim, {
+    guestCount: 0,
+    spawnTickMin: 100000,
+    fraudRatePermille: 0,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+    ...extraConfig,
+  });
+  const terminalEntity = findTerminalEntity(sim);
+  focusTerminal(sim, terminalEntity);
+  return { sim, terminalEntity };
+}
+
+// --- the shell registers exactly the six H2a apps -----------------------
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-apps-registry");
+  const rects = shellRects(sim, terminalEntity);
+  const registered = HOTEL_APPS.map((a) => a.id);
+  check(
+    `shell registry is exactly the six H2a apps (got ${registered.join(",")})`,
+    JSON.stringify(registered) === JSON.stringify(["reserva", "audit", "ledger", "pricer", "mailbox", "staff"]),
+  );
+  check(
+    "every registered app has a taskbar hit rect",
+    registered.every((id) => rects[`taskbar:${id}`] !== undefined),
+  );
+}
+
+// --- PRICER: rate up, rate down, and the two guards ---------------------
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-pricer-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  openApp(sim, terminalEntity, "pricer");
+  check("pricer: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "pricer");
+
+  const before = sim.getComponent(hotelEntity, "hotel").rateByTier["1"];
+
+  // Guard: RATE + with no tier selected must not change anything.
+  clickRect(sim, terminalEntity, "app:up");
+  check(
+    "pricer(guard): RATE + with no tier selected changes no rate",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === before,
+  );
+
+  clickRect(sim, terminalEntity, "app:tier:1");
+  clickRect(sim, terminalEntity, "app:up");
+  const up = sim.getComponent(hotelEntity, "hotel").rateByTier["1"];
+  check(`pricer: RATE + raises tier 1 by one step (${before} -> ${up})`, up === before + RATE_STEP_MINOR);
+  check(
+    "pricer: econ.rateSet fired with the actor",
+    sim.eventsSince(0).some((e) => e.type === "econ.rateSet" && e.payload.tier === 1 && e.payload.actor === "player"),
+  );
+
+  clickRect(sim, terminalEntity, "app:down");
+  check("pricer: RATE - lowers it back", sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === before);
+
+  // Guard: the bounds. Walk the rate to the floor and try to go under it.
+  let guardTicks = 0;
+  while (sim.getComponent(hotelEntity, "hotel").rateByTier["1"] > MIN_RATE_MINOR && guardTicks < 200) {
+    clickRect(sim, terminalEntity, "app:down");
+    guardTicks++;
+  }
+  check("pricer: the rate reaches the committed floor", sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR);
+  clickRect(sim, terminalEntity, "app:down");
+  check(
+    "pricer(guard): RATE - at the floor is refused, not clamped silently past it",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR,
+  );
+
+  // And the sim refuses an out-of-bounds rate even when the app is bypassed
+  // entirely — the app's guard is a courtesy, this is the rule.
+  sim.submit(pricerSetRateCommand(sim.tick + 1, 1, MAX_RATE_MINOR + RATE_STEP_MINOR));
+  sim.step();
+  check(
+    "pricer: the COMMAND form is validated too (out-of-bounds rate refused)",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR &&
+      sim.eventsSince(0).some((e) => e.type === "screen.denied" && e.payload.reason === "rate-out-of-bounds"),
+  );
+  sim.submit(pricerSetRateCommand(sim.tick + 1, 1, MIN_RATE_MINOR + 1));
+  sim.step();
+  check(
+    "pricer: an off-step rate is refused",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR,
+  );
+}
+
+// --- MAILBOX: open a message, the read flag, and the re-read guard ------
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-mailbox-1");
+  const mailEntity = sim.spawn();
+  sim.setComponent(mailEntity, "mail", {
+    day: 1,
+    kind: "bulletin",
+    subjectKey: "mail.bulletin",
+    fields: { names: "Vex Harrow" },
+    read: false,
+  });
+  openApp(sim, terminalEntity, "mailbox");
+  check("mailbox: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "mailbox");
+  check("mailbox: the message starts unread", sim.getComponent(mailEntity, "mail").read === false);
+
+  clickRect(sim, terminalEntity, `app:mail:${mailEntity}`);
+  check("mailbox: opening a message marks it read", sim.getComponent(mailEntity, "mail").read === true);
+  check(
+    "mailbox: mail.read fired once, with the actor",
+    sim.eventsSince(0).filter((e) => e.type === "mail.read" && e.payload.actor === "player").length === 1,
+  );
+
+  // Guard: re-opening an already-read message is a view change and nothing
+  // more — no second effect, no second event.
+  clickRect(sim, terminalEntity, "app:back");
+  clickRect(sim, terminalEntity, `app:mail:${mailEntity}`);
+  check(
+    "mailbox(guard): re-opening a read message emits no second mail.read",
+    sim.eventsSince(0).filter((e) => e.type === "mail.read").length === 1,
+  );
+}
+
+// --- LEDGER: paging back and forward, and the clamp at both ends --------
+{
+  // Twelve REAL closed days, run through the sim, rather than faked
+  // `ledgerEntry` rows plus a faked `hotel.day` — dayPhaseSystem recomputes
+  // the day from the tick, so a faked day is overwritten on the very next
+  // step and the history silently empties. (It did, and this test caught
+  // it.) Twelve days at 6,000 ticks each is under a second.
+  const sim = new Sim("hotel-h2-ledger-1");
+  setupWithConfig(sim, {
+    guestCount: 0,
+    spawnTickMin: 100000,
+    fraudRatePermille: 0,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+  });
+  for (let t = 0; t < 6000 * 13; t++) sim.step();
+  const terminalEntity = findTerminalEntity(sim);
+  focusTerminal(sim, terminalEntity);
+  check(
+    "ledger: twelve closed days of real history exist",
+    buildScreenWorldView(sim).data.ledgerDays.length >= 12,
+  );
+
+  openApp(sim, terminalEntity, "ledger");
+  check("ledger: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "ledger");
+  const stateOf = () => sim.getComponent(terminalEntity, "screenApp").state.appStates.ledger;
+  check("ledger: starts on the newest page", stateOf().pageOffset === 0);
+
+  // Guard at the newest end: NEWER on page 0 does nothing.
+  clickRect(sim, terminalEntity, "app:next");
+  check("ledger(guard): NEWER on the newest page does not page past it", stateOf().pageOffset === 0);
+
+  clickRect(sim, terminalEntity, "app:prev");
+  check("ledger: OLDER pages back", stateOf().pageOffset === 1);
+  clickRect(sim, terminalEntity, "app:next");
+  check("ledger: NEWER pages forward again", stateOf().pageOffset === 0);
+
+  // Guard at the oldest end.
+  for (let i = 0; i < 10; i++) clickRect(sim, terminalEntity, "app:prev");
+  const deepest = stateOf().pageOffset;
+  clickRect(sim, terminalEntity, "app:prev");
+  check(`ledger(guard): OLDER stops at the oldest page (${deepest})`, stateOf().pageOffset === deepest);
+
+  // The STAFF BUDGET line is printed whether or not it is unlocked.
+  const view = buildScreenWorldView(sim);
+  check("ledger: the view carries the hire threshold so the locked line can print it", view.data.ledger.hireThresholdMinor > 0);
+  const painted = JSON.stringify(hotelShell.paintSpec(sim.getComponent(terminalEntity, "screenApp").state, view));
+  check("ledger: the STAFF BUDGET line is on screen", painted.includes("STAFF BUDGET"));
+}
+
+// --- STAFF: HIRE and PASS, and the two guards ---------------------------
+function spawnInterviewingCandidate(sim, wageAsk) {
+  const entity = sim.spawn();
+  sim.setComponent(entity, "person", { kind: "candidate", name: "Desmond Pike", seed: 4242 });
+  sim.setComponent(entity, "candidate", {
+    wageAsk,
+    skillPermille: 800,
+    quirk: "hums showtunes",
+    state: "interviewing",
+    resumeEntity: 0,
+  });
+  return entity;
+}
+
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-staff-hire-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", { ...sim.getComponent(hotelEntity, "hotel"), cash: 50000, hireUnlocked: true });
+  const candidateEntity = spawnInterviewingCandidate(sim, 3000);
+
+  openApp(sim, terminalEntity, "staff");
+  check("staff: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "staff");
+
+  // Guard 1: HIRE with nobody selected decides nothing.
+  clickRect(sim, terminalEntity, "app:hire");
+  check(
+    "staff(guard): HIRE with no candidate selected hires nobody",
+    sim.getComponent(candidateEntity, "staffed") === undefined,
+  );
+
+  clickRect(sim, terminalEntity, `app:candidate:${candidateEntity}`);
+  clickRect(sim, terminalEntity, "app:hire");
+  const staffed = sim.getComponent(candidateEntity, "staffed");
+  check("staff: HIRE puts the candidate on the payroll", staffed !== undefined && staffed.wage === 3000);
+  check(
+    "staff: the hire gains an actorId, which is what makes it a second ACTOR",
+    sim.getComponent(candidateEntity, "actorId").actor === `staff:${candidateEntity}`,
+  );
+  check(
+    "staff: staff.hired fired with the wage and the deciding actor",
+    sim.eventsSince(0).some((e) => e.type === "staff.hired" && e.payload.wage === 3000 && e.payload.actor === "player"),
+  );
+  check("staff: the hire is no longer interactable as a candidate", sim.getComponent(candidateEntity, "interactable") === undefined);
+}
+
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-staff-pass-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", { ...sim.getComponent(hotelEntity, "hotel"), cash: 50000, hireUnlocked: true });
+  const candidateEntity = spawnInterviewingCandidate(sim, 3000);
+  // A candidate that can be sent away needs somewhere to walk to.
+  sim.setComponent(candidateEntity, "navAgent", {
+    goalCx: 0, goalCz: 0, path: [], pathIdx: 0, repathAtTick: 0, jitterSeed: 1, stuckTicks: 0, avoidCx: -1, avoidCz: -1,
+  });
+
+  openApp(sim, terminalEntity, "staff");
+  clickRect(sim, terminalEntity, `app:candidate:${candidateEntity}`);
+  clickRect(sim, terminalEntity, "app:pass");
+  check("staff: PASS rejects the candidate", sim.getComponent(candidateEntity, "candidate").state === "rejected");
+  check("staff: nobody was put on the payroll", sim.getComponent(candidateEntity, "staffed") === undefined);
+  check(
+    "staff: staff.rejected fired",
+    sim.eventsSince(0).some((e) => e.type === "staff.rejected" && e.payload.candidateEntity === candidateEntity),
+  );
+}
+
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-staff-cash-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", { ...sim.getComponent(hotelEntity, "hotel"), cash: 100, hireUnlocked: true });
+  const candidateEntity = spawnInterviewingCandidate(sim, 3000);
+
+  openApp(sim, terminalEntity, "staff");
+  clickRect(sim, terminalEntity, `app:candidate:${candidateEntity}`);
+  clickRect(sim, terminalEntity, "app:hire");
+  check(
+    "staff(guard): HIRE with less cash than the first wage hires nobody",
+    sim.getComponent(candidateEntity, "staffed") === undefined,
+  );
+
+  // And the sim refuses it even when the app's guard is bypassed.
+  sim.submit(staffHireCommand(sim.tick + 1, candidateEntity, true));
+  sim.step();
+  check(
+    "staff: the COMMAND form re-checks cash too (screen.denied insufficient-cash)",
+    sim.getComponent(candidateEntity, "staffed") === undefined &&
+      sim.eventsSince(0).some((e) => e.type === "screen.denied" && e.payload.reason === "insufficient-cash"),
+  );
+}
+
+// --- RESERVA's procedures card is derived from stars, not frozen --------
+// H1 froze the active table in a module constant at import. If that came
+// back, the card would be identical at both tiers and the escalation system
+// would be decorative. The card only paints while a guest is presenting, so
+// this drives paintSpec with a synthetic view rather than staging a guest.
+{
+  const cardAt = (stars) => {
+    const view = {
+      tick: 1,
+      data: {
+        queue: {
+          reservationEntity: 1,
+          guestEntity: 2,
+          docFields: { id: { name: "Alex Rivera", docNumber: "X1", expiresDay: "500" } },
+          resFields: { guestName: "Alex Rivera", resCode: "RC-1" },
+        },
+        rooms: [],
+        stars,
+        ledger: { day: 1, revenueMinor: 0, expenseMinor: 0, closingCashMinor: 0 },
+      },
+    };
+    return JSON.stringify(reservaApp.paintSpec(reservaApp.init(), view));
+  };
+  const blacklistRow = H1_RULES.find((r) => r.id === "blacklist");
+  const atOne = cardAt(1);
+  const atTwo = cardAt(2);
+  // A distinctive tail, not a prefix: the blacklist row and the name-match
+  // row share their first two dozen characters ("The name on the ID must"),
+  // so a prefix match would report the blacklist line as present at 1 star.
+  const blacklistPhrase = "blacklist bulletin";
+  check("reserva(setup): the phrase used below is unique to the blacklist row", blacklistRow.description.includes(blacklistPhrase));
+  check("reserva: the blacklist procedure is ABSENT at 1 star", !atOne.includes(blacklistPhrase));
+  check("reserva: the blacklist procedure APPEARS at 2 stars", atTwo.includes(blacklistPhrase));
+  check("reserva: the two cards genuinely differ", atOne !== atTwo);
+  check(
+    "reserva: the card grew by exactly the rows the tier activates",
+    rulesForStars(H1_RULES, 2).length === rulesForStars(H1_RULES, 1).length + 1,
+  );
+}
+
+// --- the composed-shell overflow gate, DERIVED from the registry --------
+// H1b's loop hardcoded ["reserva","audit"]. Deriving it from HOTEL_APPS is
+// the pattern obligation: registering app seven can never silently skip the
+// gate, because there is no list to forget to update.
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-overflow-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", {
+    ...sim.getComponent(hotelEntity, "hotel"),
+    stars: 2,
+    cash: 999999,
+    hireUnlocked: true,
+    repBySegment: { business: 1000, leisure: 1000, family: 1000 },
+  });
+  // Worst-case content for every app at once.
+  for (let day = 1; day <= 20; day++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "ledgerEntry", { day, debitAccount: "expense:staff", creditAccount: "cash", amountMinor: 999999, memo: "x" });
+  }
+  for (let i = 0; i < 20; i++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "mail", {
+      day: 20,
+      kind: "complaint",
+      subjectKey: "mail.complaint",
+      fields: { segment: "business", score: "1", factors: "waited-very-long,broken-prop,overpriced" },
+      read: false,
+    });
+  }
+  for (const kind of ["check-in-guests", "clean-messes", "catch-fraud"]) {
+    const e = sim.spawn();
+    sim.setComponent(e, "objective", { day: sim.getComponent(hotelEntity, "hotel").day, kind, target: 99, progress: 0, done: false, rewardMinor: 99999 });
+  }
+  for (let i = 0; i < 3; i++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "person", { kind: "candidate", name: "Marguerite Oyelaran", seed: i });
+    sim.setComponent(e, "candidate", { wageAsk: 3500, skillPermille: 950, quirk: "will not touch the fax machine", state: "waiting", resumeEntity: 0 });
+  }
+  const e = sim.spawn();
+  sim.setComponent(e, "person", { kind: "staff", name: "Marguerite Oyelaran", seed: 9 });
+  sim.setComponent(e, "staffed", { job: "clerk", wage: 3500, skillPermille: 950, quirk: "will not touch the fax machine", hiredDay: 1, seed: 9 });
+
+  let overflowing = 0;
+  const covered = [];
+  for (const app of HOTEL_APPS) {
+    openApp(sim, terminalEntity, app.id);
+    const state = sim.getComponent(terminalEntity, "screenApp").state;
+    const violations = findOverflowingNodes(hotelShell.paintSpec(state, buildScreenWorldView(sim)));
+    covered.push(app.id);
+    if (violations.length > 0) {
+      overflowing++;
+      console.log(`  overflow in ${app.id}: ${JSON.stringify(violations.slice(0, 3))}`);
+    }
+  }
+  check(
+    `composed-shell overflow gate covers every registered app, derived from the registry (${covered.join(",")})`,
+    covered.length === HOTEL_APPS.length,
+  );
+  check("composed-shell overflow gate: zero overflowing nodes at worst-case data", overflowing === 0);
 }
 
 if (failures > 0) {

@@ -34,9 +34,10 @@ hacks.
 planning/review turn):
 
 - ⚠ `core` — `despawn(entity)`, `componentsOf(entity)`, indexed/
-  ring-buffered `eventsSince` (today it linear-scans an unbounded log),
-  incremental dirty-tracked `stateHash` (today it `JSON.stringify`s all
-  state per call). Old APIs keep working.
+  ring-buffered `eventsSince`, incremental dirty-tracked `stateHash`. All
+  landed (H0 for the first three, H2a for the hash). Old APIs keep working;
+  the hash's VALUES moved once, at the H2a re-pin, and its write-through
+  requirement is now CLAUDE.md invariant 6.
 - ⚠ `renderer-three` — `pointerHandlers` alongside the existing keyboard
   `keymap`, an `onFrame(camera)` hook, an `instancedScenery` helper, a
   texture cache, and synthetic-pointer injection in `installTestHook`.
@@ -274,9 +275,14 @@ verdicts): sim tick ≤ 5 ms at 300 entities; browser frame-time p95 ≤ 16.7
 ms; ≤ 300 draw calls; server state-message serialisation ≤ 3 ms/actor. Fix
 order:
 
-1. Indexed/ring-buffered `eventsSince` — Phase 0.
+1. Indexed/ring-buffered `eventsSince` — Phase 0. **Done.**
 2. Incremental `stateHash` with the full JSON hash kept as a `--verify` slow
-   path — Phase 2.
+   path — Phase 2. **Done in H2a**, and the slow path is not merely kept: the
+   harness asserts `stateHash() === stateHashSlow()` on every run, live and
+   replayed, because the incremental hash's correctness now rests on a house
+   rule (write-through) rather than on arithmetic. Measured at a 300-entity
+   fixture: 6x cheaper than the full walk, below the 10x the H2 spec
+   expected — reported as measured.
 3. Merged static geometry + instancing + one atlas — Phase 2.
 4. `despawn` plus "off-screen guests are rows in a demand table, not
    entities" — Phase 0/2.

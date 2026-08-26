@@ -55,8 +55,10 @@ shell with RESERVA and AUDIT, in-world screen focus and click routing,
 harness `screenClick` step and the `screen-readability` probe. Gates live:
 `reserva-readability` (both engines) and `save-restore`.
 
-**Phase 1 is complete.** Next: Phase 2, the One-Man Show vertical slice.
-Start from the H1b review's consolidated deferral list.
+**Phase 1 is complete.** Phase 2 is split into H2a (everything that changes
+`stateHash`) and H2b (everything forbidden from changing it) — see
+[docs/PHASE-H2.md](PHASE-H2.md) §1. **H2a is complete and merged**; H2b is
+next.
 
 
 `surface-ui` + HOTELSOFT shell + RESERVA (rule-table driven from day one);
@@ -74,19 +76,50 @@ screenshot check** on RESERVA.
 
 ## Phase 2 — "One-Man Show" (vertical slice 1) (~2–3 wk) [S, F review]
 
+Split into H2a and H2b at the invariant-2 boundary ([PHASE-H2.md](PHASE-H2.md) §1).
+
+### Phase 2a — "The Living Hotel" — **DONE** (merged 2026-08-26)
+
+Everything that changes `stateHash`. Incremental `stateHash` with
+`stateHashSlow()` as the cross-check on every `--verify-replay`; the
+`indexSystem` per-tick context and the A*-scratch refactor; `actorId` and
+the second actor kind; housekeeping + maintenance as *zen-loop* activities
+(dirty or broken rooms are BLOCKED from re-letting, never punished);
+complaints → reviews → reputation → stars, recomputed from a rolling window
+at each audit; demand curve + pricing; daily objectives; LEDGER / PRICER /
+MAILBOX / STAFF (the registry stops at six apps); the blacklist rule row and
+the MAILBOX bulletins that feed it; and **the first-hire beat** — the
+threshold is printed nightly, résumés print as real document entities, the
+interview happens in person, and the clerk NPC then works the desk through
+the same validated `desk.decision` path the player uses.
+
+*Exit, all met:* `one-man-week` (7 in-game days, ends solvent, one hire, the
+review pipeline emitting, 21 objectives, zero `nav.stuck`); `first-hire`
+(the clerk completes check-ins and a fraud catch unaided, asserted from the
+attribution record); `zen-clean` (the not-ready refusal, and delay costing
+nothing across a real idle gap); `escalation-stars` (reviews → tier → rule
+row → bulletin → a catch that was impossible a day earlier, with a pre-tier
+control); the app decision-path suite and a registry-derived composed-shell
+overflow gate. Verdict: [reviews/phase-H2a.md](reviews/phase-H2a.md).
+
+### Phase 2b — "The Look & The Sound" — next
+
 Retro texture pipeline (quantize + dither atlas, UVs, instancing,
 vertex-colour lighting, PS1 shader look-lock excluding screen quads);
-`audio`; LEDGER / PRICER / MAILBOX / STAFF apps; complaints → reviews →
-reputation; housekeeping + maintenance as *zen-loop* player activities
-(dirty rooms block check-in, props break); demand curve + pricing; daily
-objectives; incremental `stateHash`; **the first-hire beat** — hit the
-threshold, résumés print, interview in person, clerk NPC works the desk
-while you watch.
+`audio`; `frame-time-p95` + `draw-calls` probes and budgets; load-on-boot
+persistence; third-person boom clip.
 
-*Exit:* `one-man-week` (7 in-game days, ends solvent, ≥1 hire completed,
-review pipeline emits); `first-hire` (staff NPC completes a check-in
-end-to-end unaided); `frame-time-p95` + `draw-calls` budgets green; art
-look-lock signed off on screenshots.
+*Exit:* `art-lock` (both engines) with the art look-lock signed off on
+screenshots; `save-resume`; `audio-coverage`; and every headless golden
+pinned at the H2a merge byte-identical afterwards.
+
+**First item for H2b** (carried from the H2a review): there is no repeatable
+browser gate for clicking a mess, a prop or a candidate. The objects render
+and were verified clickable by driving the running game, but a browser
+scenario's `setup` builds only the replay sim — the page runs the app's own
+`setup()` — so a gate can only click what the shipped world contains at the
+tick it runs, and the nearest prop is a bedroom away behind two closed
+doors. H2b owns browser gates; this is the flagship-path hole to close.
 
 ## Phase 3 — "A Real Hotel" (~3–4 wk) [S]
 

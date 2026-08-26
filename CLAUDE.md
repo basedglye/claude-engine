@@ -29,6 +29,16 @@ that idea applied to an entire engine.
 5. **Engine owns the hard parts.** Netcode, persistence, auth, and input
    validation live in engine packages and are human-reviewed. Generated game
    code must not roll its own.
+6. **Write-through.** Sim code mutates components ONLY via `setComponent()`.
+   As of Phase H2a `Sim.stateHash()` is incremental — it caches a
+   per-(component, entity) digest that the write path invalidates — so an
+   in-place mutation of a fetched component object (`pos.x += dx`) is
+   invisible to the hash and silently corrupts every replay comparison
+   built on it. `Sim.stateHashSlow()` is the full-walk cross-check, and the
+   harness asserts the two agree on every run; a disagreement is exit 3, a
+   P0, and is never answered by loosening the check. Numbered last so the
+   older invariant numbers referenced throughout docs/ keep meaning what
+   they always meant.
 
 ## Development loop
 

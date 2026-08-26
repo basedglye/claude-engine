@@ -35,6 +35,7 @@ import {
 } from "./sim/game.js";
 import type { Guest } from "./sim/components.js";
 import { syncCharacter, pruneCharacters } from "./render/characters.js";
+import { syncUpkeepObjects } from "./render/upkeep.js";
 import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
 import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from "./render/screens.js";
 
@@ -290,6 +291,10 @@ const DOOR_SWING_OPEN_RAD = Math.PI / 2;
 // to trigger "presenting". Registered once per entity (guarded by this
 // Set), the same create-once discipline as objectFor itself.
 const registeredGuestInteractables = new Set<EntityId>();
+/** The same guard, for everything H2a added that a player must be able to
+ *  click: messes, props, printed resumes on the tray, and candidates. Same
+ *  hazard, same reset (see resetEntityKeyedHostState below). */
+const registeredUpkeepInteractables = new Set<EntityId>();
 
 /**
  * Reset entity-keyed host state `Sim.restore()` can invalidate (H1b review
@@ -310,6 +315,7 @@ const registeredGuestInteractables = new Set<EntityId>();
  * exercise it for real (docs/reviews/phase-H1b.md item 6). */
 function resetEntityKeyedHostState(): void {
   registeredGuestInteractables.clear();
+  registeredUpkeepInteractables.clear();
 }
 
 // -- Terminal focus / screen input (docs/PHASE-H1.md, "Host (main.ts)
@@ -586,6 +592,14 @@ const host = createThreeHost(sim, {
         registeredGuestInteractables.add(entity);
       }
     }
+    // -- H2a: everything else a player has to be able to see and click --
+    //    messes, props, printed resumes on the tray, and candidates.
+    //    Registered as interactables the same way doors and guest rigs are;
+    //    without this the whole housekeeping/maintenance/hiring layer is
+    //    invisible and unclickable in the actual game while every headless
+    //    gate stays green.
+    const upkeep = syncUpkeepObjects(ctx, world, alpha, controller.registerInteractable, registeredUpkeepInteractables);
+    for (const entity of upkeep.live) liveGuests.add(entity);
     pruneCharacters(liveGuests);
 
     // -- held-document view: docs/PHASE-H1.md "Held-item inspect". --

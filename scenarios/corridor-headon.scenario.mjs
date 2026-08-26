@@ -37,9 +37,16 @@
 //   - both pairs resolve and every agent lands exactly on its goal cell:
 //     arrival ticks 15@18, 16@18, 17@16, 18@14 -- all <= 200, with plenty
 //     of the 300-tick budget left over as headroom.
-//   - the event log for the run is exactly {"nav.yield": 2} -- two yields
-//     (entity 18 blocked by 17 at cell (24,12), ticks 6 and 7) and ZERO
-//     `nav.stuck`.
+//   - the event log for the H1 run was exactly {"nav.yield": 2} -- two
+//     yields (entity 18 blocked by 17 at cell (24,12), ticks 6 and 7) and
+//     ZERO `nav.stuck`. Both are the WAIT branch (blocked agent has the
+//     higher id). H2a adds a third, non-head-on pair for the SIDESTEP
+//     branch: agent 19 starts (30,14) goal (40,14), agent 20 is parked at
+//     (31,14) with its own cell as its goal. Re-derived event log:
+//     nav.yield {19 blocked by 20 at (31,14)} at tick 2 (the sidestep
+//     branch, blocked agent has the LOWER id), then 19 detours via row 13
+//     and lands on (40,14); pairs 1 and 2 are byte-for-byte unchanged
+//     (same yields, same ticks), and nav.stuck is still zero.
 //   - per-tick cell printout confirming real contention rather than a
 //     wide-corridor fly-by: pair 1 shares 8 of its cells between the two
 //     agents, and at tick 9 agent 15's next path cell was (5,9) -- agent
@@ -61,7 +68,15 @@ const AGENTS = [
   { entity: 16, pair: 1, goalCx: 2, goalCz: 10 },
   { entity: 17, pair: 2, goalCx: 24, goalCz: 9 },
   { entity: 18, pair: 2, goalCx: 24, goalCz: 15 },
+  // Pair 3 (H2a, H1b review deferral 4b) -- the SIDESTEP fixture, not a
+  // head-on: 19 walks east along row 14, 20 is PARKED on 19's first step
+  // (its goal is its own cell). See the header note below.
+  { entity: 19, pair: 3, goalCx: 40, goalCz: 14 },
+  { entity: 20, pair: 3, goalCx: 31, goalCz: 14 },
 ];
+/** The one agent whose yield must be the sidestep branch, and its blocker. */
+const SIDESTEP_MOVER = 19;
+const SIDESTEP_BLOCKER = 20;
 const AGENT_IDS = new Set(AGENTS.map((a) => a.entity));
 
 // Pure function of the seed alone -- the same call setup() makes
@@ -109,7 +124,7 @@ export default {
   assertions: [
     {
       description:
-        "all four fixture agents exist and each one's final pos is inside its own (committed) goal cell",
+        "all six fixture agents exist and each one's final pos is inside its own (committed) goal cell",
       check: (s) =>
         AGENTS.every(({ entity, goalCx, goalCz }) => {
           const pos = s.getComponent(entity, "pos");
@@ -121,7 +136,7 @@ export default {
         }),
     },
     {
-      description: `both pairs resolved: every agent reached its goal cell by tick <= ${ARRIVE_BY_TICK}`,
+      description: `all three pairs resolved: every agent reached its goal cell by tick <= ${ARRIVE_BY_TICK}`,
       check: (s) =>
         AGENTS.every(({ entity }) => {
           const log = s.getComponent(entity, "headonLog");
@@ -144,6 +159,55 @@ export default {
               AGENT_IDS.has(e.payload.entity) &&
               AGENT_IDS.has(e.payload.blockedBy)
           ),
+    },
+    {
+      // H1b review round-2 deferral 4b: "sidestep-branch assertion before
+      // crowd density rises". Density rises in H2a (a parked clerk at the
+      // desk work cell, a parked candidate in the lobby), and until this
+      // gate the `occupant > entity` branch of moveSystem's yield rule was
+      // dead code in EVERY scenario in the repo -- verified by counting
+      // nav.yield events with entity < blockedBy across corridor-headon
+      // and checkin-rush: zero. It is asserted here by the id RELATION, so
+      // it cannot be satisfied by the wait branch.
+      description:
+        "the sidestep branch fired: a nav.yield whose blocked agent has the LOWER id of its pair (occupant > entity), on the blocker's cell",
+      check: (s) =>
+        s
+          .eventsSince(0)
+          .some(
+            (e) =>
+              e.type === "nav.yield" &&
+              e.payload.entity === SIDESTEP_MOVER &&
+              e.payload.blockedBy === SIDESTEP_BLOCKER &&
+              e.payload.entity < e.payload.blockedBy
+          ),
+    },
+    {
+      // Firing is not enough: before H2a the sidestep branch cleared the
+      // path and pathSystem recomputed the IDENTICAL route (A* is blind to
+      // occupancy), so the agent re-blocked every tick until nav.stuck.
+      // This asserts the detour actually resolved -- the mover reached a
+      // goal on the far side of a permanently parked blocker, and the
+      // blocker never moved.
+      description:
+        "the sidestep RESOLVED: the blocked agent detoured around a permanently parked blocker and reached its goal, and the blocker never left its cell",
+      check: (s) => {
+        const moverLog = s.getComponent(SIDESTEP_MOVER, "headonLog");
+        const blockerLog = s.getComponent(SIDESTEP_BLOCKER, "headonLog");
+        const blockerPos = s.getComponent(SIDESTEP_BLOCKER, "pos");
+        const blockerAgent = s.getComponent(SIDESTEP_BLOCKER, "navAgent");
+        if (!moverLog || !blockerLog || !blockerPos || !blockerAgent) return false;
+        if (!(moverLog.arrivedTick > 0 && moverLog.arrivedTick <= ARRIVE_BY_TICK)) return false;
+        // The blocker is parked: its goal is its own start cell, and it
+        // still stands there at the end.
+        const blockerCell = cellOfMm(grid, blockerPos.xMm, blockerPos.zMm);
+        return (
+          blockerAgent.goalCx === blockerLog.startCx &&
+          blockerAgent.goalCz === blockerLog.startCz &&
+          blockerCell.cx === blockerLog.startCx &&
+          blockerCell.cz === blockerLog.startCz
+        );
+      },
     },
     {
       description:

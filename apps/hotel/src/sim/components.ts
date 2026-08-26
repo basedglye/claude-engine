@@ -81,6 +81,14 @@ export interface NavAgent {
    *  time (determinism rule 5). */
   jitterSeed: number;
   stuckTicks: number;
+  /** The cell this agent was last blocked on by the yield rule's SIDESTEP
+   *  branch (a higher-EntityId agent that is not vacating), as cell
+   *  coordinates; -1/-1 = none. Consumed and cleared by the very next
+   *  repath, which routes around it. One-shot by construction: a stale
+   *  avoid cell can never wedge an agent, because it never survives the
+   *  repath it was set for. */
+  avoidCx: number;
+  avoidCz: number;
 }
 
 export type DocType = "id" | "resSlip";
@@ -164,6 +172,16 @@ export interface SaveRestoreDebug {
   savedTick: number;
   savedHash: number;
   restoredHash: number;
+}
+
+/** A named list of values that `RuleContext.lists` is built from — the
+ *  seam rules.ts's `listed` check kind was designed against, activated in
+ *  Phase H2a. MAILBOX bulletins append values; nothing ever mutates the
+ *  RULE TABLE at runtime (H2 determinism rule 7 — rows stay committed
+ *  data, world state is what changes). One entity per list id. */
+export interface NoticeList {
+  listId: string;
+  values: string[];
 }
 
 /** Singleton — the repath round-robin cursor. A component, never a closure

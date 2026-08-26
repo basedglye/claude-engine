@@ -32,9 +32,25 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
   const reservationByGuest = new Map<number, { reservationEntity: number; res: Reservation }>();
   let presentingGuestEntity: number | undefined;
 
+  const ledgerEntries: LedgerEntry[] = [];
+
+  // ONE sweep over entities, not two (docs/PHASE-H2.md §12 item 1). The
+  // second sweep existed only to total the ledger, which needs `day` from
+  // the hotel singleton — so the entries are collected here and filtered
+  // by day below, once `hotel` is known.
+  //
+  // Deliberately still `IWorld`-only, NOT the sim-side tick context the
+  // spec suggests: this is the ONE view builder that `screenSystem` and
+  // `main.ts`'s repaint share, and H1b's screen contract exists because two
+  // view builders that can disagree is the bug. The host has no tick
+  // context; giving the sim a second, faster path would recreate exactly
+  // that hazard for a scan that runs at most once per focused tick.
   for (const entity of world.entities()) {
     const h = world.getComponent<Hotel>(entity, "hotel");
     if (h) hotel = h;
+
+    const entry = world.getComponent<LedgerEntry>(entity, "ledgerEntry");
+    if (entry) ledgerEntries.push(entry);
 
     const room = world.getComponent<RoomUnit>(entity, "roomUnit");
     if (room && room.occupantEntity === 0) {
@@ -74,9 +90,8 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
   let revenueMinor = 0;
   let expenseMinor = 0;
   const day = hotel ? hotel.day : 0;
-  for (const entity of world.entities()) {
-    const entry = world.getComponent<LedgerEntry>(entity, "ledgerEntry");
-    if (!entry || entry.day !== day) continue;
+  for (const entry of ledgerEntries) {
+    if (entry.day !== day) continue;
     if (entry.creditAccount === "revenue:rooms") revenueMinor += entry.amountMinor;
     if (entry.debitAccount.startsWith("expense:")) expenseMinor += entry.amountMinor;
   }

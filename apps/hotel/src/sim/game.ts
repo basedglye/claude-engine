@@ -57,6 +57,7 @@ import type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  NoticeList,
   SaveRestoreDebug,
 } from "./components.js";
 import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
@@ -86,6 +87,7 @@ export type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  NoticeList,
   SaveRestoreDebug,
 } from "./components.js";
 
@@ -374,6 +376,18 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         },
       ],
     ];
+    // Pair 3 is NOT head-on — it is the SIDESTEP fixture (H1b review
+    // deferral 4b). The lower-id agent walks east along row 14; the
+    // higher-id agent is PARKED on its first step (goal == its own cell,
+    // so pathSystem skips it and moveSystem never moves it). That is the
+    // only configuration that reaches moveSystem's `occupant > entity`
+    // branch: a higher-id occupant that will not vacate. The mover must
+    // detour around it and still land on its goal, which is what proves
+    // the branch resolves rather than merely fires.
+    pairs.push([
+      { from: { cx: 30, cz: 14 }, to: { cx: 40, cz: 14 } },
+      { from: { cx: 31, cz: 14 }, to: { cx: 31, cz: 14 } },
+    ]);
     for (const pair of pairs) {
       // One draw per PAIR, shared by both of its agents (see note 1 above).
       const pairJitterSeed = guestSpawnRng.int(0, 0x7fffffff);
@@ -393,19 +407,89 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
           repathAtTick: 0,
           jitterSeed: pairJitterSeed,
           stuckTicks: 0,
+          avoidCx: -1,
+          avoidCz: -1,
         });
       }
     }
   }
 
+  // === The per-tick index (docs/PHASE-H2.md §6 system 1, §12 item 1) ====
+  //
+  // ONE object, rebuilt in full at the start of every tick by
+  // `indexSystem` and dead at tick end. This is the H1 "per-tick locals"
+  // rule hoisted so the shared scans happen once instead of once per
+  // reader — NOT closure state: `ctxFor` keys the cached object on
+  // `s.tick` and rebuilds whenever the tick differs, so a fresh setup()
+  // after `Sim.restore()` (or any caller reaching a system out of order)
+  // can never be served a context from a tick that no longer exists.
+  //
+  // Two of its fields are deliberately MUTABLE by their writers, because
+  // that is what the pre-index code did with its local copies and the
+  // goldens encode it:
+  //   - `openCells`: moveSystem's guest-door-opening block adds the cells
+  //     of a door it just opened so the same tick's later agents see it
+  //     open (the local copy did exactly this).
+  //   - `occupancy`: moveSystem moves agents between cells as it walks
+  //     them, and `guestSpawnSystem` inserts a guest it spawns THIS tick
+  //     (the old code built occupancy inside moveSystem, i.e. after the
+  //     spawn, so a tick-new guest was present — dropping it would change
+  //     which agents yield, and therefore the goldens).
+  interface TickContext {
+    tick: number;
+    openCells: Set<number>;
+    isOpen: (cx: number, cz: number) => boolean;
+    occupancy: Map<number, EntityId>;
+    /** Named lists for `RuleContext.lists`, rebuilt per tick from the
+     *  `noticeList` components (never cached across ticks — determinism
+     *  rule 3 of the H2 spec). Empty until MAILBOX delivers a bulletin. */
+    lists: Record<string, string[]>;
+  }
+
+  let tickCtx: TickContext | null = null;
+
+  function buildTickContext(s: Sim): TickContext {
+    const openCells = buildOpenCellSet(s, grid.width, portalCellsByDoorIndex);
+    const lists: Record<string, string[]> = {};
+    for (const [, list] of s.withComponent<NoticeList>("noticeList")) {
+      const bucket = lists[list.listId] ?? (lists[list.listId] = []);
+      for (const value of list.values) bucket.push(value);
+    }
+    return {
+      tick: s.tick,
+      openCells,
+      isOpen: makeIsOpen(openCells, grid.width),
+      occupancy: buildOccupancy(s, grid.width),
+      lists,
+    };
+  }
+
+  function ctxFor(s: Sim): TickContext {
+    if (tickCtx === null || tickCtx.tick !== s.tick) tickCtx = buildTickContext(s);
+    return tickCtx;
+  }
+
   // === Systems ============================================================
 
+  // 0. indexSystem — builds the per-tick context, first, before any reader.
+  function indexSystem(s: Sim): void {
+    tickCtx = buildTickContext(s);
+  }
+
   // 1. snapshotPrevSystem — now over ALL pos/yaw holders, not just player.
+  //    Skips the write when the value is already identical: the resulting
+  //    state (and therefore the hash) is the same either way, but a
+  //    needless setComponent() dirties the incremental hash's cache entry
+  //    for every static prop, every tick.
   function snapshotPrevSystem(s: Sim): void {
     for (const [entity, pos] of s.withComponent<Pos>("pos")) {
+      const prev = s.getComponent<Pos>(entity, "prevPos");
+      if (prev && prev.xMm === pos.xMm && prev.zMm === pos.zMm) continue;
       s.setComponent<Pos>(entity, "prevPos", { xMm: pos.xMm, zMm: pos.zMm });
     }
     for (const [entity, yaw] of s.withComponent<Yaw>("yaw")) {
+      const prev = s.getComponent<Yaw>(entity, "prevYaw");
+      if (prev && prev.mdeg === yaw.mdeg) continue;
       s.setComponent<Yaw>(entity, "prevYaw", { mdeg: yaw.mdeg });
     }
   }
@@ -498,7 +582,14 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       repathAtTick: 0,
       jitterSeed,
       stuckTicks: 0,
+      avoidCx: -1,
+      avoidCz: -1,
     });
+    // The pre-index code built `occupancy` inside moveSystem, i.e. AFTER
+    // this system ran, so a guest spawned this tick was already on its
+    // cell for that tick's yield checks. Keep that exactly.
+    const spawnCtx = ctxFor(s);
+    spawnCtx.occupancy.set(streetCell.cz * grid.width + streetCell.cx, guestEntity);
     s.emit("guest.arrived", { guestEntity });
 
     const interval = 50 + guestSpawnRng.int(0, 100);
@@ -511,9 +602,20 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
   // 4. guestBrainSystem — the FSM.
   function guestBrainSystem(s: Sim): void {
+    // One pass over the `guest` store per tick instead of five: the id list
+    // is collected once (membership cannot change inside this system —
+    // spawning happens before it, despawning after), and every phase below
+    // re-READS each guest's component through getComponent, so a phase
+    // still sees the transitions an earlier phase made. Behaviour-identical
+    // to the five separate scans; the goldens are the proof.
+    const guestIds: EntityId[] = [];
+    for (const [entity] of s.withComponent<Guest>("guest")) guestIds.push(entity);
+
     // -- queue derivation (no closure array; scanned + compacted fresh) --
     const active: [EntityId, Guest][] = [];
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest) continue;
       if ((guest.state === "queued" || guest.state === "presenting") && guest.queueIndex >= 0) {
         active.push([entity, guest]);
       }
@@ -542,8 +644,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
     // -- assign arriving guests to the back of the queue --
     const arriving: [EntityId, Guest][] = [];
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state === "arriving") arriving.push([entity, guest]);
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (guest && guest.state === "arriving") arriving.push([entity, guest]);
     }
     arriving.sort((a, b) => a[0] - b[0]);
     for (const [entity, guest] of arriving) {
@@ -559,8 +662,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     // -- presenting guests: react to a PRIOR tick's desk.decision outcome
     //    (deskSystem, item 8, runs after this system, so `decided` reflects
     //    the previous tick's decision by the time we read it here) --
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state !== "presenting") continue;
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest || guest.state !== "presenting") continue;
       const resEntity = findReservationFor(s, entity);
       if (resEntity === undefined) continue;
       const res = s.getComponent<Reservation>(resEntity, "reservation");
@@ -582,16 +686,18 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
 
     // -- toRoom -> inRoom on arrival --
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state !== "toRoom") continue;
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest || guest.state !== "toRoom") continue;
       if (hasArrived(s, entity)) {
         s.setComponent<Guest>(entity, "guest", { ...guest, state: "inRoom" });
       }
     }
 
     // -- inRoom -> leaving at stayUntilTick --
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state !== "inRoom") continue;
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest || guest.state !== "inRoom") continue;
       if (s.tick < guest.stayUntilTick) continue;
       if (guest.roomEntity !== 0) {
         const room = s.getComponent<RoomUnit>(guest.roomEntity, "roomUnit");
@@ -672,12 +778,21 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (!agent || !pos) continue;
       const from = cellOfMm(grid, pos.xMm, pos.zMm);
       const to: PathCell = { cx: agent.goalCx, cz: agent.goalCz };
-      const path = findJitteredPath(grid, from, to, isOpen, agent.jitterSeed);
+      // Consume the sidestep branch's avoid cell, ONCE. Falling back to
+      // the un-avoided path when no detour exists matters: in a
+      // single-lane corridor there IS no way around, and the agent should
+      // go back to waiting behind the yield rule rather than losing its
+      // path entirely.
+      const avoidIdx = agent.avoidCx >= 0 && agent.avoidCz >= 0 ? agent.avoidCz * grid.width + agent.avoidCx : -1;
+      const detour = avoidIdx >= 0 ? findJitteredPath(grid, from, to, isOpen, agent.jitterSeed, avoidIdx) : null;
+      const path = detour ?? findJitteredPath(grid, from, to, isOpen, agent.jitterSeed);
       s.setComponent<NavAgent>(entity, "navAgent", {
         ...agent,
         path: path ?? [],
         pathIdx: 0,
         repathAtTick: s.tick,
+        avoidCx: -1,
+        avoidCz: -1,
       });
       budget--;
       lastServed = entity;
@@ -711,18 +826,15 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         (fw * cosYaw * MOVE_SPEED_MM_PER_TICK) / (1000 * ONE) - (sw * sinYaw * MOVE_SPEED_MM_PER_TICK) / (1000 * ONE)
       );
 
-      const openCells = buildOpenCellSet(s, grid.width, portalCellsByDoorIndex);
-      const isOpen = makeIsOpen(openCells, grid.width);
-      const resolved = moveCircle(grid, pos.xMm, pos.zMm, dxMm, dzMm, collider.radiusMm, isOpen);
+      const resolved = moveCircle(grid, pos.xMm, pos.zMm, dxMm, dzMm, collider.radiusMm, ctxFor(s).isOpen);
       s.setComponent<Pos>(player, "pos", resolved);
     }
 
     // -- NPC agents, ascending EntityId (deterministic priority order:
     //    lower id yields to nobody; the yield rule below is symmetric with
     //    that ordering) --
-    const openCells = buildOpenCellSet(s, grid.width, portalCellsByDoorIndex);
-    const isOpen = makeIsOpen(openCells, grid.width);
-    const occupancy = buildOccupancy(s, grid.width);
+    const ctx = ctxFor(s);
+    const { openCells, isOpen, occupancy } = ctx;
 
     const agents: [EntityId, NavAgent][] = [...s.withComponent<NavAgent>("navAgent")];
     agents.sort((a, b) => a[0] - b[0]);
@@ -818,12 +930,26 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
             if (agent.stuckTicks < STUCK_THRESHOLD && newStuck >= STUCK_THRESHOLD) {
               s.emit("nav.stuck", { entity, cx: curCell.cx, cz: curCell.cz });
             }
+            // SIDESTEP branch: a higher-EntityId agent is sitting on the
+            // cell we want and is not about to leave it. Before H2a this
+            // cleared the path and let pathSystem recompute — which,
+            // because A* is blind to occupancy, produced the IDENTICAL
+            // route and re-blocked on the same cell every tick until
+            // `nav.stuck` fired. Dead code in every H1 gate (verified: the
+            // branch never once fired), but H2a parks a clerk at the desk
+            // work cell and a candidate in the lobby — permanently
+            // stationary, high-EntityId agents directly in guests' way —
+            // so it becomes live. Recording the blocked cell makes the
+            // repath an actual detour; `pathSystem` consumes and clears it
+            // in the same breath, so it is one-shot and cannot wedge.
             const sidestep = occupant > entity;
             s.setComponent<NavAgent>(entity, "navAgent", {
               ...agent,
               stuckTicks: newStuck,
               path: sidestep ? [] : agent.path,
               pathIdx: sidestep ? 0 : agent.pathIdx,
+              avoidCx: sidestep ? targetCell.cx : agent.avoidCx,
+              avoidCz: sidestep ? targetCell.cz : agent.avoidCz,
             });
             continue;
           }
@@ -1232,6 +1358,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  sim.addSystem(indexSystem);
   sim.addSystem(snapshotPrevSystem);
   sim.addSystem(faceSystem);
   sim.addSystem(guestSpawnSystem);

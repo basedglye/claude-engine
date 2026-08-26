@@ -154,13 +154,63 @@ function isOccupiable(grid: NavGrid, cx: number, cz: number, isOpen: (cx: number
  *  agents with different `agentSeed`s prefer slightly different columns in
  *  wide spaces without ever touching an Rng at query time. Deterministic
  *  tie-break: lower (cz*width+cx) index wins, same convention as
- *  `@claude-engine/space`'s `findPathCells`. */
+ *  `@claude-engine/space`'s `findPathCells`.
+ *
+ *  ALLOCATION (docs/PHASE-H2.md §12 item 2, H1b review deferral 4c): the
+ *  four per-cell working arrays are module-level scratch, sized once to the
+ *  grid and reused across calls via generation stamping instead of being
+ *  allocated and filled per call. At 10 repaths/tick over a ~1000-cell
+ *  grid that was ~40k element writes per tick of pure setup. This is
+ *  deterministic for the same reason a fresh array is: nothing survives a
+ *  call. A cell is only ever read after its stamp has been set to the
+ *  current generation in the same call, so a stale value from a previous
+ *  call can never be observed. The generation counter is a pure
+ *  performance detail — it is never hashed, never in a component, and is
+ *  reset (along with the stamps) on wraparound.
+ */
+let scratchSize = 0;
+let scratchGeneration = 0;
+let scratchGScore = new Int32Array(0);
+let scratchCameFrom = new Int32Array(0);
+let scratchStamp = new Uint32Array(0);
+let scratchClosed = new Uint32Array(0);
+let scratchInOpen = new Uint32Array(0);
+const scratchOpenList: number[] = [];
+
+function ensureScratch(size: number): void {
+  if (scratchSize === size) {
+    scratchGeneration++;
+    // Uint32 wraparound would make every stale stamp look current. Reset
+    // the stamp arrays and restart at 1 — correctness, not just hygiene.
+    if (scratchGeneration >= 0xffffffff) {
+      scratchStamp.fill(0);
+      scratchClosed.fill(0);
+      scratchInOpen.fill(0);
+      scratchGeneration = 1;
+    }
+    return;
+  }
+  scratchSize = size;
+  scratchGeneration = 1;
+  scratchGScore = new Int32Array(size);
+  scratchCameFrom = new Int32Array(size);
+  scratchStamp = new Uint32Array(size);
+  scratchClosed = new Uint32Array(size);
+  scratchInOpen = new Uint32Array(size);
+}
+
 export function findJitteredPath(
   grid: NavGrid,
   from: PathCell,
   to: PathCell,
   isOpen: (cx: number, cz: number) => boolean,
-  agentSeed: number
+  agentSeed: number,
+  /** Cell index (cz*width+cx) to route AROUND, or -1 for none. The
+   *  sidestep branch of moveSystem's yield rule passes the cell it was
+   *  blocked on, so the repath is a genuine detour instead of a re-plan of
+   *  the identical route (see game.ts). Never applied to the start or goal
+   *  cell — an agent standing on it, or aiming at it, still gets a path. */
+  avoidIdx: number = -1
 ): PathCell[] | null {
   if (!isOccupiable(grid, from.cx, from.cz, isOpen)) return null;
   if (!isOccupiable(grid, to.cx, to.cz, isOpen)) return null;
@@ -171,10 +221,20 @@ export function findJitteredPath(
   if (startIdx === goalIdx) return [{ cx: from.cx, cz: from.cz }];
 
   const size = grid.width * grid.height;
-  const gScore = new Array<number>(size).fill(Infinity);
-  const cameFrom = new Array<number>(size).fill(-1);
-  const closed = new Array<boolean>(size).fill(false);
+  ensureScratch(size);
+  const gen = scratchGeneration;
+  const gScore = scratchGScore;
+  const cameFrom = scratchCameFrom;
+  const stamp = scratchStamp;
+  const closed = scratchClosed;
+  const inOpen = scratchInOpen;
+
+  /** gScore for a cell not yet reached this call reads as "infinite". */
+  const gAt = (idx: number): number => (stamp[idx] === gen ? gScore[idx]! : Infinity);
+
   gScore[startIdx] = 0;
+  cameFrom[startIdx] = -1;
+  stamp[startIdx] = gen;
 
   const heuristic = (idx: number): number => {
     const cx = idx % grid.width;
@@ -182,16 +242,17 @@ export function findJitteredPath(
     return Math.abs(cx - to.cx) + Math.abs(cz - to.cz);
   };
 
-  const open: number[] = [startIdx];
-  const inOpen = new Array<boolean>(size).fill(false);
-  inOpen[startIdx] = true;
+  const open = scratchOpenList;
+  open.length = 0;
+  open.push(startIdx);
+  inOpen[startIdx] = gen;
 
   while (open.length > 0) {
     let bestPos = 0;
-    let bestF = gScore[open[0]!]! + heuristic(open[0]!);
+    let bestF = gAt(open[0]!) + heuristic(open[0]!);
     for (let i = 1; i < open.length; i++) {
       const idx = open[i]!;
-      const f = gScore[idx]! + heuristic(idx);
+      const f = gAt(idx) + heuristic(idx);
       if (f < bestF || (f === bestF && idx < open[bestPos]!)) {
         bestF = f;
         bestPos = i;
@@ -199,9 +260,11 @@ export function findJitteredPath(
     }
     const currentIdx = open[bestPos]!;
     open.splice(bestPos, 1);
-    inOpen[currentIdx] = false;
+    inOpen[currentIdx] = 0;
 
     if (currentIdx === goalIdx) {
+      // The output path is a FRESH array: it lives in a component, so it
+      // must not alias scratch.
       const path: PathCell[] = [];
       let cur = currentIdx;
       while (cur !== -1) {
@@ -211,7 +274,7 @@ export function findJitteredPath(
       path.reverse();
       return path;
     }
-    closed[currentIdx] = true;
+    closed[currentIdx] = gen;
 
     const cx = currentIdx % grid.width;
     const cz = Math.floor(currentIdx / grid.width);
@@ -225,15 +288,17 @@ export function findJitteredPath(
       if (n.cx < 0 || n.cz < 0 || n.cx >= grid.width || n.cz >= grid.height) continue;
       if (!isOccupiable(grid, n.cx, n.cz, isOpen)) continue;
       const nIdx = idxOf(n.cx, n.cz);
-      if (closed[nIdx]) continue;
+      if (nIdx === avoidIdx && nIdx !== goalIdx) continue;
+      if (closed[nIdx] === gen) continue;
       const stepCost = 1 + jitter(agentSeed, n.cx, n.cz, grid.width);
-      const tentativeG = gScore[currentIdx]! + stepCost;
-      if (tentativeG < gScore[nIdx]!) {
+      const tentativeG = gAt(currentIdx) + stepCost;
+      if (tentativeG < gAt(nIdx)) {
         cameFrom[nIdx] = currentIdx;
         gScore[nIdx] = tentativeG;
-        if (!inOpen[nIdx]) {
+        stamp[nIdx] = gen;
+        if (inOpen[nIdx] !== gen) {
           open.push(nIdx);
-          inOpen[nIdx] = true;
+          inOpen[nIdx] = gen;
         }
       }
     }

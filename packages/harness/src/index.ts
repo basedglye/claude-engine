@@ -85,12 +85,63 @@ export interface Verdict {
   eventsTail?: readonly GameEvent[];
   /** Present only when the caller requests a replay-equivalence check (e.g. the CLI's --verify-replay). */
   replayCheck?: { verified: boolean; expectedHash: number; actualHash: number };
+  /**
+   * Incremental-vs-slow `stateHash` cross-check (docs/PHASE-H2.md contract
+   * A). `live` is the sim this verdict ran; `replay` is the replayed sim,
+   * present only when a replay actually happened (--verify-replay, or
+   * browser mode's assertion replay). A disagreement means some sim system
+   * mutated a component object in place without a setComponent() call — a
+   * P0 determinism bug, exit 3, never something to loosen.
+   */
+  hashCheck?: {
+    live: HashConsistency;
+    replay?: HashConsistency;
+  };
   /** Present iff the scenario declared checkpoints. */
   checkpoints?: Checkpoint[];
   /** Present iff run with --browser (see @claude-engine/harness/browser). */
   browser?: unknown;
   /** Present iff run with --soak (see @claude-engine/harness/soak). */
   soak?: unknown;
+}
+
+/** One incremental-vs-slow comparison. `agrees` is the only field a gate
+ *  needs; the two hashes are carried so a failure verdict names the actual
+ *  numbers instead of just "they differ". */
+export interface HashConsistency {
+  incremental: number;
+  slow: number;
+  agrees: boolean;
+}
+
+/**
+ * How often, in ticks, a run cross-checks the incremental hash against the
+ * full walk mid-run — not only at the end.
+ *
+ * The end-of-run check alone has a healing window the H2a review measured:
+ * an in-place mutation is invisible once any later legitimate setComponent
+ * on the same entry re-digests the already-mutated object, so only a
+ * violator that is the entry's LAST writer is caught. Checking every N ticks
+ * bounds that window to N instead of to the whole run. It does not close it
+ * — closing it means the full walk every tick, which is the cost the
+ * incremental hash exists to remove — and Sim.stateHashSlow()'s doc comment
+ * says so.
+ *
+ * 500 ticks (25 s of sim time) costs one full walk per 500: on the
+ * 42,000-tick one-man-week run that is 84 extra walks, ~0.002 ms/tick
+ * amortised, against a run budget of 1.0.
+ */
+export const HASH_CROSSCHECK_INTERVAL_TICKS = 500;
+
+/**
+ * Assert Sim.stateHash() === Sim.stateHashSlow() (docs/PHASE-H2.md contract
+ * A / determinism rule 6). One full state walk against a hash the run has
+ * already been maintaining incrementally.
+ */
+export function checkHashConsistency(sim: Sim): HashConsistency {
+  const incremental = sim.stateHash();
+  const slow = sim.stateHashSlow();
+  return { incremental, slow, agrees: incremental === slow };
 }
 
 export function runScenario(scenario: Scenario): Verdict {
@@ -111,6 +162,8 @@ export function runScenario(scenario: Scenario): Verdict {
   // `scenario.commands ?? []`, unaffected by tick-grouping order.
   const submittedCommands: Command[] | undefined = scenario.bots ? [] : undefined;
 
+  let firstHashDivergence: HashConsistency | undefined;
+
   const tickMs: number[] = [];
   const start = performance.now();
   for (let t = 1; t <= scenario.ticks; t++) {
@@ -128,6 +181,10 @@ export function runScenario(scenario: Scenario): Verdict {
     const tickStart = performance.now();
     sim.step();
     tickMs.push(performance.now() - tickStart);
+    if (firstHashDivergence === undefined && t % HASH_CROSSCHECK_INTERVAL_TICKS === 0) {
+      const periodic = checkHashConsistency(sim);
+      if (!periodic.agrees) firstHashDivergence = periodic;
+    }
     if (checkpointTicks.has(t)) {
       checkpoints.push({
         tick: t,
@@ -169,6 +226,10 @@ export function runScenario(scenario: Scenario): Verdict {
       p95TickMs: percentile(tickMs, 0.95),
       maxTickMs: tickMs.reduce((m, v) => Math.max(m, v), 0),
     },
+    // The FIRST mid-run divergence wins if there was one: a later
+    // end-of-run agreement does not un-diverge an earlier one, and
+    // reporting the final check would hide it.
+    hashCheck: { live: firstHashDivergence ?? checkHashConsistency(sim) },
     ...(passed ? {} : { eventsTail: sim.eventsSince(0).slice(-50) }),
     ...(scenario.checkpoints ? { checkpoints } : {}),
   };
@@ -185,16 +246,23 @@ export function verifyReplay(
   expectedHash: number,
   commands?: readonly Command[],
   ticks?: number
-): { verified: boolean; expectedHash: number; actualHash: number } {
+): { verified: boolean; expectedHash: number; actualHash: number; hashCheck: HashConsistency } {
   // Browser-mode runs land on a wall-clock-determined final tick that can
   // differ from scenario.ticks (the static headless tick count) — the
   // caller passes the run's actual final tick so replay covers exactly the
   // ticks that were live. Headless callers omit `ticks` and keep the
   // original scenario.ticks behaviour unchanged.
   const tickCount = ticks ?? scenario.ticks;
-  const sim = replayToSim(scenario, commands ?? scenario.commands ?? [], tickCount);
-  const actualHash = sim.stateHash();
-  return { verified: actualHash === expectedHash, expectedHash, actualHash };
+  const replayed = replayToSimChecked(scenario, commands ?? scenario.commands ?? [], tickCount);
+  const actualHash = replayed.sim.stateHash();
+  return {
+    verified: actualHash === expectedHash,
+    expectedHash,
+    actualHash,
+    // Same rule as the live leg: the FIRST divergence wins over a later
+    // end-of-run agreement.
+    hashCheck: replayed.firstDivergence ?? checkHashConsistency(replayed.sim),
+  };
 }
 
 /**
@@ -204,19 +272,49 @@ export function verifyReplay(
  * setup() always runs first, same as every other replay path in this file.
  */
 export function replayToSim(scenario: Scenario, commands: readonly Command[], ticks: number): Sim {
+  return replayToSimChecked(scenario, commands, ticks).sim;
+}
+
+/** `replayToSim` plus the first mid-run incremental-vs-slow divergence it
+ *  saw, if any — the replay leg of the same periodic cross-check the live
+ *  run does (see HASH_CROSSCHECK_INTERVAL_TICKS). Split out rather than
+ *  changing replayToSim's return type, because that function is called from
+ *  three places that only want the sim. */
+export function replayToSimChecked(
+  scenario: Scenario,
+  commands: readonly Command[],
+  ticks: number
+): { sim: Sim; firstDivergence?: HashConsistency } {
   const sim = new Sim(scenario.seed);
   scenario.setup(sim);
+  // Prime the incremental-hash cache exactly as the live path does
+  // (runScenario computes setupStateHash here). Without this, the replay
+  // sim's cache is built for the first time at the FINAL hash, when every
+  // entry is recomputed fresh — so its incremental/slow cross-check could
+  // never disagree, and the replay leg of the check would be vacuous.
+  // Note the honest residual: the cross-check catches an in-place mutation
+  // of a component that has been hashed at least once. A component created
+  // AND mutated in place between two hash calls is invisible until the next
+  // one — which is why per-tick hashing paths (core's replay(), checkpoints)
+  // are the sharp end of this detector, and why the house rule is enforced
+  // by review and by the core suite's negative control as well as here.
+  sim.stateHash();
   const byTick = new Map<number, Command[]>();
   for (const c of commands) {
     const list = byTick.get(c.tick) ?? [];
     list.push(c);
     byTick.set(c.tick, list);
   }
+  let firstDivergence: HashConsistency | undefined;
   for (let t = 1; t <= ticks; t++) {
     for (const c of byTick.get(t) ?? []) sim.submit(c);
     sim.step();
+    if (firstDivergence === undefined && t % HASH_CROSSCHECK_INTERVAL_TICKS === 0) {
+      const periodic = checkHashConsistency(sim);
+      if (!periodic.agrees) firstDivergence = periodic;
+    }
   }
-  return sim;
+  return firstDivergence === undefined ? { sim } : { sim, firstDivergence };
 }
 
 /** Evaluate a scenario's declared assertions against a sim's final state —

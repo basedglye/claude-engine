@@ -54,8 +54,7 @@ function createGameSetup() {
             if (owner === c.actor) {
               const pos = s.getComponent(id, "pos");
               if (pos) {
-                pos.x += c.payload.dx;
-                pos.z += c.payload.dz ?? 0;
+                s.setComponent(id, "pos", { x: pos.x + c.payload.dx, z: pos.z + (c.payload.dz ?? 0) });
               }
               break;
             }

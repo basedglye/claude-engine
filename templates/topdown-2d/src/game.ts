@@ -60,9 +60,16 @@ export function setup(sim: Sim): void {
     for (const c of s.commands()) {
       if (c.type !== "move") continue;
       const { dx, dy } = c.payload as { dx: number; dy: number };
-      pos.x = clamp(pos.x + dx, -GRID_HALF, GRID_HALF);
-      pos.y = clamp(pos.y + dy, -GRID_HALF, GRID_HALF);
-      s.emit("moved", { x: pos.x, y: pos.y });
+      // Write-through, never in-place: Sim.stateHash() caches a
+      // per-component digest keyed off setComponent() calls, so an in-place
+      // mutation is invisible to the hash (and to replay divergence).
+      const cur = s.getComponent<GridPos>(player, "pos")!;
+      const next: GridPos = {
+        x: clamp(cur.x + dx, -GRID_HALF, GRID_HALF),
+        y: clamp(cur.y + dy, -GRID_HALF, GRID_HALF),
+      };
+      s.setComponent<GridPos>(player, "pos", next);
+      s.emit("moved", { x: next.x, y: next.y });
     }
   });
 
@@ -71,8 +78,9 @@ export function setup(sim: Sim): void {
   sim.addSystem((s) => {
     if (s.tick % 60 !== 0) return;
     const hp = s.getComponent<PlayerHp>(player, "hp")!;
-    hp.value -= hazard.int(1, 3);
-    s.emit("damaged", { hp: hp.value });
+    const value = hp.value - hazard.int(1, 3);
+    s.setComponent<PlayerHp>(player, "hp", { value });
+    s.emit("damaged", { hp: value });
   });
 }
 

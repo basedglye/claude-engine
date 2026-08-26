@@ -36,9 +36,9 @@ function setupCounterGame(sim) {
     for (const c of s.commands()) {
       const state = s.getComponent(e, "counter");
       if (c.type === "inc") {
-        state.value += c.payload?.by ?? 1;
+        s.setComponent(e, "counter", { ...state, value: state.value + (c.payload?.by ?? 1) });
       } else if (c.type === "roll") {
-        state.rolls.push(fork.int(0, 99));
+        s.setComponent(e, "counter", { ...state, rolls: [...state.rolls, fork.int(0, 99)] });
       }
     }
   });
@@ -241,6 +241,10 @@ function spawnClerk(sim, floor) {
   sim.setComponent(clerk, "yaw", { mdeg: yawMdeg });
   sim.setComponent(clerk, "prevYaw", { mdeg: yawMdeg });
   sim.setComponent(clerk, "player", { actor: CLERK_ACTOR });
+  // H2a: `actorId` is what game.ts's findActorEntity resolves an actor
+  // string through (ARCHITECTURE B9). `player` alone no longer makes an
+  // entity addressable by commands.
+  sim.setComponent(clerk, "actorId", { actor: CLERK_ACTOR });
   return clerk;
 }
 

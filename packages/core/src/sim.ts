@@ -32,6 +32,20 @@ export class Sim implements IWorld {
 
   private nextEntity: EntityId = 1;
   private readonly components = new Map<string, Map<EntityId, unknown>>();
+  /**
+   * Per-(component, entity) cached FNV entry hash — the incremental
+   * stateHash()'s only state. Mirrors `components` key-for-key AND in the
+   * same insertion order — every write path (setComponent, removeComponent,
+   * despawn) touches both maps together — so the hash walk iterates the
+   * cache directly instead of paying a Map lookup per entry. `undefined`
+   * means "dirty, recompute"; an absent cache Map for a component means
+   * "not built yet" (a brand-new store, or post-restore, which clears the
+   * cache wholesale) and is rebuilt from the store on the next hash. The
+   * cache can never be stale-wrong on its own: it goes wrong only if sim
+   * code mutates a component object in place without a setComponent()
+   * call, which is exactly what stateHashSlow() exists to catch.
+   */
+  private readonly entryHashes = new Map<string, Map<EntityId, number | undefined>>();
   private readonly systems: System[] = [];
   private readonly pendingCommands: Command[] = [];
   private readonly eventLog: GameEvent[] = [];
@@ -85,6 +99,10 @@ export class Sim implements IWorld {
       this.components.set(component, store);
     }
     store.set(entity, value);
+    // Mark dirty, never delete: a delete would move the key to the END of
+    // the cache's insertion order when it is written again, desyncing it
+    // from the store order the hash folds in.
+    this.entryHashes.get(component)?.set(entity, undefined);
   }
 
   getComponent<T>(entity: EntityId, component: string): T | undefined {
@@ -93,6 +111,7 @@ export class Sim implements IWorld {
 
   removeComponent(entity: EntityId, component: string): void {
     this.components.get(component)?.delete(entity);
+    this.entryHashes.get(component)?.delete(entity);
   }
 
   *withComponent<T>(component: string): Iterable<[EntityId, T]> {
@@ -118,6 +137,7 @@ export class Sim implements IWorld {
    */
   despawn(entity: EntityId): void {
     for (const store of this.components.values()) store.delete(entity);
+    for (const cache of this.entryHashes.values()) cache.delete(entity);
   }
 
   /**
@@ -189,21 +209,126 @@ export class Sim implements IWorld {
     this.pendingCommands.length = 0;
   }
 
-  /** Deterministic state hash — the replay-divergence detector. */
+  /**
+   * Deterministic state hash — the replay-divergence detector.
+   *
+   * INCREMENTAL as of Phase H2 (docs/PHASE-H2.md contract A): every write
+   * path invalidates a per-(component, entity) cached entry hash;
+   * stateHash() recomputes only invalidated entries (FNV-1a over
+   * name + id + JSON — exactly one JSON.stringify per WRITE, not per call)
+   * and folds the cached entry hashes in component-store insertion order.
+   * Same order as the pre-H2 byte-stream hash, so iteration-order
+   * divergence stays detectable; the numeric VALUES differ from pre-H2 (a
+   * one-time, repo-wide golden re-pin — a sequential stream hash cannot be
+   * reproduced by folding per-entry digests). Cost: O(entities) small mixes
+   * plus O(dirty bytes) instead of O(total state bytes) per call.
+   *
+   * CONTRACT — the write-through rule, now load-bearing: sim code MUST
+   * mutate components via setComponent(). Mutating a fetched component
+   * object in place without a setComponent() call was always against house
+   * style and is now a hash-corrupting bug. stateHashSlow() exists so the
+   * harness can catch exactly that (see verifyStateHashConsistency in
+   * @claude-engine/harness, asserted on every --verify-replay).
+   */
   stateHash(): number {
+    return this.combineStateHash(true);
+  }
+
+  /**
+   * The pre-H2 full-walk hash, in the SAME combination scheme as the
+   * incremental path — the two MUST always agree. A divergence means some
+   * component object was mutated in place without a setComponent() call
+   * (see stateHash()'s contract note), which is a P0 determinism bug, not a
+   * hashing detail. Kept as the --verify slow path per ARCHITECTURE B8's
+   * fix-order item 2.
+   *
+   * WHAT THIS DETECTOR DOES NOT CATCH — stated precisely, because the first
+   * version of this comment understated it and the H2a review proved it
+   * (verdict item 2). Comparing the two hashes at a point in time catches an
+   * in-place mutation only while the stale digest is still cached. Any later
+   * LEGITIMATE setComponent() on the same (component, entity) invalidates
+   * the entry, the next hash recomputes it from the already-mutated object,
+   * and the violation heals silently. So:
+   *
+   *   - a violator that is the entry's LAST writer before the check is
+   *     caught — and that is the dangerous class, because its staleness is
+   *     permanent;
+   *   - a violator followed by any normal write to the same entry is not.
+   *
+   * The harness therefore cross-checks periodically as well as at the end
+   * (see HASH_CROSSCHECK_INTERVAL_TICKS in @claude-engine/harness), which
+   * shrinks the window to that interval rather than the whole run. It does
+   * not close it: closing it means running the full walk every tick, which
+   * is the cost this whole change exists to remove. The rule is enforced by
+   * review and by house style; this is the backstop, not the proof.
+   */
+  stateHashSlow(): number {
+    return this.combineStateHash(false);
+  }
+
+  /** FNV-1a over `name`, `id`, and `JSON.stringify(value)` — one component
+   *  entry's digest, the unit both hash paths fold. */
+  private static entryHash(name: string, id: EntityId, value: unknown): number {
     let h = 0x811c9dc5;
-    const mix = (n: number) => {
-      h ^= n >>> 0;
+    for (let i = 0; i < name.length; i++) {
+      h ^= name.charCodeAt(i);
       h = Math.imul(h, 0x01000193);
-    };
-    mix(this.tick);
-    mix(this.nextEntity);
+    }
+    h ^= id >>> 0;
+    h = Math.imul(h, 0x01000193);
+    const json = JSON.stringify(value) ?? "";
+    for (let i = 0; i < json.length; i++) {
+      h ^= json.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+  }
+
+  /** One combination scheme, two entry-hash sources. Component NAMES are
+   *  still folded per store even when the store is empty, so a
+   *  created-then-emptied store stays distinguishable from one that never
+   *  existed — the pre-H2 hash made that distinction and dropping it would
+   *  quietly weaken the detector. */
+  private combineStateHash(useCache: boolean): number {
+    // The mixing step is written out inline rather than through a `mix()`
+    // closure: this is the hot loop of the whole determinism check, and a
+    // closure over a mutable `h` costs more than the mix itself.
+    const PRIME = 0x01000193;
+    let h = 0x811c9dc5;
+    h ^= this.tick >>> 0;
+    h = Math.imul(h, PRIME);
+    h ^= this.nextEntity >>> 0;
+    h = Math.imul(h, PRIME);
     for (const [name, store] of this.components) {
-      for (let i = 0; i < name.length; i++) mix(name.charCodeAt(i));
-      for (const [id, value] of store) {
-        mix(id);
-        const json = JSON.stringify(value) ?? "";
-        for (let i = 0; i < json.length; i++) mix(json.charCodeAt(i));
+      for (let i = 0; i < name.length; i++) {
+        h ^= name.charCodeAt(i);
+        h = Math.imul(h, PRIME);
+      }
+      if (!useCache) {
+        for (const [id, value] of store) {
+          h ^= Sim.entryHash(name, id, value);
+          h = Math.imul(h, PRIME);
+        }
+        continue;
+      }
+      let cache = this.entryHashes.get(name);
+      if (cache === undefined || cache.size !== store.size) {
+        // Not built yet: a brand-new store, or post-restore. Rebuild the
+        // key set in store order, all dirty. Sizes are the only way the two
+        // maps can ever differ — content and order cannot diverge, because
+        // every write path writes to both.
+        cache = new Map();
+        for (const id of store.keys()) cache.set(id, undefined);
+        this.entryHashes.set(name, cache);
+      }
+      for (const [id, cached] of cache) {
+        let entry = cached;
+        if (entry === undefined) {
+          entry = Sim.entryHash(name, id, store.get(id));
+          cache.set(id, entry);
+        }
+        h ^= entry;
+        h = Math.imul(h, PRIME);
       }
     }
     return h >>> 0;
@@ -216,12 +341,12 @@ export class Sim implements IWorld {
    *
    * Component values are deep-cloned (JSON round-trip — they are already
    * required to be JSON-serializable, per stateHash()) rather than
-   * referenced live. Game code in this repo mutates component objects in
-   * place (`pos.x += dx`); without cloning, every captured checkpoint would
-   * alias the same live object and silently show whatever it mutates to by
-   * the time anything reads the snapshot back — invisible in Phase 1/2
-   * (only stateHash(), computed immediately, was ever relied on) but wrong
-   * once restore() makes snapshot.components load-bearing.
+   * referenced live. Sim code is required to write through setComponent()
+   * (stateHash()'s Phase-H2 contract), but a caller outside the sim can
+   * still hold a reference to a component object; without cloning, every
+   * captured checkpoint would alias the live object and silently show
+   * whatever it mutates to by the time anything reads the snapshot back —
+   * wrong once restore() makes snapshot.components load-bearing.
    */
   snapshot(): SimSnapshot {
     const components: Record<string, [EntityId, unknown][]> = {};
@@ -275,6 +400,7 @@ export class Sim implements IWorld {
     }
 
     this.components.clear();
+    this.entryHashes.clear();
     for (const [name, entries] of Object.entries(snapshot.components)) {
       // Deep-clone (not just re-Map the same value refs): the snapshot
       // object may be restored more than once (e.g. persistence recovery

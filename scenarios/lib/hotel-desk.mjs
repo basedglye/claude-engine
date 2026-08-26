@@ -42,6 +42,10 @@ export function spawnClerk(sim, floor, atan2Mdeg) {
   sim.setComponent(clerk, "yaw", { mdeg: yawMdeg });
   sim.setComponent(clerk, "prevYaw", { mdeg: yawMdeg });
   sim.setComponent(clerk, "player", { actor: CLERK_ACTOR });
+  // H2a: `actorId` is what game.ts's findActorEntity resolves an actor
+  // string through (ARCHITECTURE B9). `player` alone no longer makes an
+  // entity addressable by commands.
+  sim.setComponent(clerk, "actorId", { actor: CLERK_ACTOR });
   return clerk;
 }
 

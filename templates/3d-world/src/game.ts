@@ -83,9 +83,16 @@ export function setup(sim: Sim): void {
     for (const c of s.commands()) {
       if (c.type !== "move") continue;
       const { dx, dz } = c.payload as { dx: number; dz: number };
-      pos.x = clamp(pos.x + dx, -TERRAIN_OPTIONS.size / 2, TERRAIN_OPTIONS.size / 2);
-      pos.z = clamp(pos.z + dz, -TERRAIN_OPTIONS.size / 2, TERRAIN_OPTIONS.size / 2);
-      s.emit("moved", { x: pos.x, z: pos.z, y: heightAt(terrain, pos.x, pos.z) });
+      // Write-through, never in-place: Sim.stateHash() caches a
+      // per-component digest keyed off setComponent() calls, so an in-place
+      // mutation is invisible to the hash (and to replay divergence).
+      const cur = s.getComponent<PlayerPos>(player, "pos")!;
+      const next: PlayerPos = {
+        x: clamp(cur.x + dx, -TERRAIN_OPTIONS.size / 2, TERRAIN_OPTIONS.size / 2),
+        z: clamp(cur.z + dz, -TERRAIN_OPTIONS.size / 2, TERRAIN_OPTIONS.size / 2),
+      };
+      s.setComponent<PlayerPos>(player, "pos", next);
+      s.emit("moved", { x: next.x, z: next.z, y: heightAt(terrain, next.x, next.z) });
     }
   });
 
@@ -94,8 +101,9 @@ export function setup(sim: Sim): void {
   sim.addSystem((s) => {
     if (s.tick % 60 !== 0) return;
     const hp = s.getComponent<PlayerHp>(player, "hp")!;
-    hp.value -= hazard.int(1, 3);
-    s.emit("damaged", { hp: hp.value });
+    const value = hp.value - hazard.int(1, 3);
+    s.setComponent<PlayerHp>(player, "hp", { value });
+    s.emit("damaged", { hp: value });
   });
 }
 

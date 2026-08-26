@@ -95,6 +95,13 @@ export interface BrowserRunReport {
   deterministic: false;
   finalTick: number;
   finalStateHash: number;
+  /** The PAGE-side incremental-vs-slow stateHash cross-check (docs/
+   *  PHASE-H2.md contract A). The live sim of a browser run lives in the
+   *  page, not in this process, so the cross-check has to be evaluated
+   *  there. `available: false` means the page's world is not a `Sim` (no
+   *  `stateHashSlow`) — reported honestly rather than silently counted as a
+   *  pass. */
+  liveHashCheck: { available: boolean; incremental: number; slow: number; agrees: boolean };
   screenshots: { requestedTick: number; actualTick: number; path: string }[];
   consoleErrors: string[];
   pageErrors: string[];
@@ -393,13 +400,29 @@ export async function runBrowserScenario(
     const finalState = await page.evaluate(() => {
       const hook = (window as unknown as {
         __WORLDFORGE__: {
-          world: { tick: number; stateHash(): number; eventsSince(t: number): unknown[]; entities(): Iterable<number> };
+          world: {
+            tick: number;
+            stateHash(): number;
+            stateHashSlow?: () => number;
+            eventsSince(t: number): unknown[];
+            entities(): Iterable<number>;
+          };
           commandLog(): { tick: number; actor: string; type: string; payload?: unknown }[];
         };
       }).__WORLDFORGE__;
+      // Duck-typed on purpose: `IWorld` (the hook's declared type) has no
+      // stateHashSlow — it is a `Sim`-only method. Every app in this repo
+      // hands the hook its real Sim, so the check is live; an app that
+      // hands over some other IWorld gets `available: false` instead of a
+      // vacuous pass.
+      const incremental = hook.world.stateHash();
+      const slowFn = hook.world.stateHashSlow;
+      const available = typeof slowFn === "function";
+      const slow = available ? slowFn!.call(hook.world) : incremental;
       return {
         tick: hook.world.tick,
-        stateHash: hook.world.stateHash(),
+        stateHash: incremental,
+        liveHashCheck: { available, incremental, slow, agrees: incremental === slow },
         eventCount: hook.world.eventsSince(0).length,
         entityCount: [...hook.world.entities()].length,
         commands: hook.commandLog(),
@@ -419,6 +442,7 @@ export async function runBrowserScenario(
         deterministic: false,
         finalTick: finalState.tick,
         finalStateHash: finalState.stateHash,
+        liveHashCheck: finalState.liveHashCheck,
         screenshots,
         consoleErrors,
         pageErrors,

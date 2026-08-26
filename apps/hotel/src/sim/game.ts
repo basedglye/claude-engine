@@ -45,6 +45,7 @@ import type {
   Door,
   Interactable,
   Player,
+  ActorId,
   Guest,
   NavAgent,
   PathCell,
@@ -57,12 +58,56 @@ import type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  NoticeList,
+  Mess,
+  Prop,
+  Review,
+  Objective,
+  Staffed,
+  StaffWork,
+  Candidate,
+  Person,
+  Mail,
   SaveRestoreDebug,
 } from "./components.js";
-import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath } from "./nav.js";
-import { H1_RULES, plantViolation, type RuleDoc, type ResFields } from "./rules.js";
-import { pickArchetype, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
+import { buildOpenCellSet, buildOccupancy, makeIsOpen, findJitteredPath, isOccupiable as isOccupiableCell, hash32 } from "./nav.js";
+import {
+  H1_RULES,
+  evaluateRules,
+  plantViolation,
+  plantableRules,
+  rulesForStars,
+  type RuleContext,
+  type RuleDoc,
+  type ResFields,
+} from "./rules.js";
+import { ARCHETYPES, pickArchetype, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
+import {
+  scoreReview,
+  reputationBySegment,
+  overallReputation,
+  starsFromReputation,
+  REVIEW_WINDOW_DAYS,
+  DEFAULT_REP_PERMILLE,
+  type ReviewRow,
+} from "./reviews.js";
+import {
+  arrivalsForDay,
+  totalArrivals,
+  generateObjectives,
+  isValidRate,
+  OBJECTIVE_KINDS,
+  HIRE_THRESHOLD_MINOR,
+  DAILY_UTILITIES_MINOR as UTILITIES_MINOR,
+  DAILY_OVERHEAD_MINOR,
+} from "./economy.js";
 import { hotelShell, buildScreenWorldView } from "./screen.js";
+import {
+  generateCandidate,
+  decisionDelayTicks,
+  clerkErrs,
+  CANDIDATES_PER_ROUND,
+} from "./staff.js";
 import type { ScreenInput, ScreenEffect } from "@claude-engine/surface-ui";
 
 export type {
@@ -73,6 +118,7 @@ export type {
   Interactable,
   InteractableKind,
   Player,
+  ActorId,
   Guest,
   GuestState,
   NavAgent,
@@ -86,6 +132,16 @@ export type {
   Hotel,
   LedgerEntry,
   NavSchedule,
+  NoticeList,
+  Mess,
+  Prop,
+  Staffed,
+  StaffWork,
+  Candidate,
+  Person,
+  Review,
+  Mail,
+  Objective,
   SaveRestoreDebug,
 } from "./components.js";
 
@@ -141,16 +197,50 @@ const STAY_TICKS = 1600;
  *  block in setupWithConfig. */
 const HEADON_Z_HALF_SPAN = 3;
 
+/** Opening nightly rates per tier, in minor units. H2a moves the live
+ *  rates into `hotel.rateByTier` (PRICER edits them); this is the starting
+ *  table and the fallback when a tier is missing. Keys are strings because
+ *  the component is JSON-plain and JSON object keys are strings — reading
+ *  it back through a number key would silently miss. */
+const DEFAULT_RATE_BY_TIER: Record<string, number> = { "1": 5000, "2": 8000 };
 const ROOM_RATE_MINOR: Record<number, number> = { 1: 5000, 2: 8000 };
-const DAILY_WAGES_MINOR = 3000;
-const DAILY_UTILITIES_MINOR = 1500;
+/** H1 shipped a flat "wages" line even with no staff. H2a splits it: the
+ *  owner's own draw is overhead, and WAGES are the sum of the `staffed`
+ *  components — so hiring shows up on the expense line as a real change,
+ *  which is the whole point of the first-hire beat's economics. */
+const DAILY_WAGES_MINOR = DAILY_OVERHEAD_MINOR;
+const DAILY_UTILITIES_MINOR = UTILITIES_MINOR;
+
+/** Housekeeping/maintenance content (docs/PHASE-H2.md §9, open question 2).
+ *  Comedy flavour only — no system reads the kind. */
+const MESS_KINDS: readonly string[] = [
+  "pizza-box",
+  "mystery-stain",
+  "towel-mountain",
+  "minibar-carnage",
+  "suspicious-glitter",
+];
+const PROP_KINDS: readonly string[] = ["tv", "radiator", "lamp", "icebox"];
+
+/** A checkout leaves 2..4 discrete messes — bounded by spec. */
+const MESS_MIN = 2;
+const MESS_MAX = 4;
+/** Repair is this many `interact` presses. Bounded, no consumables, no
+ *  failure state — the zen ruling's "one verb" (DESIGN §6, H2 spec §9). */
+const REPAIR_STEPS = 3;
+/** Per-prop chance, per night, of breaking. Drawn once per prop at the day
+ *  rollover from forkRng("upkeep"). */
+const BREAKAGE_PERMILLE = 150;
 
 export type InteractDeniedReason =
   | "no-interactable"
   | "out-of-range"
   | "out-of-arc"
   | "not-a-door"
-  | "not-presenting-eligible";
+  | "not-presenting-eligible"
+  | "not-broken"
+  | "not-a-mess"
+  | "not-interviewable";
 
 // -- Scenario config hook (spec: "Scenario config hook") ------------------
 
@@ -168,6 +258,36 @@ export interface ScenarioConfig {
    *  same lane; see the fixture block in setupWithConfig and
    *  scenarios/corridor-headon.scenario.mjs. */
   fixture: "normal" | "headon";
+  /** H2a housekeeping/maintenance. When false, no props are created, no
+   *  checkout leaves a mess, and nothing ever breaks.
+   *
+   *  The H1 gates pin this FALSE, for the same reason determinism rule 8
+   *  pins them to the fixed-schedule spawn path: `checkin-rush`'s whole
+   *  design is 8 guests serialising through 4 rooms, and `STAY_TICKS` was
+   *  tuned against exactly that turnover. Letting checkouts dirty rooms
+   *  would silently re-tune an H1 gate from an H2 content change — the
+   *  opposite of what those gates are for. The shipped default is true,
+   *  and `zen-clean` / `one-man-week` are what verify it. */
+  upkeep: boolean;
+  /** H2a arrivals. "fixed" is H1's schedule (`guestCount` guests, first at
+   *  `spawnTickMin`, then every 50-150 ticks) — pinned by the H1 gates so
+   *  their spawn streams stay byte-identical (determinism rule 8).
+   *  "demand" is the shipped path: a per-day quota computed at the rollover
+   *  from price, per-segment reputation and stars. */
+  arrivals: "fixed" | "demand";
+  /** Opening cash, in minor units. Exists so a gate can start the hotel at
+   *  a state that would otherwise take days of play to reach (the
+   *  `first-hire` gate pins it above HIRE_THRESHOLD_MINOR so the day-1
+   *  audit unlocks the staff budget). Default 0 — H1's opening balance. */
+  startingCashMinor: number;
+  /** Gap between fixed-schedule arrivals, in ticks: `min + rng.int(0, max -
+   *  min)`. Defaults reproduce H1's exact draw (`50 + rng.int(0, 100)`), so
+   *  leaving them alone leaves every H1 spawn stream byte-identical. A gate
+   *  that needs arrivals spread across DAYS rather than minutes widens
+   *  them — `escalation-stars` does, because it needs guests on both sides
+   *  of a bulletin that is only delivered at a day rollover. */
+  spawnIntervalMinTicks: number;
+  spawnIntervalMaxTicks: number;
 }
 
 // H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
@@ -184,6 +304,11 @@ export const DEFAULTS: ScenarioConfig = {
   spawnTickMin: 100,
   fraudRatePermille: 0,
   fixture: "normal",
+  upkeep: true,
+  arrivals: "demand",
+  startingCashMinor: 0,
+  spawnIntervalMinTicks: 50,
+  spawnIntervalMaxTicks: 150,
 };
 
 function wrapMdeg(mdeg: number): number {
@@ -231,6 +356,17 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   // sim.forkRng").
   const guestSpawnRng = sim.forkRng("guest-spawn");
   const guestFraudRng = sim.forkRng("guest-fraud");
+  // H2a's four new streams. Registered here, in this order, for every
+  // config — a fork's mere existence draws nothing, and a label set that
+  // varies by config would make snapshots config-specific. Registering
+  // them is what breaks H1 saves at Sim.restore()'s label check, which is
+  // the documented policy (docs/PHASE-H2.md non-goals: no save migration
+  // pre-1.0; the boot path treats a RestoreError as "no save").
+  const demandRng = sim.forkRng("demand");
+  const staffRng = sim.forkRng("staff");
+  const objectivesRng = sim.forkRng("objectives");
+  const upkeepRng = sim.forkRng("upkeep");
+
 
   // -- Player (as H0) ------------------------------------------------------
   const player = sim.spawn(); // == PLAYER_ENTITY: first entity spawned
@@ -240,6 +376,10 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   sim.setComponent<Yaw>(player, "prevYaw", { mdeg: wrapMdeg(floor.spawn.yawMdeg) });
   sim.setComponent<Collider>(player, "collider", { radiusMm: PLAYER_RADIUS_MM });
   sim.setComponent<Player>(player, "player", { actor: PLAYER_ACTOR });
+  // The human's avatar carries BOTH: `player` still marks "this is the
+  // local human's body" (movement/face input target), while `actorId` is
+  // what every who-acted lookup resolves through — see findActorEntity.
+  sim.setComponent<ActorId>(player, "actorId", { actor: PLAYER_ACTOR });
 
   // -- Doors ----------------------------------------------------------------
   // Doors default CLOSED (open:false), exactly as H0. First judgment call
@@ -286,9 +426,30 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       roomId: bedroom.roomId,
       tier: bedroom.tier,
       occupantEntity: 0,
+      messCount: 0,
     });
   }
   const bedroomByRoomId = new Map(floor.bedrooms.map((b) => [b.roomId, b]));
+
+  // Every walkable, non-doorway cell of each bedroom, in ascending cell
+  // index. Pure derivation of `floor` (which is a pure function of the
+  // seed), so this is a legal closure capture exactly like
+  // `portalCellsByDoorIndex` — and the placement pool messes and props are
+  // drawn from.
+  const bedroomCellsByRoomId = new Map<number, PathCell[]>();
+  for (const bedroom of floor.bedrooms) {
+    const cells: PathCell[] = [];
+    for (let cz = 0; cz < grid.height; cz++) {
+      for (let cx = 0; cx < grid.width; cx++) {
+        if (floor.rooms[cz * grid.width + cx] !== bedroom.roomId) continue;
+        const cell = cellAt(grid, cx, cz);
+        if ((cell & CELL.WALKABLE) === 0) continue;
+        if (cell & CELL.DOOR) continue;
+        cells.push({ cx, cz });
+      }
+    }
+    bedroomCellsByRoomId.set(bedroom.roomId, cells);
+  }
 
   // -- Front desk terminal ------------------------------------------------
   const terminal = sim.spawn();
@@ -308,12 +469,26 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   const hotelEntity = sim.spawn();
   const { day: day0, phaseId: phaseId0 } = computePhase(0);
   sim.setComponent<Hotel>(hotelEntity, "hotel", {
-    cash: 0,
+    cash: config.startingCashMinor ?? 0,
     day: day0,
     phaseId: phaseId0,
     phaseStartTick: 0,
     nextGuestAtTick: config.spawnTickMin,
     guestsSpawned: 0,
+    stars: 1,
+    repBySegment: {},
+    rateByTier: { ...DEFAULT_RATE_BY_TIER },
+    // Day 1 has no rollover behind it, so its quota is drawn here — the
+    // same call, the same fork, one day earlier. Without this the shipped
+    // demand path would open on an empty first day.
+    arrivalsToday:
+      config.arrivals === "demand"
+        ? totalArrivals(
+            arrivalsForDay(demandRng, { ...DEFAULT_RATE_BY_TIER }, {}, 1, DEFAULT_REP_PERMILLE)
+          )
+        : 0,
+    arrivalsSpawned: 0,
+    hireUnlocked: false,
   });
 
   // -- Nav schedule singleton (the repath cursor — a component, not a
@@ -374,6 +549,18 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         },
       ],
     ];
+    // Pair 3 is NOT head-on — it is the SIDESTEP fixture (H1b review
+    // deferral 4b). The lower-id agent walks east along row 14; the
+    // higher-id agent is PARKED on its first step (goal == its own cell,
+    // so pathSystem skips it and moveSystem never moves it). That is the
+    // only configuration that reaches moveSystem's `occupant > entity`
+    // branch: a higher-id occupant that will not vacate. The mover must
+    // detour around it and still land on its goal, which is what proves
+    // the branch resolves rather than merely fires.
+    pairs.push([
+      { from: { cx: 30, cz: 14 }, to: { cx: 40, cz: 14 } },
+      { from: { cx: 31, cz: 14 }, to: { cx: 31, cz: 14 } },
+    ]);
     for (const pair of pairs) {
       // One draw per PAIR, shared by both of its agents (see note 1 above).
       const pairJitterSeed = guestSpawnRng.int(0, 0x7fffffff);
@@ -393,19 +580,225 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
           repathAtTick: 0,
           jitterSeed: pairJitterSeed,
           stuckTicks: 0,
+          avoidCx: -1,
+          avoidCz: -1,
         });
       }
     }
   }
 
+  // -- The clerk's work cell, DERIVED (open question 6) -------------------
+  //
+  // Not a magic number: it is the nearest cell to the desk that a
+  // 300mm-radius agent can actually stand on (`findJitteredPath`'s own
+  // occupancy rule, so the clerk can path to it) AND that is inside both
+  // the desk's decision radius and interact range of queue slot 0 — the
+  // two range checks `applyDeskDecision` and `interactSystem` will run on
+  // the clerk exactly as they run on the player. Searched in ascending
+  // (distance^2, cell index) order, so the choice is deterministic and the
+  // tie-break is the same convention the rest of the nav code uses.
+  //
+  // Note the H1 scenario clerk stands ON the terminal anchor, which is
+  // flush against the desk's FURNITURE row and therefore NOT occupiable by
+  // a moving agent (see nav.ts's hasClearance). That is fine for an entity
+  // that never moves; a hired NPC has to walk there.
+  const deskCellHere = cellOfMm(grid, floor.desk.xMm, floor.desk.zMm);
+  const queueHeadCell = floor.desk.queueCells[0] ?? deskCellHere;
+  const queueHeadMm = cellMm(queueHeadCell.cx, queueHeadCell.cz);
+  const clerkWorkCell: PathCell = (() => {
+    const candidates: { cell: PathCell; distSq: number; idx: number }[] = [];
+    const SEARCH = 8;
+    const alwaysOpen = () => true;
+    for (let dz = -SEARCH; dz <= SEARCH; dz++) {
+      for (let dx = -SEARCH; dx <= SEARCH; dx++) {
+        const cx = deskCellHere.cx + dx;
+        const cz = deskCellHere.cz + dz;
+        if (cx < 0 || cz < 0 || cx >= grid.width || cz >= grid.height) continue;
+        if (!isOccupiableCell(grid, cx, cz, alwaysOpen)) continue;
+        const mm = cellMm(cx, cz);
+        const deskDx = mm.xMm - floor.desk.xMm;
+        const deskDz = mm.zMm - floor.desk.zMm;
+        const deskDistSq = deskDx * deskDx + deskDz * deskDz;
+        if (deskDistSq > DESK_RADIUS_MM * DESK_RADIUS_MM) continue;
+        const headDx = mm.xMm - queueHeadMm.xMm;
+        const headDz = mm.zMm - queueHeadMm.zMm;
+        if (headDx * headDx + headDz * headDz > INTERACTABLE_RADIUS_MM * INTERACTABLE_RADIUS_MM) continue;
+        candidates.push({ cell: { cx, cz }, distSq: deskDistSq, idx: cz * grid.width + cx });
+      }
+    }
+    candidates.sort((a, b) => (a.distSq - b.distSq) || (a.idx - b.idx));
+    // Fall back to the queue head's own cell if the floor somehow offers
+    // nothing: a clerk standing in the queue is wrong but recoverable, and
+    // silently having no work cell at all is not.
+    return candidates[0]?.cell ?? queueHeadCell;
+  })();
+
+  /** Where printed resumes land — one cell toward the lobby from the work
+   *  cell, so they are reachable by the player without standing inside the
+   *  desk. Derived, committed, never hand-tuned. */
+  const printerTrayMm = cellMm(clerkWorkCell.cx, clerkWorkCell.cz);
+
+  /** Where a candidate waits to be interviewed.
+   *
+   *  Explicitly NOT a queue cell: the first version parked candidates on
+   *  the queue row's far end, which is a slot a guest takes the moment the
+   *  line is more than a few deep. The result was gridlock — the candidate
+   *  standing in a guest's slot, the guests behind it yielding forever, and
+   *  the candidate never reaching "waiting" at all. Derived instead as the
+   *  occupiable cell nearest the lobby spawn point that keeps a
+   *  CANDIDATE_CLEARANCE_CELLS margin from every queue cell and from the
+   *  street door, searched in ascending (distance^2, cell index) order. */
+  const candidateWaitCells: PathCell[] = (() => {
+    const CANDIDATE_CLEARANCE_CELLS = 3;
+    const spawnCell = cellOfMm(grid, floor.spawn.xMm, floor.spawn.zMm);
+    const keepAway: PathCell[] = [...floor.desk.queueCells, streetCell];
+    const found: { cell: PathCell; distSq: number; idx: number }[] = [];
+    const alwaysOpen = () => true;
+    const SEARCH = 10;
+    for (let dz = -SEARCH; dz <= SEARCH; dz++) {
+      for (let dx = -SEARCH; dx <= SEARCH; dx++) {
+        const cx = spawnCell.cx + dx;
+        const cz = spawnCell.cz + dz;
+        if (cx < 0 || cz < 0 || cx >= grid.width || cz >= grid.height) continue;
+        if (!isOccupiableCell(grid, cx, cz, alwaysOpen)) continue;
+        let clear = true;
+        for (const other of keepAway) {
+          const ox = cx - other.cx;
+          const oz = cz - other.cz;
+          if (ox * ox + oz * oz < CANDIDATE_CLEARANCE_CELLS * CANDIDATE_CLEARANCE_CELLS) {
+            clear = false;
+            break;
+          }
+        }
+        if (!clear) continue;
+        found.push({ cell: { cx, cz }, distSq: dx * dx + dz * dz, idx: cz * grid.width + cx });
+      }
+    }
+    found.sort((a, b) => (a.distSq - b.distSq) || (a.idx - b.idx));
+    return found.length > 0 ? found.map((f) => f.cell) : [spawnCell];
+  })();
+  /** One wait cell PER candidate in a round: two candidates sharing a goal
+   *  cell means the second yields against the first forever and never
+   *  reaches "waiting" at all (observed, before this). */
+  const candidateWaitCellFor = (index: number): PathCell =>
+    candidateWaitCells[index % candidateWaitCells.length]!;
+
+  /** Salt for bulletin content, drawn ONCE at setup. Bulletin names are
+   *  then a stateless hash of (salt, day) — stronger than draw-at-
+   *  generation, because a bulletin can never advance a stream at all, and
+   *  still per-hotel rather than identical across every save. */
+  const bulletinSalt = staffRng.int(0, 0x7fffffff);
+
+  // -- Props: one breakable prop per bedroom (H2a) -----------------------
+  //
+  // Created AFTER the headon fixture block on purpose: `corridor-headon`
+  // asserts against committed entity ids, and inserting spawns ahead of the
+  // fixture would shift them. (That gate also pins `upkeep: false`, so it
+  // creates none — belt and braces, because the ordering constraint is the
+  // kind of thing a later edit breaks silently.)
+  if (config.upkeep) {
+    for (const bedroom of floor.bedrooms) {
+      const cells = bedroomCellsByRoomId.get(bedroom.roomId) ?? [];
+      if (cells.length === 0) continue;
+      const roomEntity = roomEntityByRoomId.get(bedroom.roomId);
+      if (roomEntity === undefined) continue;
+      const kind = upkeepRng.pick(PROP_KINDS);
+      const cell = upkeepRng.pick(cells);
+      const propEntity = sim.spawn();
+      const mm = cellMm(cell.cx, cell.cz);
+      sim.setComponent<Prop>(propEntity, "prop", {
+        kind,
+        roomEntity,
+        broken: false,
+        repairProgress: 0,
+      });
+      sim.setComponent<Pos>(propEntity, "pos", mm);
+      sim.setComponent<Interactable>(propEntity, "interactable", {
+        kind: "prop",
+        xMm: mm.xMm,
+        zMm: mm.zMm,
+        radiusMm: INTERACTABLE_RADIUS_MM,
+        arcMdeg: INTERACTABLE_ARC_MDEG,
+      });
+    }
+  }
+
+  // === The per-tick index (docs/PHASE-H2.md §6 system 1, §12 item 1) ====
+  //
+  // ONE object, rebuilt in full at the start of every tick by
+  // `indexSystem` and dead at tick end. This is the H1 "per-tick locals"
+  // rule hoisted so the shared scans happen once instead of once per
+  // reader — NOT closure state: `ctxFor` keys the cached object on
+  // `s.tick` and rebuilds whenever the tick differs, so a fresh setup()
+  // after `Sim.restore()` (or any caller reaching a system out of order)
+  // can never be served a context from a tick that no longer exists.
+  //
+  // Two of its fields are deliberately MUTABLE by their writers, because
+  // that is what the pre-index code did with its local copies and the
+  // goldens encode it:
+  //   - `openCells`: moveSystem's guest-door-opening block adds the cells
+  //     of a door it just opened so the same tick's later agents see it
+  //     open (the local copy did exactly this).
+  //   - `occupancy`: moveSystem moves agents between cells as it walks
+  //     them, and `guestSpawnSystem` inserts a guest it spawns THIS tick
+  //     (the old code built occupancy inside moveSystem, i.e. after the
+  //     spawn, so a tick-new guest was present — dropping it would change
+  //     which agents yield, and therefore the goldens).
+  interface TickContext {
+    tick: number;
+    openCells: Set<number>;
+    isOpen: (cx: number, cz: number) => boolean;
+    occupancy: Map<number, EntityId>;
+    /** Named lists for `RuleContext.lists`, rebuilt per tick from the
+     *  `noticeList` components (never cached across ticks — determinism
+     *  rule 3 of the H2 spec). Empty until MAILBOX delivers a bulletin. */
+    lists: Record<string, string[]>;
+  }
+
+  let tickCtx: TickContext | null = null;
+
+  function buildTickContext(s: Sim): TickContext {
+    const openCells = buildOpenCellSet(s, grid.width, portalCellsByDoorIndex);
+    const lists: Record<string, string[]> = {};
+    for (const [, list] of s.withComponent<NoticeList>("noticeList")) {
+      const bucket = lists[list.listId] ?? (lists[list.listId] = []);
+      for (const value of list.values) bucket.push(value);
+    }
+    return {
+      tick: s.tick,
+      openCells,
+      isOpen: makeIsOpen(openCells, grid.width),
+      occupancy: buildOccupancy(s, grid.width),
+      lists,
+    };
+  }
+
+  function ctxFor(s: Sim): TickContext {
+    if (tickCtx === null || tickCtx.tick !== s.tick) tickCtx = buildTickContext(s);
+    return tickCtx;
+  }
+
   // === Systems ============================================================
 
+  // 0. indexSystem — builds the per-tick context, first, before any reader.
+  function indexSystem(s: Sim): void {
+    tickCtx = buildTickContext(s);
+  }
+
   // 1. snapshotPrevSystem — now over ALL pos/yaw holders, not just player.
+  //    Skips the write when the value is already identical: the resulting
+  //    state (and therefore the hash) is the same either way, but a
+  //    needless setComponent() dirties the incremental hash's cache entry
+  //    for every static prop, every tick.
   function snapshotPrevSystem(s: Sim): void {
     for (const [entity, pos] of s.withComponent<Pos>("pos")) {
+      const prev = s.getComponent<Pos>(entity, "prevPos");
+      if (prev && prev.xMm === pos.xMm && prev.zMm === pos.zMm) continue;
       s.setComponent<Pos>(entity, "prevPos", { xMm: pos.xMm, zMm: pos.zMm });
     }
     for (const [entity, yaw] of s.withComponent<Yaw>("yaw")) {
+      const prev = s.getComponent<Yaw>(entity, "prevYaw");
+      if (prev && prev.mdeg === yaw.mdeg) continue;
       s.setComponent<Yaw>(entity, "prevYaw", { mdeg: yaw.mdeg });
     }
   }
@@ -423,6 +816,13 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  /** The `RuleContext` for this tick — rebuilt from the tick index's
+   *  `noticeList` scan every time it is asked for, never cached across
+   *  ticks (H2 determinism rule 3). */
+  function ruleCtx(s: Sim, hotel: Hotel): RuleContext {
+    return { day: hotel.day, lists: ctxFor(s).lists };
+  }
+
   // 3. guestSpawnSystem — spawn guest + documents + reservation from
   //    forkRng("guest-spawn"); plant a violation via forkRng("guest-fraud")
   //    per the configured rate.
@@ -432,7 +832,11 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     if (!hotel) return;
     // Check-in phases: morning (0) and day (1).
     if (hotel.phaseId !== 0 && hotel.phaseId !== 1) return;
-    if (hotel.guestsSpawned >= config.guestCount) return;
+    if (config.arrivals === "demand") {
+      if (hotel.arrivalsSpawned >= hotel.arrivalsToday) return;
+    } else if (hotel.guestsSpawned >= config.guestCount) {
+      return;
+    }
     if (s.tick < hotel.nextGuestAtTick) return;
 
     const archetype = pickArchetype(guestSpawnRng);
@@ -450,7 +854,15 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     const plantedViolations: string[] = [];
 
     if (guestFraudRng.int(0, 999) < config.fraudRatePermille) {
-      const planted = plantViolation(H1_RULES, guestFraudRng, ruleDocs, resFields);
+      // Plant only among rows that are BOTH active at the current star tier
+      // and violable in this world right now (docs/PHASE-H2.md deferral
+      // 4d): a `listed`/absent row with an empty list has no value that
+      // would violate it, so planting it would hand the desk an
+      // uncatchable "fraud". H1's gates run at stars 1 with no lists, so
+      // this filters to exactly H1's five rows and their streams are
+      // unchanged.
+      const activeRules = plantableRules(rulesForStars(H1_RULES, hotel.stars), ruleCtx(s, hotel));
+      const planted = plantViolation(activeRules, guestFraudRng, ruleDocs, resFields, ruleCtx(s, hotel));
       ruleDocs = planted.docs;
       resFields = planted.resFields;
       plantedViolations.push(planted.failFlag);
@@ -483,6 +895,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       stayUntilTick: 0,
       queueIndex: -1,
       patienceTicks: 0,
+      waitedTicks: 0,
+      brokenPropNights: 0,
+      paidMinor: 0,
     });
     const spawnMm = cellMm(streetCell.cx, streetCell.cz);
     s.setComponent<Pos>(guestEntity, "pos", spawnMm);
@@ -498,22 +913,43 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       repathAtTick: 0,
       jitterSeed,
       stuckTicks: 0,
+      avoidCx: -1,
+      avoidCz: -1,
     });
+    // The pre-index code built `occupancy` inside moveSystem, i.e. AFTER
+    // this system ran, so a guest spawned this tick was already on its
+    // cell for that tick's yield checks. Keep that exactly.
+    const spawnCtx = ctxFor(s);
+    spawnCtx.occupancy.set(streetCell.cz * grid.width + streetCell.cx, guestEntity);
     s.emit("guest.arrived", { guestEntity });
 
-    const interval = 50 + guestSpawnRng.int(0, 100);
+    const intervalMin = config.spawnIntervalMinTicks ?? 50;
+    const intervalMax = config.spawnIntervalMaxTicks ?? 150;
+    const interval = intervalMin + guestSpawnRng.int(0, intervalMax - intervalMin);
     s.setComponent<Hotel>(hotelEntity, "hotel", {
       ...hotel,
       guestsSpawned: hotel.guestsSpawned + 1,
+      arrivalsSpawned: hotel.arrivalsSpawned + 1,
       nextGuestAtTick: s.tick + interval,
     });
   }
 
   // 4. guestBrainSystem — the FSM.
   function guestBrainSystem(s: Sim): void {
+    // One pass over the `guest` store per tick instead of five: the id list
+    // is collected once (membership cannot change inside this system —
+    // spawning happens before it, despawning after), and every phase below
+    // re-READS each guest's component through getComponent, so a phase
+    // still sees the transitions an earlier phase made. Behaviour-identical
+    // to the five separate scans; the goldens are the proof.
+    const guestIds: EntityId[] = [];
+    for (const [entity] of s.withComponent<Guest>("guest")) guestIds.push(entity);
+
     // -- queue derivation (no closure array; scanned + compacted fresh) --
     const active: [EntityId, Guest][] = [];
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest) continue;
       if ((guest.state === "queued" || guest.state === "presenting") && guest.queueIndex >= 0) {
         active.push([entity, guest]);
       }
@@ -522,7 +958,17 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       const d = a[1].queueIndex - b[1].queueIndex;
       return d !== 0 ? d : a[0] - b[0];
     });
-    active.forEach(([entity, guest], i) => {
+    // Queue time is a stay FACT, accumulated on the guest and cashed out
+    // once at the checkout review. Not a meter, not visible, not a running
+    // score — day-granularity consequences (DESIGN §6).
+    for (const [entity, guest] of active) {
+      s.setComponent<Guest>(entity, "guest", { ...guest, waitedTicks: guest.waitedTicks + 1 });
+    }
+    const activeAfterWait: [EntityId, Guest][] = active.map(([entity]) => [
+      entity,
+      s.getComponent<Guest>(entity, "guest")!,
+    ]);
+    activeAfterWait.forEach(([entity, guest], i) => {
       if (guest.queueIndex === i) return;
       s.setComponent<Guest>(entity, "guest", { ...guest, queueIndex: i });
       // ...and WALK to the new slot. Compacting `queueIndex` without
@@ -542,8 +988,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
     // -- assign arriving guests to the back of the queue --
     const arriving: [EntityId, Guest][] = [];
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state === "arriving") arriving.push([entity, guest]);
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (guest && guest.state === "arriving") arriving.push([entity, guest]);
     }
     arriving.sort((a, b) => a[0] - b[0]);
     for (const [entity, guest] of arriving) {
@@ -559,8 +1006,9 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     // -- presenting guests: react to a PRIOR tick's desk.decision outcome
     //    (deskSystem, item 8, runs after this system, so `decided` reflects
     //    the previous tick's decision by the time we read it here) --
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state !== "presenting") continue;
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest || guest.state !== "presenting") continue;
       const resEntity = findReservationFor(s, entity);
       if (resEntity === undefined) continue;
       const res = s.getComponent<Reservation>(resEntity, "reservation");
@@ -582,25 +1030,83 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
 
     // -- toRoom -> inRoom on arrival --
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state !== "toRoom") continue;
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest || guest.state !== "toRoom") continue;
       if (hasArrived(s, entity)) {
         s.setComponent<Guest>(entity, "guest", { ...guest, state: "inRoom" });
       }
     }
 
     // -- inRoom -> leaving at stayUntilTick --
-    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
-      if (guest.state !== "inRoom") continue;
+    for (const entity of guestIds) {
+      const guest = s.getComponent<Guest>(entity, "guest");
+      if (!guest || guest.state !== "inRoom") continue;
       if (s.tick < guest.stayUntilTick) continue;
       if (guest.roomEntity !== 0) {
         const room = s.getComponent<RoomUnit>(guest.roomEntity, "roomUnit");
         if (room) s.setComponent<RoomUnit>(guest.roomEntity, "roomUnit", { ...room, occupantEntity: 0 });
+        spawnMessesFor(s, guest.roomEntity);
       }
       s.setComponent<Guest>(entity, "guest", { ...guest, state: "leaving" });
       setGoal(s, entity, streetCell.cx, streetCell.cz);
       s.emit("guest.checkedOut", { guestEntity: entity });
     }
+  }
+
+  /** Post one piece of mail. MAILBOX content is world state, created by
+   *  the systems that have something to say; `read` is set by the player's
+   *  `mailbox.read` effect and by nothing else. Bulletins take effect at
+   *  DELIVERY, never on read — see mailSystem. */
+  function queueMail(s: Sim, day: number, kind: Mail["kind"], subjectKey: string, fields: Record<string, string>): void {
+    const entity = s.spawn();
+    s.setComponent<Mail>(entity, "mail", { day, kind, subjectKey, fields, read: false });
+    s.emit("mail.delivered", { mailEntity: entity, kind, day });
+  }
+
+  /** Is this room sellable right now? Vacant, wiped, and not carrying a
+   *  broken prop. A dirty or broken room is BLOCKED, never punished — the
+   *  cost is the room-night you did not sell, and it lands at the audit
+   *  like every other economic fact (docs/PHASE-H2.md §9). */
+  function roomReady(s: Sim, roomEntity: EntityId): boolean {
+    const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+    if (!room) return false;
+    if (room.occupantEntity !== 0) return false;
+    if (room.messCount > 0) return false;
+    for (const [, prop] of s.withComponent<Prop>("prop")) {
+      if (prop.roomEntity === roomEntity && prop.broken) return false;
+    }
+    return true;
+  }
+
+  /** A checkout leaves 2..4 discrete, visible messes on the room's own
+   *  cells. The player's progress bar is the literal count of objects still
+   *  in front of them — never a meter, never a HUD. */
+  function spawnMessesFor(s: Sim, roomEntity: EntityId): void {
+    if (!config.upkeep) return;
+    const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+    if (!room) return;
+    const cells = bedroomCellsByRoomId.get(room.roomId) ?? [];
+    if (cells.length === 0) return;
+    const count = MESS_MIN + upkeepRng.int(0, MESS_MAX - MESS_MIN);
+    for (let i = 0; i < count; i++) {
+      const kind = upkeepRng.pick(MESS_KINDS);
+      const cell = upkeepRng.pick(cells);
+      const messEntity = s.spawn();
+      const mm = cellMm(cell.cx, cell.cz);
+      s.setComponent<Mess>(messEntity, "mess", { roomEntity, kind });
+      s.setComponent<Pos>(messEntity, "pos", mm);
+      s.setComponent<Interactable>(messEntity, "interactable", {
+        kind: "mess",
+        xMm: mm.xMm,
+        zMm: mm.zMm,
+        radiusMm: INTERACTABLE_RADIUS_MM,
+        arcMdeg: INTERACTABLE_ARC_MDEG,
+      });
+    }
+    const after = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
+    if (after) s.setComponent<RoomUnit>(roomEntity, "roomUnit", { ...after, messCount: after.messCount + count });
+    s.emit("room.messSpawned", { roomEntity, count });
   }
 
   function setGoal(s: Sim, entity: EntityId, goalCx: number, goalCz: number): void {
@@ -624,9 +1130,14 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     return undefined;
   }
 
+  /** Who acted. Scans `actorId`, NOT `player` (ARCHITECTURE B9 / H2a): the
+   *  hired clerk is an actor with no `player` component, and every
+   *  validation path — interact, desk.decision, screen.* — must resolve it
+   *  the same way it resolves the human. There is deliberately no branch on
+   *  the literal "player" anywhere below this line. */
   function findActorEntity(s: Sim, actor: string): EntityId | undefined {
-    for (const [entity, p] of s.withComponent<Player>("player")) {
-      if (p.actor === actor) return entity;
+    for (const [entity, a] of s.withComponent<ActorId>("actorId")) {
+      if (a.actor === actor) return entity;
     }
     return undefined;
   }
@@ -672,12 +1183,21 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (!agent || !pos) continue;
       const from = cellOfMm(grid, pos.xMm, pos.zMm);
       const to: PathCell = { cx: agent.goalCx, cz: agent.goalCz };
-      const path = findJitteredPath(grid, from, to, isOpen, agent.jitterSeed);
+      // Consume the sidestep branch's avoid cell, ONCE. Falling back to
+      // the un-avoided path when no detour exists matters: in a
+      // single-lane corridor there IS no way around, and the agent should
+      // go back to waiting behind the yield rule rather than losing its
+      // path entirely.
+      const avoidIdx = agent.avoidCx >= 0 && agent.avoidCz >= 0 ? agent.avoidCz * grid.width + agent.avoidCx : -1;
+      const detour = avoidIdx >= 0 ? findJitteredPath(grid, from, to, isOpen, agent.jitterSeed, avoidIdx) : null;
+      const path = detour ?? findJitteredPath(grid, from, to, isOpen, agent.jitterSeed);
       s.setComponent<NavAgent>(entity, "navAgent", {
         ...agent,
         path: path ?? [],
         pathIdx: 0,
         repathAtTick: s.tick,
+        avoidCx: -1,
+        avoidCz: -1,
       });
       budget--;
       lastServed = entity;
@@ -711,18 +1231,15 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         (fw * cosYaw * MOVE_SPEED_MM_PER_TICK) / (1000 * ONE) - (sw * sinYaw * MOVE_SPEED_MM_PER_TICK) / (1000 * ONE)
       );
 
-      const openCells = buildOpenCellSet(s, grid.width, portalCellsByDoorIndex);
-      const isOpen = makeIsOpen(openCells, grid.width);
-      const resolved = moveCircle(grid, pos.xMm, pos.zMm, dxMm, dzMm, collider.radiusMm, isOpen);
+      const resolved = moveCircle(grid, pos.xMm, pos.zMm, dxMm, dzMm, collider.radiusMm, ctxFor(s).isOpen);
       s.setComponent<Pos>(player, "pos", resolved);
     }
 
     // -- NPC agents, ascending EntityId (deterministic priority order:
     //    lower id yields to nobody; the yield rule below is symmetric with
     //    that ordering) --
-    const openCells = buildOpenCellSet(s, grid.width, portalCellsByDoorIndex);
-    const isOpen = makeIsOpen(openCells, grid.width);
-    const occupancy = buildOccupancy(s, grid.width);
+    const ctx = ctxFor(s);
+    const { openCells, isOpen, occupancy } = ctx;
 
     const agents: [EntityId, NavAgent][] = [...s.withComponent<NavAgent>("navAgent")];
     agents.sort((a, b) => a[0] - b[0]);
@@ -818,12 +1335,26 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
             if (agent.stuckTicks < STUCK_THRESHOLD && newStuck >= STUCK_THRESHOLD) {
               s.emit("nav.stuck", { entity, cx: curCell.cx, cz: curCell.cz });
             }
+            // SIDESTEP branch: a higher-EntityId agent is sitting on the
+            // cell we want and is not about to leave it. Before H2a this
+            // cleared the path and let pathSystem recompute — which,
+            // because A* is blind to occupancy, produced the IDENTICAL
+            // route and re-blocked on the same cell every tick until
+            // `nav.stuck` fired. Dead code in every H1 gate (verified: the
+            // branch never once fired), but H2a parks a clerk at the desk
+            // work cell and a candidate in the lobby — permanently
+            // stationary, high-EntityId agents directly in guests' way —
+            // so it becomes live. Recording the blocked cell makes the
+            // repath an actual detour; `pathSystem` consumes and clears it
+            // in the same breath, so it is one-shot and cannot wedge.
             const sidestep = occupant > entity;
             s.setComponent<NavAgent>(entity, "navAgent", {
               ...agent,
               stuckTicks: newStuck,
               path: sidestep ? [] : agent.path,
               pathIdx: sidestep ? 0 : agent.pathIdx,
+              avoidCx: sidestep ? targetCell.cx : agent.avoidCx,
+              avoidCz: sidestep ? targetCell.cz : agent.avoidCz,
             });
             continue;
           }
@@ -926,6 +1457,78 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         continue;
       }
 
+      if (interactable.kind === "mess") {
+        const mess = s.getComponent<Mess>(target, "mess");
+        if (!mess) {
+          s.emit("interact-denied", { reason: "not-a-mess" satisfies InteractDeniedReason });
+          continue;
+        }
+        // ONE wipe, one object gone. No timer, no meter, no partial state:
+        // the world in front of the player IS the progress bar.
+        const room = s.getComponent<RoomUnit>(mess.roomEntity, "roomUnit");
+        if (room) {
+          s.setComponent<RoomUnit>(mess.roomEntity, "roomUnit", {
+            ...room,
+            messCount: Math.max(0, room.messCount - 1),
+          });
+        }
+        s.despawn(target);
+        s.emit("room.messCleaned", { roomEntity: mess.roomEntity, messEntity: target, actor: c.actor });
+        continue;
+      }
+
+      if (interactable.kind === "prop") {
+        const prop = s.getComponent<Prop>(target, "prop");
+        if (!prop) continue;
+        if (!prop.broken) {
+          s.emit("interact-denied", { reason: "not-broken" satisfies InteractDeniedReason });
+          continue;
+        }
+        // Repair advances by a fixed quantum per press and PERSISTS
+        // indefinitely — half-repaired stays half-repaired across days,
+        // saves and interruptions. Nothing decays it back.
+        const progress = prop.repairProgress + 1;
+        if (progress >= REPAIR_STEPS) {
+          s.setComponent<Prop>(target, "prop", { ...prop, broken: false, repairProgress: 0 });
+          s.emit("prop.repaired", { propEntity: target, roomEntity: prop.roomEntity, actor: c.actor });
+          s.emit("incident.resolved", { propEntity: target, roomEntity: prop.roomEntity });
+        } else {
+          s.setComponent<Prop>(target, "prop", { ...prop, repairProgress: progress });
+          s.emit("prop.repairStep", { propEntity: target, progress, of: REPAIR_STEPS, actor: c.actor });
+        }
+        continue;
+      }
+
+      if (interactable.kind === "candidate") {
+        const candidate = s.getComponent<Candidate>(target, "candidate");
+        if (!candidate) continue;
+        if (candidate.state !== "waiting") {
+          s.emit("interact-denied", { reason: "not-interviewable" satisfies InteractDeniedReason });
+          continue;
+        }
+        s.setComponent<Candidate>(target, "candidate", { ...candidate, state: "interviewing" });
+        // Hand over the resume, through the same held-document path an ID
+        // takes when a guest presents.
+        if (candidate.resumeEntity !== 0) {
+          const resume = s.getComponent<DocumentComp>(candidate.resumeEntity, "document");
+          if (resume) {
+            s.setComponent<DocumentComp>(candidate.resumeEntity, "document", { ...resume, heldBy: actorEntity });
+          }
+        }
+        s.emit("staff.interviewStarted", { candidateEntity: target, actor: c.actor });
+        continue;
+      }
+
+      if (interactable.kind === "document") {
+        const doc = s.getComponent<DocumentComp>(target, "document");
+        if (!doc) continue;
+        // Pick up / put down, one verb, toggling on the actor who asked.
+        const heldBy = doc.heldBy === actorEntity ? 0 : actorEntity;
+        s.setComponent<DocumentComp>(target, "document", { ...doc, heldBy });
+        s.emit("document.held", { documentEntity: target, heldBy, actor: c.actor });
+        continue;
+      }
+
       if (interactable.kind === "terminal") {
         const terminalComp = s.getComponent<Terminal>(target, "terminal");
         if (!terminalComp) continue;
@@ -998,12 +1601,40 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
     const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
     if (!hotel) return;
-    const wasPlanted = res.plantedViolations.length > 0;
+
+    // GROUND TRUTH IS THE RULE TABLE, not the planting record. H1 shipped
+    // `plantedViolations.length > 0` as the "is this fraud?" test, which was
+    // indistinguishable while every violation in the game was planted. H2a
+    // breaks that: a guest whose real name is on the blacklist bulletin
+    // violates the `blacklist` row without anything having been planted on
+    // them, and the old test called denying them a `desk.falseDeny` — the
+    // event for punishing an innocent guest. (Observed: six of them in a
+    // clean seven-day run.) `plantedViolations` is still carried in the
+    // payload, because "what was planted" and "what the rules say" being
+    // separately visible is exactly what makes the fraud gates meaningful.
+    const truthDocs: RuleDoc[] = [];
+    for (const [, doc] of s.withComponent<DocumentComp>("document")) {
+      if (doc.ownerEntity === res.guestEntity) truthDocs.push({ docType: doc.docType, fields: doc.fields });
+    }
+    const actualViolations = evaluateRules(
+      rulesForStars(H1_RULES, hotel.stars),
+      truthDocs,
+      res.fields,
+      ruleCtx(s, hotel),
+    );
+    const wasPlanted = actualViolations.length > 0;
 
     if (accept) {
       if (roomEntity === undefined) return;
       const room = s.getComponent<RoomUnit>(roomEntity, "roomUnit");
       if (!room || room.occupantEntity !== 0) return; // not vacant: no-op, retry later
+      if (!roomReady(s, roomEntity)) {
+        // Dirty or broken: a BLOCK, not a punishment. Nothing is charged,
+        // nothing is flagged, the reservation stays undecided and the desk
+        // can try another room (or the same one once it is wiped).
+        s.emit("desk.denied-room", { reservationEntity, roomEntity, reason: "not-ready" });
+        return;
+      }
       s.setComponent<RoomUnit>(roomEntity, "roomUnit", { ...room, occupantEntity: res.guestEntity });
       s.setComponent<Reservation>(reservationEntity, "reservation", {
         ...res,
@@ -1011,8 +1642,12 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         accepted: true,
         roomEntity,
       });
-      const rate = ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
+      // The live rate is whatever PRICER last set for this tier; the
+      // committed opening table is the fallback for a tier PRICER has never
+      // touched.
+      const rate = hotel.rateByTier[String(room.tier)] ?? ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
       s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash + rate });
+      s.setComponent<Guest>(res.guestEntity, "guest", { ...guest, paidMinor: rate });
       const ledger = s.spawn();
       s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
         day: hotel.day,
@@ -1021,8 +1656,18 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         amountMinor: rate,
         memo: `room charge guest ${res.guestEntity}`,
       });
-      s.emit("guest.checkedIn", { guestEntity: res.guestEntity, roomEntity });
-      if (wasPlanted) s.emit("desk.fraudMissed", { reservationEntity, violations: res.plantedViolations });
+      // The actor is on the event because `first-hire` proves "unaided"
+      // structurally, from the record: a check-in attributed to `staff:*`
+      // is one the player did not make.
+      s.emit("guest.checkedIn", { guestEntity: res.guestEntity, roomEntity, actor });
+      if (wasPlanted) {
+        s.emit("desk.fraudMissed", {
+          reservationEntity,
+          violations: actualViolations,
+          plantedViolations: res.plantedViolations,
+          actor,
+        });
+      }
     } else {
       s.setComponent<Reservation>(reservationEntity, "reservation", {
         ...res,
@@ -1030,9 +1675,34 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         accepted: false,
         roomEntity: 0,
       });
-      s.emit("guest.denied", { guestEntity: res.guestEntity });
-      if (wasPlanted) s.emit("desk.fraudCaught", { reservationEntity, violations: res.plantedViolations });
-      else s.emit("desk.falseDeny", { reservationEntity });
+      s.emit("guest.denied", { guestEntity: res.guestEntity, actor });
+      if (wasPlanted) {
+        s.emit("desk.fraudCaught", {
+          reservationEntity,
+          violations: actualViolations,
+          plantedViolations: res.plantedViolations,
+          actor,
+        });
+      } else {
+        s.emit("desk.falseDeny", { reservationEntity, actor });
+      }
+    }
+  }
+
+  /** The command forms of the three H2a screen effects. Each one calls the
+   *  SAME validated apply function `screenSystem` calls for the effect —
+   *  one path per decision, whether the caller is a screen click, a bot or
+   *  a scenario (the H1b `applyDeskDecision` pattern, applied to all four
+   *  decisions this phase adds). */
+  function staffSystem(s: Sim): void {
+    for (const c of s.commands()) {
+      if (c.type === "staff.hire") {
+        applyStaffDecision(s, c.actor, c.payload as { candidateEntity: EntityId; accept: boolean });
+      } else if (c.type === "pricer.setRate") {
+        applyPricerRate(s, c.actor, c.payload as { tier: number; rateMinor: number });
+      } else if (c.type === "mailbox.read") {
+        applyMailRead(s, c.actor, c.payload as { mailEntity: EntityId });
+      }
     }
   }
 
@@ -1124,13 +1794,471 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (openAppChanged) s.emit("screen.appOpened", { actor: c.actor, appId: nextState.openAppId });
       else if (changed) s.emit("screen.actionTaken", { actor: c.actor });
 
-      if (effect && effect.type === "desk.decision") {
-        applyDeskDecision(
-          s,
-          c.actor,
-          effect.payload as { reservationEntity: EntityId; accept: boolean; roomEntity?: EntityId }
-        );
+      if (effect) {
+        // Every screen effect flows through ONE validated apply function,
+        // the same one the command form reaches. An app's output is always
+        // a proposal; the sim is always the authority.
+        if (effect.type === "desk.decision") {
+          applyDeskDecision(
+            s,
+            c.actor,
+            effect.payload as { reservationEntity: EntityId; accept: boolean; roomEntity?: EntityId }
+          );
+        } else if (effect.type === "staff.hire") {
+          applyStaffDecision(s, c.actor, effect.payload as { candidateEntity: EntityId; accept: boolean });
+        } else if (effect.type === "pricer.setRate") {
+          applyPricerRate(s, c.actor, effect.payload as { tier: number; rateMinor: number });
+        } else if (effect.type === "mailbox.read") {
+          applyMailRead(s, c.actor, effect.payload as { mailEntity: EntityId });
+        }
       }
+    }
+  }
+
+  /** Everyone this actor string could be. Used only by the clerk's own
+   *  brain — every VALIDATION path still goes through findActorEntity. */
+  function findPresentingGuest(s: Sim): [EntityId, Guest] | undefined {
+    for (const [entity, guest] of s.withComponent<Guest>("guest")) {
+      if (guest.state === "presenting") return [entity, guest];
+    }
+    return undefined;
+  }
+
+  function findReadyRoom(s: Sim): EntityId | undefined {
+    for (const [entity] of s.withComponent<RoomUnit>("roomUnit")) {
+      if (roomReady(s, entity)) return entity;
+    }
+    return undefined;
+  }
+
+  /** The ONE validated hire path. Reached from `staffSystem` (the command
+   *  form) and from `screenSystem` (the STAFF app's effect) — the same
+   *  shape as `applyDeskDecision`, for the same reason. */
+  function applyStaffDecision(s: Sim, actor: string, payload: { candidateEntity: EntityId; accept: boolean }): void {
+    const { candidateEntity, accept } = payload;
+    const actorEntity = findActorEntity(s, actor);
+    if (actorEntity === undefined) return;
+    const actorPos = s.getComponent<Pos>(actorEntity, "pos");
+    if (!actorPos) return;
+    const dxMm = floor.desk.xMm - actorPos.xMm;
+    const dzMm = floor.desk.zMm - actorPos.zMm;
+    if (dxMm * dxMm + dzMm * dzMm > DESK_RADIUS_MM * DESK_RADIUS_MM) {
+      s.emit("screen.denied", { reason: "out-of-range" });
+      return;
+    }
+
+    const candidate = s.getComponent<Candidate>(candidateEntity, "candidate");
+    if (!candidate || candidate.state !== "interviewing") return;
+
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+
+    if (!accept) {
+      s.setComponent<Candidate>(candidateEntity, "candidate", { ...candidate, state: "rejected" });
+      setGoal(s, candidateEntity, streetCell.cx, streetCell.cz);
+      s.emit("staff.rejected", { candidateEntity, actor });
+      return;
+    }
+
+    // Re-checked here, not trusted from the screen: the app's guard is a
+    // courtesy to the player, this is the rule.
+    if (hotel.cash < candidate.wageAsk) {
+      s.emit("screen.denied", { reason: "insufficient-cash" });
+      return;
+    }
+    const person = s.getComponent<Person>(candidateEntity, "person");
+    s.setComponent<Candidate>(candidateEntity, "candidate", { ...candidate, state: "hired" });
+    s.setComponent<Staffed>(candidateEntity, "staffed", {
+      job: "clerk",
+      wage: candidate.wageAsk,
+      skillPermille: candidate.skillPermille,
+      moralePermille: 500,
+      quirk: candidate.quirk,
+      hiredDay: hotel.day,
+      seed: person ? person.seed : candidateEntity,
+    });
+    // The second actor kind. Nothing below this line special-cases it.
+    s.setComponent<ActorId>(candidateEntity, "actorId", { actor: `staff:${candidateEntity}` });
+    s.setComponent<StaffWork>(candidateEntity, "staffWork", { reservationEntity: 0, decideAtTick: 0 });
+    s.removeComponent(candidateEntity, "interactable");
+    setGoal(s, candidateEntity, clerkWorkCell.cx, clerkWorkCell.cz);
+    s.emit("staff.hired", { candidateEntity, wage: candidate.wageAsk, actor, day: hotel.day });
+  }
+
+  function applyPricerRate(s: Sim, actor: string, payload: { tier: number; rateMinor: number }): void {
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    const key = String(payload.tier);
+    if (hotel.rateByTier[key] === undefined) {
+      s.emit("screen.denied", { reason: "no-such-tier" });
+      return;
+    }
+    if (!isValidRate(payload.rateMinor)) {
+      s.emit("screen.denied", { reason: "rate-out-of-bounds" });
+      return;
+    }
+    s.setComponent<Hotel>(hotelEntity, "hotel", {
+      ...hotel,
+      rateByTier: { ...hotel.rateByTier, [key]: payload.rateMinor },
+    });
+    s.emit("econ.rateSet", { tier: payload.tier, rateMinor: payload.rateMinor, actor });
+  }
+
+  function applyMailRead(s: Sim, actor: string, payload: { mailEntity: EntityId }): void {
+    const mail = s.getComponent<Mail>(payload.mailEntity, "mail");
+    if (!mail || mail.read) return;
+    s.setComponent<Mail>(payload.mailEntity, "mail", { ...mail, read: true });
+    s.emit("mail.read", { mailEntity: payload.mailEntity, kind: mail.kind, actor });
+  }
+
+  // 6. candidateSystem — the candidate FSM. Arrive -> walk to a lobby wait
+  //    cell -> `waiting`; `interact` starts the interview; the STAFF app
+  //    decides. A candidate is a guest-shaped NPC that does not queue.
+  function candidateSystem(s: Sim): void {
+    for (const [entity, candidate] of [...s.withComponent<Candidate>("candidate")]) {
+      // A candidate WALKS, so its interactable has to walk with it — an
+      // interactable pinned to the spawn point is a target the player can
+      // never be in range of, which is exactly how this first presented
+      // (13,983 consecutive  events in the drive-through).
+      const pos = s.getComponent<Pos>(entity, "pos");
+      const interactable = s.getComponent<Interactable>(entity, "interactable");
+      if (pos && interactable && (interactable.xMm !== pos.xMm || interactable.zMm !== pos.zMm)) {
+        s.setComponent<Interactable>(entity, "interactable", { ...interactable, xMm: pos.xMm, zMm: pos.zMm });
+      }
+
+      if (candidate.state === "arriving") {
+        if (hasArrived(s, entity)) {
+          s.setComponent<Candidate>(entity, "candidate", { ...candidate, state: "waiting" });
+          s.emit("staff.candidateArrived", { candidateEntity: entity });
+        }
+        continue;
+      }
+      if (candidate.state === "hired") {
+        // Handled by staffBrainSystem from here on.
+        continue;
+      }
+    }
+  }
+
+  // 7. staffBrainSystem — the hired clerk, as an ACTOR.
+  //
+  //    It submits real `interact` and `desk.decision` commands as
+  //    `staff:<entity>`, and those commands are consumed later in the same
+  //    tick by `interactSystem` (10) and `deskSystem` (11) — the SAME
+  //    validated path the player's RESERVA effect and the harness clerkBot
+  //    reach. There is no clerk back door: if the validation would deny a
+  //    player, it denies the clerk. (Commands pushed by an earlier system
+  //    are visible to later systems in the same tick, because `commands()`
+  //    returns the live pending array; and they are re-derived identically
+  //    on replay because this system is code, not input.)
+  //
+  //    PLAYER OVERRIDE: while any other actor holds the terminal's focus,
+  //    the clerk stands down. Watching them work, or taking over, is the
+  //    player's choice — never a race.
+  function staffBrainSystem(s: Sim): void {
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    const terminalComp = s.getComponent<Terminal>(terminal, "terminal");
+
+    for (const [entity, staffed] of [...s.withComponent<Staffed>("staffed")]) {
+      const actorId = s.getComponent<ActorId>(entity, "actorId");
+      if (!actorId) continue;
+      const work = s.getComponent<StaffWork>(entity, "staffWork") ?? { reservationEntity: 0, decideAtTick: 0 };
+
+      if (terminalComp && terminalComp.focusedBy !== "" && terminalComp.focusedBy !== actorId.actor) {
+        if (work.reservationEntity !== 0) {
+          s.setComponent<StaffWork>(entity, "staffWork", { reservationEntity: 0, decideAtTick: 0 });
+        }
+        continue;
+      }
+
+      const pos = s.getComponent<Pos>(entity, "pos");
+      if (!pos) continue;
+      const cell = cellOfMm(grid, pos.xMm, pos.zMm);
+      if (cell.cx !== clerkWorkCell.cx || cell.cz !== clerkWorkCell.cz) {
+        const agent = s.getComponent<NavAgent>(entity, "navAgent");
+        if (agent && (agent.goalCx !== clerkWorkCell.cx || agent.goalCz !== clerkWorkCell.cz)) {
+          setGoal(s, entity, clerkWorkCell.cx, clerkWorkCell.cz);
+        }
+        continue;
+      }
+
+      // At the desk: face the queue head, so the interact arc check passes
+      // for the same reason it passes for a player who looks at someone.
+      const yawToHead = atan2Mdeg(queueHeadMm.xMm - pos.xMm, queueHeadMm.zMm - pos.zMm);
+      const yaw = s.getComponent<Yaw>(entity, "yaw");
+      if (!yaw || yaw.mdeg !== yawToHead) s.setComponent<Yaw>(entity, "yaw", { mdeg: yawToHead });
+
+      const presenting = findPresentingGuest(s);
+      if (!presenting) {
+        if (work.reservationEntity !== 0) {
+          s.setComponent<StaffWork>(entity, "staffWork", { reservationEntity: 0, decideAtTick: 0 });
+        }
+        // Nobody presenting: invite the queue head, once it has physically
+        // arrived at slot 0.
+        for (const [guestEntity, guest] of s.withComponent<Guest>("guest")) {
+          if (guest.state !== "queued" || guest.queueIndex !== 0) continue;
+          const guestPos = s.getComponent<Pos>(guestEntity, "pos");
+          if (!guestPos) continue;
+          const guestCell = cellOfMm(grid, guestPos.xMm, guestPos.zMm);
+          if (guestCell.cx !== queueHeadCell.cx || guestCell.cz !== queueHeadCell.cz) continue;
+          s.submit({ tick: s.tick, actor: actorId.actor, type: "interact", payload: { target: guestEntity } });
+          break;
+        }
+        continue;
+      }
+
+      const [guestEntity] = presenting;
+      const resEntity = findReservationFor(s, guestEntity);
+      if (resEntity === undefined) continue;
+      const res = s.getComponent<Reservation>(resEntity, "reservation");
+      if (!res || res.decided) continue;
+
+      if (work.reservationEntity !== resEntity) {
+        // Start deliberating. The pause is long enough to WATCH — that is
+        // the beat, not a delay to tune away.
+        s.setComponent<StaffWork>(entity, "staffWork", {
+          reservationEntity: resEntity,
+          decideAtTick: s.tick + decisionDelayTicks(staffed.skillPermille),
+        });
+        continue;
+      }
+      if (s.tick < work.decideAtTick) continue;
+
+      const docs: RuleDoc[] = [];
+      for (const [, doc] of s.withComponent<DocumentComp>("document")) {
+        if (doc.ownerEntity === guestEntity) docs.push({ docType: doc.docType, fields: doc.fields });
+      }
+      const violations = evaluateRules(
+        rulesForStars(H1_RULES, hotel.stars),
+        docs,
+        res.fields,
+        ruleCtx(s, hotel),
+      );
+      let accept = violations.length === 0;
+      // Stateless error hash, never an Rng draw (H2 determinism rule 3).
+      if (clerkErrs(staffed.seed, resEntity, staffed.skillPermille)) accept = !accept;
+
+      const roomEntity = accept ? findReadyRoom(s) : undefined;
+      if (accept && roomEntity === undefined) {
+        // Every room is occupied, dirty or broken. Wait — silently, and
+        // WITHOUT re-arming the deliberation timer, so the moment a room
+        // frees the clerk acts on the next tick. Submitting anyway would
+        // hand deskSystem a decision it can only no-op, which is a
+        // decision event per cadence tick, forever, for a guest who never
+        // moves (observed in the drive-through: one reservation re-decided
+        // 300 times).
+        continue;
+      }
+      s.submit({
+        tick: s.tick,
+        actor: actorId.actor,
+        type: "desk.decision",
+        payload: { reservationEntity: resEntity, accept, roomEntity },
+      });
+      s.emit("staff.decision", { actor: actorId.actor, reservationEntity: resEntity, accepted: accept });
+      s.setComponent<StaffWork>(entity, "staffWork", { reservationEntity: 0, decideAtTick: 0 });
+    }
+  }
+
+  // 17. mailSystem — deliveries at the day rollover.
+  //
+  //     Bulletins take effect at DELIVERY: this system appends to the
+  //     `noticeList` component the rule table reads through, and separately
+  //     posts a `mail` the player can read. Reading is how the player
+  //     learns; it is never how the rule activates (docs/PHASE-H2.md §10).
+  function mailSystem(s: Sim): void {
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    if (hotel.phaseStartTick !== s.tick || hotel.phaseId !== 0) return; // rollover tick only
+
+    // -- the first-hire beat: applications, then printed resumes --
+    if (hotel.hireUnlocked && !hasAnyStaffOrCandidates(s)) {
+      const specs: { spec: ReturnType<typeof generateCandidate>; index: number }[] = [];
+      for (let i = 0; i < CANDIDATES_PER_ROUND; i++) {
+        specs.push({ spec: generateCandidate(staffRng, i), index: i });
+      }
+      queueMail(s, hotel.day, "applications", "mail.applications", { count: String(specs.length) });
+      for (const { spec, index } of specs) {
+        const candidateEntity = s.spawn();
+        const spawnMm = cellMm(streetCell.cx, streetCell.cz);
+        s.setComponent<Pos>(candidateEntity, "pos", spawnMm);
+        s.setComponent<Pos>(candidateEntity, "prevPos", spawnMm);
+        s.setComponent<Yaw>(candidateEntity, "yaw", { mdeg: 0 });
+        s.setComponent<Yaw>(candidateEntity, "prevYaw", { mdeg: 0 });
+        s.setComponent<Collider>(candidateEntity, "collider", { radiusMm: GUEST_RADIUS_MM });
+        s.setComponent<NavAgent>(candidateEntity, "navAgent", {
+          goalCx: candidateWaitCellFor(index).cx,
+          goalCz: candidateWaitCellFor(index).cz,
+          path: [],
+          pathIdx: 0,
+          repathAtTick: 0,
+          jitterSeed: spec.seed,
+          stuckTicks: 0,
+          avoidCx: -1,
+          avoidCz: -1,
+        });
+        s.setComponent<Person>(candidateEntity, "person", { kind: "candidate", name: spec.name, seed: spec.seed });
+
+        // The resume is a REAL document entity on the printer tray, read
+        // through the exact held-item path IDs already use.
+        const resumeEntity = s.spawn();
+        const trayMm = { xMm: printerTrayMm.xMm + index * 300, zMm: printerTrayMm.zMm };
+        s.setComponent<DocumentComp>(resumeEntity, "document", {
+          docType: "resume",
+          fields: {
+            name: spec.name,
+            wageAsk: String(spec.wageAsk),
+            skill: String(spec.skillPermille),
+            quirk: spec.quirk,
+          },
+          ownerEntity: candidateEntity,
+          heldBy: 0,
+        });
+        s.setComponent<Pos>(resumeEntity, "pos", trayMm);
+        s.setComponent<Interactable>(resumeEntity, "interactable", {
+          kind: "document",
+          xMm: trayMm.xMm,
+          zMm: trayMm.zMm,
+          radiusMm: INTERACTABLE_RADIUS_MM,
+          arcMdeg: INTERACTABLE_ARC_MDEG,
+        });
+        s.emit("printer.printed", { docType: "resume", documentEntity: resumeEntity, candidateEntity });
+
+        s.setComponent<Candidate>(candidateEntity, "candidate", {
+          wageAsk: spec.wageAsk,
+          skillPermille: spec.skillPermille,
+          quirk: spec.quirk,
+          state: "arriving",
+          resumeEntity,
+        });
+        s.setComponent<Interactable>(candidateEntity, "interactable", {
+          kind: "candidate",
+          xMm: spawnMm.xMm,
+          zMm: spawnMm.zMm,
+          radiusMm: INTERACTABLE_RADIUS_MM,
+          arcMdeg: INTERACTABLE_ARC_MDEG,
+        });
+      }
+    }
+
+    // -- blacklist bulletins, once the tier that reads them is live --
+    if (hotel.stars >= 2 && isBulletinDay(hotel.day)) {
+      const name = bulletinNameFor(hotel.day);
+      const listEntity = findOrCreateNoticeList(s, "blacklist");
+      const list = s.getComponent<NoticeList>(listEntity, "noticeList")!;
+      if (!list.values.includes(name)) {
+        s.setComponent<NoticeList>(listEntity, "noticeList", { ...list, values: [...list.values, name] });
+        queueMail(s, hotel.day, "bulletin", "mail.bulletin", { names: name });
+        s.emit("mail.bulletinDelivered", { listId: "blacklist", name, day: hotel.day });
+      }
+    }
+  }
+
+  function hasAnyStaffOrCandidates(s: Sim): boolean {
+    for (const [] of s.withComponent<Staffed>("staffed")) return true;
+    for (const [, candidate] of s.withComponent<Candidate>("candidate")) {
+      if (candidate.state !== "rejected") return true;
+    }
+    return false;
+  }
+
+  /** Bulletin days: a stateless hash of the salt and the day. Never a
+   *  draw, so delivering (or not delivering) a bulletin cannot perturb any
+   *  Rng stream. */
+  function isBulletinDay(day: number): boolean {
+    return hash32((bulletinSalt ^ (day * 0x9e3779b1)) >>> 0) % 3 === 0;
+  }
+
+  /** Bulletin content comes from the SAME name pool guests draw from —
+   *  otherwise the blacklist row could never be violated by a real guest
+   *  and the escalation would be decorative. */
+  function bulletinNameFor(day: number): string {
+    const names: string[] = [];
+    for (const archetype of ARCHETYPES) for (const name of archetype.names) names.push(name);
+    const idx = hash32((bulletinSalt ^ (day * 2654435761)) >>> 0) % names.length;
+    return names[idx]!;
+  }
+
+  function findOrCreateNoticeList(s: Sim, listId: string): EntityId {
+    for (const [entity, list] of s.withComponent<NoticeList>("noticeList")) {
+      if (list.listId === listId) return entity;
+    }
+    const entity = s.spawn();
+    s.setComponent<NoticeList>(entity, "noticeList", { listId, values: [] });
+    return entity;
+  }
+
+  // 14. reviewSystem — one review per checkout, scored from integer stay
+  //     facts. Runs after guestBrainSystem (which emits guest.checkedOut
+  //     earlier in the same tick), so this tick's checkouts are visible in
+  //     the event log by the time we read it.
+  function reviewSystem(s: Sim): void {
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    for (const event of s.eventsSince(s.tick)) {
+      if (event.type !== "guest.checkedOut") continue;
+      const guestEntity = (event.payload as { guestEntity: EntityId }).guestEntity;
+      const guest = s.getComponent<Guest>(guestEntity, "guest");
+      if (!guest) continue;
+      const tierBaseline = ROOM_RATE_MINOR[1]!;
+      const outcome = scoreReview({
+        waitedTicks: guest.waitedTicks,
+        brokenPropNights: guest.brokenPropNights,
+        paidMinor: guest.paidMinor,
+        tierBaselineMinor: tierBaseline,
+      });
+      const reviewEntity = s.spawn();
+      s.setComponent<Review>(reviewEntity, "review", {
+        day: hotel.day,
+        segment: guest.segment,
+        score: outcome.score,
+        factors: outcome.factors,
+      });
+      s.emit("guest.reviewed", { guestEntity, score: outcome.score, segment: guest.segment, factors: outcome.factors });
+      if (outcome.score <= 2) {
+        s.emit("guest.complained", { guestEntity, score: outcome.score, segment: guest.segment, factors: outcome.factors });
+        queueMail(s, hotel.day, "complaint", "mail.complaint", {
+          segment: guest.segment,
+          score: String(outcome.score),
+          factors: outcome.factors.join(","),
+        });
+      }
+    }
+  }
+
+  // 13. upkeepSystem — breakage rolls at the day rollover, one draw per
+  //     prop from forkRng("upkeep"). A broken prop is a broken prop: it
+  //     never worsens, never spreads, and never becomes a flood (incident
+  //     cascade is a Phase 3 system, deliberately absent). An OCCUPIED
+  //     room's broken prop accrues one integer broken-night on its guest,
+  //     cashed out once in the checkout review — nothing dings the player
+  //     mid-day and nothing beeps.
+  function upkeepSystem(s: Sim): void {
+    if (!config.upkeep) return;
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+    const { day: newDay } = computePhase(s.tick);
+    if (newDay === hotel.day) return; // rollover only
+
+    for (const [entity, prop] of [...s.withComponent<Prop>("prop")]) {
+      if (prop.broken) {
+        const room = s.getComponent<RoomUnit>(prop.roomEntity, "roomUnit");
+        const occupant = room?.occupantEntity ?? 0;
+        if (occupant !== 0) {
+          const guest = s.getComponent<Guest>(occupant, "guest");
+          if (guest) {
+            s.setComponent<Guest>(occupant, "guest", {
+              ...guest,
+              brokenPropNights: guest.brokenPropNights + 1,
+            });
+          }
+        }
+        continue;
+      }
+      if (upkeepRng.int(0, 999) >= BREAKAGE_PERMILLE) continue;
+      s.setComponent<Prop>(entity, "prop", { ...prop, broken: true, repairProgress: 0 });
+      s.emit("prop.broke", { propEntity: entity, roomEntity: prop.roomEntity, kind: prop.kind });
     }
   }
 
@@ -1138,18 +2266,75 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   function economySystem(s: Sim): void {
     const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
     if (!hotel) return;
+
+    // Objective progress, every tick, from THIS tick's events. Progress
+    // lives on the component (never a closure counter), so a mid-day
+    // restore() resumes with exactly the progress the snapshot recorded.
+    const todaysEvents = s.eventsSince(s.tick);
+    if (todaysEvents.length > 0) {
+      for (const [entity, objective] of [...s.withComponent<Objective>("objective")]) {
+        if (objective.done || objective.day !== hotel.day) continue;
+        const template = OBJECTIVE_KINDS.find((t) => t.kind === objective.kind);
+        if (!template) continue;
+        let hits = 0;
+        for (const event of todaysEvents) if (event.type === template.event) hits++;
+        if (hits === 0) continue;
+        const progress = objective.progress + hits;
+        const done = progress >= objective.target;
+        s.setComponent<Objective>(entity, "objective", { ...objective, progress, done });
+        if (done) s.emit("objective.completed", { objectiveEntity: entity, kind: objective.kind, day: objective.day });
+      }
+    }
+
     const { day: newDay } = computePhase(s.tick);
     if (newDay === hotel.day) return; // no rollover this tick
-    const expense = DAILY_WAGES_MINOR + DAILY_UTILITIES_MINOR;
-    s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash - expense });
-    const wages = s.spawn();
-    s.setComponent<LedgerEntry>(wages, "ledgerEntry", {
+
+    // Settle the day's objectives: completed ones pay, missed ones just
+    // close. There is no penalty for a missed objective anywhere in this
+    // system — "punishing absence" is on the explicit avoid-list.
+    let rewardTotal = 0;
+    for (const [entity, objective] of [...s.withComponent<Objective>("objective")]) {
+      if (objective.day !== hotel.day) continue;
+      if (!objective.done) {
+        s.emit("objective.failed", { objectiveEntity: entity, kind: objective.kind, day: objective.day });
+        continue;
+      }
+      rewardTotal += objective.rewardMinor;
+    }
+    if (rewardTotal > 0) {
+      const reward = s.spawn();
+      s.setComponent<LedgerEntry>(reward, "ledgerEntry", {
+        day: hotel.day,
+        debitAccount: "cash",
+        creditAccount: "revenue:objectives",
+        amountMinor: rewardTotal,
+        memo: "daily objectives",
+      });
+    }
+
+    let wagesMinor = 0;
+    for (const [, staffed] of s.withComponent<Staffed>("staffed")) wagesMinor += staffed.wage;
+    const expense = DAILY_WAGES_MINOR + DAILY_UTILITIES_MINOR + wagesMinor;
+
+    s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash - expense + rewardTotal });
+    const overhead = s.spawn();
+    s.setComponent<LedgerEntry>(overhead, "ledgerEntry", {
       day: hotel.day,
       debitAccount: "expense:wages",
       creditAccount: "cash",
       amountMinor: DAILY_WAGES_MINOR,
       memo: "daily wages",
     });
+    if (wagesMinor > 0) {
+      const staffWages = s.spawn();
+      s.setComponent<LedgerEntry>(staffWages, "ledgerEntry", {
+        day: hotel.day,
+        debitAccount: "expense:staff",
+        creditAccount: "cash",
+        amountMinor: wagesMinor,
+        memo: "staff wages",
+      });
+    }
     const utilities = s.spawn();
     s.setComponent<LedgerEntry>(utilities, "ledgerEntry", {
       day: hotel.day,
@@ -1173,15 +2358,84 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       let expenseMinor = 0;
       for (const [, entry] of s.withComponent<LedgerEntry>("ledgerEntry")) {
         if (entry.day !== hotel.day) continue;
-        if (entry.creditAccount === "revenue:rooms") revenueMinor += entry.amountMinor;
+        if (entry.creditAccount.startsWith("revenue:")) revenueMinor += entry.amountMinor;
         if (entry.debitAccount.startsWith("expense:")) expenseMinor += entry.amountMinor;
       }
-      s.emit("econ.audit", { day: hotel.day, revenueMinor, expenseMinor, closingCashMinor: hotel.cash });
+
+      // Reputation and stars: RECOMPUTED from the rolling review window,
+      // never accumulated. A mid-week restore() is trivially correct
+      // because there is no running total to be out of step with.
+      const windowRows: ReviewRow[] = [];
+      for (const [, review] of s.withComponent<Review>("review")) {
+        windowRows.push({ day: review.day, segment: review.segment, score: review.score });
+      }
+      const repBySegment = reputationBySegment(windowRows, hotel.day);
+      const reviewsInWindow = windowRows.filter((r) => r.day > hotel.day - REVIEW_WINDOW_DAYS).length;
+      const stars = starsFromReputation(overallReputation(repBySegment), reviewsInWindow);
+      if (stars !== hotel.stars) s.emit("hotel.starsChanged", { from: hotel.stars, to: stars, day: hotel.day });
+
+      // Tomorrow's demand, then tomorrow's objectives. Both draw ONCE,
+      // here, at generation time (H2 determinism rule 3).
+      const arrivalsBySegment =
+        config.arrivals === "demand"
+          ? arrivalsForDay(demandRng, hotel.rateByTier, repBySegment, stars, DEFAULT_REP_PERMILLE)
+          : {};
+      const forecastArrivals = config.arrivals === "demand" ? totalArrivals(arrivalsBySegment) : 0;
+
+      const roomCount = [...s.withComponent<RoomUnit>("roomUnit")].length;
+      const objectiveSpecs = generateObjectives(objectivesRng, Math.max(1, forecastArrivals), roomCount);
+      const objectivePayload: { kind: string; target: number; rewardMinor: number }[] = [];
+      for (const spec of objectiveSpecs) {
+        const entity = s.spawn();
+        s.setComponent<Objective>(entity, "objective", {
+          day: newDay,
+          kind: spec.kind,
+          target: spec.target,
+          progress: 0,
+          done: false,
+          rewardMinor: spec.rewardMinor,
+        });
+        objectivePayload.push({ kind: spec.kind, target: spec.target, rewardMinor: spec.rewardMinor });
+        s.emit("objective.posted", { objectiveEntity: entity, kind: spec.kind, target: spec.target, day: newDay });
+      }
+
+      const hireUnlocked = hotel.hireUnlocked || hotel.cash >= HIRE_THRESHOLD_MINOR;
+      if (hireUnlocked && !hotel.hireUnlocked) {
+        s.emit("econ.hireUnlocked", { day: hotel.day, thresholdMinor: HIRE_THRESHOLD_MINOR });
+      }
+
+      // The audit is the ritual close AND the "one more day" hook: the
+      // forecast line is the hook, and the STAFF BUDGET gap is printed
+      // whether or not it has been reached (DESIGN §6 transparency).
+      s.emit("econ.audit", {
+        day: hotel.day,
+        revenueMinor,
+        expenseMinor,
+        closingCashMinor: hotel.cash,
+        stars,
+        repBySegment,
+        forecastArrivals,
+        objectives: objectivePayload,
+        hireUnlocked,
+        hireThresholdMinor: HIRE_THRESHOLD_MINOR,
+      });
+
       s.setComponent<Hotel>(hotelEntity, "hotel", {
         ...hotel,
         day: newDay,
         phaseId: newPhaseId,
         phaseStartTick: s.tick,
+        stars,
+        repBySegment,
+        arrivalsToday: forecastArrivals,
+        arrivalsSpawned: 0,
+        guestsSpawned: config.arrivals === "demand" ? 0 : hotel.guestsSpawned,
+        // Only the demand path re-arms the spawn clock at the rollover. In
+        // FIXED mode `spawnTickMin` is an absolute first-guest tick, not an
+        // interval, so re-arming it would silently push the whole schedule
+        // a day into the future every midnight.
+        nextGuestAtTick: config.arrivals === "demand" ? s.tick + config.spawnTickMin : hotel.nextGuestAtTick,
+        hireUnlocked,
       });
     } else if (newPhaseId !== hotel.phaseId) {
       s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, phaseId: newPhaseId, phaseStartTick: s.tick });
@@ -1198,6 +2452,16 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (!hasArrived(s, entity)) continue;
       toDespawn.push(entity);
     }
+    // Rejected candidates walk out the same street door guests do, and
+    // take their printed resume with them.
+    for (const [entity, candidate] of [...s.withComponent<Candidate>("candidate")]) {
+      if (candidate.state !== "rejected") continue;
+      if (!hasArrived(s, entity)) continue;
+      if (candidate.resumeEntity !== 0) s.despawn(candidate.resumeEntity);
+      s.despawn(entity);
+      s.emit("staff.candidateLeft", { candidateEntity: entity });
+    }
+
     for (const guestEntity of toDespawn) {
       s.emit("guest.left", { guestEntity });
       for (const [docEntity, doc] of [...s.withComponent<DocumentComp>("document")]) {
@@ -1232,17 +2496,24 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
   }
 
+  sim.addSystem(indexSystem);
   sim.addSystem(snapshotPrevSystem);
   sim.addSystem(faceSystem);
   sim.addSystem(guestSpawnSystem);
   sim.addSystem(guestBrainSystem);
+  sim.addSystem(candidateSystem);
+  sim.addSystem(staffBrainSystem);
   sim.addSystem(pathSystem);
   sim.addSystem(moveSystem);
   sim.addSystem(interactSystem);
   sim.addSystem(deskSystem);
+  sim.addSystem(staffSystem);
   sim.addSystem(screenSystem);
+  sim.addSystem(upkeepSystem);
+  sim.addSystem(reviewSystem);
   sim.addSystem(economySystem);
   sim.addSystem(dayPhaseSystem);
+  sim.addSystem(mailSystem);
   sim.addSystem(cleanupSystem);
   sim.addSystem(saveRestoreDebugSystem);
 }
@@ -1305,6 +2576,32 @@ export function saveRestoreDebugCommand(
   return { tick, actor, type: "debug.saveRestoreRecord", payload: { savedTick, savedHash, restoredHash } };
 }
 
+/** H2a's three new actor-bound decision commands. Same shape and same
+ *  validated destination as `deskDecisionCommand`: the screen emits the
+ *  effect, a bot or scenario submits the command, and both land in one
+ *  apply function. */
+export function staffHireCommand(
+  tick: number,
+  candidateEntity: EntityId,
+  accept: boolean,
+  actor: string = PLAYER_ACTOR
+): Command {
+  return { tick, actor, type: "staff.hire", payload: { candidateEntity, accept } };
+}
+
+export function pricerSetRateCommand(
+  tick: number,
+  tier: number,
+  rateMinor: number,
+  actor: string = PLAYER_ACTOR
+): Command {
+  return { tick, actor, type: "pricer.setRate", payload: { tier, rateMinor } };
+}
+
+export function mailboxReadCommand(tick: number, mailEntity: EntityId, actor: string = PLAYER_ACTOR): Command {
+  return { tick, actor, type: "mailbox.read", payload: { mailEntity } };
+}
+
 export function deskDecisionCommand(
   tick: number,
   reservationEntity: EntityId,
@@ -1320,4 +2617,4 @@ export { cellAt, cellOfMm, CELL };
 // module it already imports everything else from; `screenSystem` (above)
 // and `syncScene`'s repaint call the exact same `buildScreenWorldView` —
 // two view-builders that can disagree is the bug this avoids.
-export { hotelShell, buildScreenWorldView } from "./screen.js";
+export { hotelShell, buildScreenWorldView, HOTEL_APPS } from "./screen.js";

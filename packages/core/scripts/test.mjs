@@ -97,9 +97,10 @@ function check(description, pass) {
     const loot = sim.forkRng("loot");
     sim.addSystem((s) => {
       const hp = s.getComponent(player, "hp");
-      hp.value -= loot.int(1, 3); // tracked-fork draw, every tick
-      hp.value -= s.rng.int(0, 1); // root-stream draw, every tick
-      s.emit("tick", { hp: hp.value });
+      let value = hp.value - loot.int(1, 3); // tracked-fork draw, every tick
+      value -= s.rng.int(0, 1); // root-stream draw, every tick
+      s.setComponent(player, "hp", { value });
+      s.emit("tick", { hp: value });
     });
   }
 
@@ -270,16 +271,18 @@ function check(description, pass) {
       for (const c of s.commands()) {
         if (c.type !== "move") continue;
         const pos = s.getComponent(player, "pos");
-        pos.x += c.payload.dx;
-        pos.y += c.payload.dy;
-        s.emit("moved", { ...pos });
+        // Write-through, never in-place (Sim.stateHash()'s Phase-H2 contract).
+        const next = { x: pos.x + c.payload.dx, y: pos.y + c.payload.dy };
+        s.setComponent(player, "pos", next);
+        s.emit("moved", { ...next });
       }
     });
     sim.addSystem((s) => {
       if (s.tick % 10 !== 0) return;
       const hp = s.getComponent(player, "hp");
-      hp.value -= loot.int(1, 3);
-      s.emit("damaged", { hp: hp.value });
+      const value = hp.value - loot.int(1, 3);
+      s.setComponent(player, "hp", { value });
+      s.emit("damaged", { hp: value });
     });
   }
 
@@ -301,7 +304,114 @@ function check(description, pass) {
     sim.step();
   }
   const hash = sim.stateHash();
-  check(`hash stability: seeded scenario stateHash pinned at 919868270 (unchanged by this change) — got ${hash}`, hash === 919868270);
+  // Re-pinned ONCE in Phase H2a lane 1 (docs/PHASE-H2.md contract A): the
+  // hash became incremental — a fold of per-entry FNV digests rather than
+  // one byte stream — so every value moved exactly once, with no change to
+  // the logic being hashed. Pre-H2 value: 919868270.
+  check(`hash stability: seeded scenario stateHash pinned at 3849639990 (H2a re-pin) — got ${hash}`, hash === 3849639990);
+  check("hash stability: stateHashSlow() agrees with the incremental stateHash()", sim.stateHashSlow() === hash);
+}
+
+// --- incremental stateHash: the write-through contract (docs/PHASE-H2.md A)
+{
+  const sim = new Sim("core-incremental-hash");
+  const a = sim.spawn();
+  const b = sim.spawn();
+  sim.setComponent(a, "pos", { x: 1, y: 2 });
+  sim.setComponent(a, "hp", { value: 10 });
+  sim.setComponent(b, "pos", { x: 3, y: 4 });
+
+  check("incremental: agrees with slow on a fresh sim", sim.stateHash() === sim.stateHashSlow());
+
+  // Every write path must invalidate the cached entry, or the incremental
+  // hash silently reports the pre-write state.
+  const beforeWrite = sim.stateHash();
+  sim.setComponent(a, "pos", { x: 9, y: 2 });
+  check("incremental: setComponent moves the hash", sim.stateHash() !== beforeWrite);
+  check("incremental: setComponent stays in step with slow", sim.stateHash() === sim.stateHashSlow());
+
+  const beforeRemove = sim.stateHash();
+  sim.removeComponent(a, "hp");
+  check("incremental: removeComponent moves the hash", sim.stateHash() !== beforeRemove);
+  check("incremental: removeComponent stays in step with slow", sim.stateHash() === sim.stateHashSlow());
+
+  // Re-adding the SAME component name to the SAME entity with a DIFFERENT
+  // value is the case a cache that only invalidates on delete would miss.
+  sim.setComponent(a, "hp", { value: 77 });
+  check("incremental: re-added component stays in step with slow", sim.stateHash() === sim.stateHashSlow());
+
+  const beforeDespawn = sim.stateHash();
+  sim.despawn(b);
+  check("incremental: despawn moves the hash", sim.stateHash() !== beforeDespawn);
+  check("incremental: despawn stays in step with slow", sim.stateHash() === sim.stateHashSlow());
+
+  // An emptied store is still distinguishable from one that never existed —
+  // the pre-H2 hash folded component names per store, and so does this one.
+  const emptied = new Sim("core-incremental-empty");
+  const e = emptied.spawn();
+  emptied.setComponent(e, "ghost", { v: 1 });
+  emptied.removeComponent(e, "ghost");
+  const never = new Sim("core-incremental-empty");
+  never.spawn();
+  check(
+    "incremental: a created-then-emptied component store still hashes differently from one that never existed",
+    emptied.stateHash() !== never.stateHash() && emptied.stateHash() === emptied.stateHashSlow()
+  );
+
+  // Negative control: the ONE thing the cross-check exists to catch. An
+  // in-place mutation is invisible to setComponent(), so the cached entry
+  // hash goes stale and the two hashes MUST disagree. If this check ever
+  // passes-by-agreeing, stateHashSlow() has stopped biting.
+  const violator = new Sim("core-writethrough-violation");
+  const v = violator.spawn();
+  violator.setComponent(v, "pos", { x: 0, y: 0 });
+  violator.stateHash(); // populate the cache
+  violator.getComponent(v, "pos").x = 42; // the banned move
+  check(
+    "incremental: an in-place component mutation makes stateHash() and stateHashSlow() disagree",
+    violator.stateHash() !== violator.stateHashSlow()
+  );
+
+  // restore() clears the cache wholesale, so a restored sim's incremental
+  // hash cannot inherit entries from the state it replaced.
+  const src = new Sim("core-incremental-restore");
+  const s1 = src.spawn();
+  src.setComponent(s1, "pos", { x: 5, y: 5 });
+  const snap = src.snapshot();
+  const dst = new Sim("core-incremental-restore");
+  const d1 = dst.spawn();
+  dst.setComponent(d1, "pos", { x: 999, y: 999 });
+  dst.stateHash(); // populate a cache with the WRONG values
+  dst.restore(snap);
+  check(
+    "incremental: restore() clears the entry cache (restored hash matches the source)",
+    dst.stateHash() === snap.stateHash && dst.stateHash() === dst.stateHashSlow()
+  );
+}
+
+// --- incremental stateHash: cost, at the spec's 300-entity fixture --------
+// Review-read, NOT asserted (a timing assertion in a unit suite is a
+// flake generator). docs/PHASE-H2.md §12 states the expectation: >= 10x.
+{
+  const bench = new Sim("core-hash-bench");
+  for (let i = 0; i < 300; i++) {
+    const e = bench.spawn();
+    bench.setComponent(e, "pos", { xMm: i * 137, zMm: i * 31 });
+    bench.setComponent(e, "guest", { archetypeId: `arch-${i % 7}`, segment: "budget", state: "queued", roomEntity: 0, stayUntilTick: 0, queueIndex: i % 12, patienceTicks: 0 });
+    bench.setComponent(e, "navAgent", { goalCx: i % 40, goalCz: i % 30, path: [], pathIdx: 0, repathAtTick: 0, jitterSeed: i, stuckTicks: 0 });
+  }
+  const REPS = 200;
+  bench.stateHash(); // warm the cache; steady state is "nothing dirty"
+  let t0 = performance.now();
+  for (let i = 0; i < REPS; i++) bench.stateHash();
+  const incrementalUs = ((performance.now() - t0) * 1000) / REPS;
+  t0 = performance.now();
+  for (let i = 0; i < REPS; i++) bench.stateHashSlow();
+  const slowUs = ((performance.now() - t0) * 1000) / REPS;
+  console.log(
+    `  hash bench @300 entities x3 components: incremental ${incrementalUs.toFixed(1)} us/call, slow ${slowUs.toFixed(1)} us/call (${(slowUs / incrementalUs).toFixed(1)}x)`
+  );
+  check("hash bench: the two paths agree at the 300-entity fixture", bench.stateHash() === bench.stateHashSlow());
 }
 
 if (failures > 0) {

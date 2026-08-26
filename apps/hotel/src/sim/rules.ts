@@ -43,13 +43,15 @@ export interface RuleSpec {
 }
 
 /** What `evaluateRules` needs about the current world, besides the rows
- *  themselves and the documents/reservation fields (H1: `lists` is always
- *  empty — MAILBOX starts populating it in Phase 3). */
+ *  themselves and the documents/reservation fields. As of Phase H2a
+ *  `lists` is really populated: MAILBOX bulletins append to `noticeList`
+ *  components and the sim rebuilds this per evaluation from a fresh scan
+ *  (never cached across ticks). */
 export interface RuleContext {
   /** Current sim day, integer. Compared against `notExpired` date fields. */
   day: number;
-  /** Named lists (blacklists, loyalty rolls) — H1: empty. MAILBOX delivers
-   *  list updates in Phase 3 by writing components this is built from. */
+  /** Named lists (blacklists, loyalty rolls), keyed by `listId`. Built
+   *  from the `noticeList` components MAILBOX appends to. */
   lists: Record<string, readonly string[]>;
 }
 
@@ -80,6 +82,19 @@ export type ResFields = Record<string, string>;
 // desk is checking presented documents against, matching how a real front
 // desk cross-references a printed confirmation.
 
+/**
+ * The committed rule table. H1 shipped five rows, all `minStars: 1`; H2a
+ * appends the `blacklist` row at `minStars: 2` — the first row the star
+ * tier actually gates, and the first consumer of the `listed` check kind
+ * (docs/PHASE-H2.md §10). Nothing here ever changes at runtime: star tiers
+ * change WHICH rows are active, and MAILBOX changes the LISTS the rows read
+ * (H2 determinism rule 7).
+ *
+ * The name `H1_RULES` is kept deliberately — it is imported by
+ * scenarios/lib/hotel-desk.mjs and both gate suites, and a rename would be
+ * pure churn across the gates this phase must hold steady. `RULES` is
+ * exported as the forward-looking alias the H2 spec names.
+ */
 export const H1_RULES: readonly RuleSpec[] = [
   {
     id: "id-present",
@@ -115,6 +130,15 @@ export const H1_RULES: readonly RuleSpec[] = [
     check: { kind: "notExpired", docType: "id", dateField: "expiresDay" },
     failFlag: "id-expired",
     description: "The ID must not be expired as of today.",
+  },
+  // H2a. Appended at the END so H1's five rows keep their table order —
+  // `evaluateRules` returns flags in table order and the gates assert it.
+  {
+    id: "blacklist",
+    minStars: 2,
+    check: { kind: "listed", listId: "blacklist", docType: "id", docField: "name", mustBe: "absent" },
+    failFlag: "blacklisted",
+    description: "The name on the ID must not appear on the current blacklist bulletin.",
   },
 ];
 
@@ -229,11 +253,20 @@ export function plantViolation(
   rng: Rng,
   docs: readonly RuleDoc[],
   resFields: ResFields,
+  ctx: RuleContext,
 ): { docs: RuleDoc[]; resFields: ResFields; failFlag: string } {
   if (rules.length === 0) {
     throw new Error("plantViolation: rules table is empty");
   }
-  const rule = rng.pick(rules);
+  // Only ever pick a row this world CAN violate right now. Callers are
+  // expected to filter with `plantableRules` first (guestSpawnSystem does);
+  // filtering again here means a caller that forgets cannot silently plant
+  // an unviolatable row and hand the desk an uncatchable "fraud".
+  const plantable = plantableRules(rules, ctx);
+  if (plantable.length === 0) {
+    throw new Error("plantViolation: no rule in this table is plantable in this context");
+  }
+  const rule = rng.pick(plantable);
 
   // Deep-ish copy: docs is a small array of small field maps.
   const nextDocs: RuleDoc[] = docs.map((d) => ({ docType: d.docType, fields: { ...d.fields } }));
@@ -266,26 +299,103 @@ export function plantViolation(
       break;
     }
     case "listed": {
-      const doc = nextDocs.find((d) => d.docType === check.docType);
-      if (doc) {
-        if (check.mustBe === "present") {
-          // Must NOT be on the list to violate "must be present" —
-          // simplest guaranteed-absent sentinel value.
-          doc.fields[check.docField] = "__not-on-any-list__";
-        } else {
-          // mustBe "absent": to violate, the value must BE on the list.
-          // H1 ships no lists, so there is no value guaranteed to be on
-          // an empty list; this branch is unreachable with H1_RULES (no
-          // "listed" row ships), but is implemented for forward
-          // compatibility per the spec's contract.
-          doc.fields[check.docField] = "__unreachable-h1-listed-present__";
-        }
+      if (check.mustBe === "present") {
+        // Must NOT be on the list to violate "must be present" — the
+        // simplest guaranteed-absent sentinel value.
+        setFieldAndDependents(nextDocs, nextResFields, rules, check.docType, check.docField, "__not-on-any-list__");
+      } else {
+        // mustBe "absent": to violate, the value must BE on the list. H1
+        // shipped a placeholder sentinel here — committed-WRONG code
+        // (H1a review item 3): the sentinel is not on any list, so the row
+        // passed and the "planted" fraud was uncatchable. `plantableRules`
+        // guarantees the list is non-empty by the time we get here.
+        const list = ctx.lists[check.listId] ?? [];
+        setFieldAndDependents(nextDocs, nextResFields, rules, check.docType, check.docField, rng.pick(list));
       }
       break;
     }
   }
 
   return { docs: nextDocs, resFields: nextResFields, failFlag: rule.failFlag };
+}
+
+/**
+ * Which rows of `rules` can actually be violated in this world right now.
+ *
+ * A `listed`/`mustBe:"absent"` row is plantable only when its list is
+ * NON-EMPTY: violating it means writing a value that IS on the list, and an
+ * empty list has no such value. Everything else is always plantable. This
+ * is what stops `guestSpawnSystem` from picking the blacklist row on day 1,
+ * before MAILBOX has delivered a bulletin, and planting a "fraud" no desk
+ * check could ever catch.
+ */
+export function plantableRules(rules: readonly RuleSpec[], ctx: RuleContext): RuleSpec[] {
+  return rules.filter((rule) => {
+    const check = rule.check;
+    if (check.kind !== "listed") return true;
+    if (check.mustBe === "present") return true;
+    return (ctx.lists[check.listId] ?? []).length > 0;
+  });
+}
+
+/**
+ * Writes `value` into one document field, and into every other field the
+ * rule table ties to it, so the planted violation stays EXACTLY one row.
+ *
+ * Without this, planting the blacklist row (write a listed name onto the
+ * ID) would also break `name-match`, because that row compares the ID's
+ * name against the reservation's guest name — a superset violation, which
+ * is precisely what the plant/evaluate round-trip property forbids. The
+ * propagation is driven by the rule table itself, not by hardcoded field
+ * names, so a later `fieldMatch` row is covered the day it lands.
+ *
+ * Three passes, all bounded by the table size:
+ *   1. the target document field;
+ *   2. every reservation field a `fieldMatch` row compares it against;
+ *   3. every OTHER document field compared against those same reservation
+ *      fields (so two documents carrying the same name stay in agreement).
+ * Finally, any document field NAMED after one of those reservation fields
+ * that no `fieldMatch` row reads (the reservation slip's own `guestName`)
+ * is moved too — nothing evaluates it, but leaving a stale name on a slip
+ * beside a blacklisted ID would show the player a contradiction the rule
+ * table does not name.
+ */
+function setFieldAndDependents(
+  docs: RuleDoc[],
+  resFields: ResFields,
+  rules: readonly RuleSpec[],
+  docType: string,
+  docField: string,
+  value: string,
+): void {
+  const target = docs.find((d) => d.docType === docType);
+  if (target) target.fields[docField] = value;
+
+  const touchedResFields: string[] = [];
+  for (const rule of rules) {
+    const check = rule.check;
+    if (check.kind !== "fieldMatch") continue;
+    if (check.docType !== docType || check.docField !== docField) continue;
+    resFields[check.resField] = value;
+    touchedResFields.push(check.resField);
+  }
+  for (const rule of rules) {
+    const check = rule.check;
+    if (check.kind !== "fieldMatch") continue;
+    if (!touchedResFields.includes(check.resField)) continue;
+    const other = docs.find((d) => d.docType === check.docType);
+    if (other) other.fields[check.docField] = value;
+  }
+
+  const readByAnyRule = (dt: string, df: string): boolean =>
+    rules.some((r) => r.check.kind === "fieldMatch" && r.check.docType === dt && r.check.docField === df);
+  for (const resField of touchedResFields) {
+    for (const doc of docs) {
+      if (!Object.prototype.hasOwnProperty.call(doc.fields, resField)) continue;
+      if (readByAnyRule(doc.docType, resField)) continue;
+      doc.fields[resField] = value;
+    }
+  }
 }
 
 /** Deterministically perturbs a string so it differs from `original`, using

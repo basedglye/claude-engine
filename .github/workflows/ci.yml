@@ -79,6 +79,13 @@ jobs:
           npm run harness --silent -- fraud-catch --verify-replay
           npm run harness --silent -- fraud-catch-b --verify-replay
 
+      - name: Harness hotel H2a gates (--verify-replay)
+        run: |
+          npm run harness --silent -- zen-clean --verify-replay
+          npm run harness --silent -- first-hire --verify-replay
+          npm run harness --silent -- escalation-stars --verify-replay
+          npm run harness --silent -- one-man-week --verify-replay
+
       - name: Harness soak scenarios (net-walk, net-interest, net-abuse, soak-ci)
         run: |
           npm run harness --silent -- net-walk --soak

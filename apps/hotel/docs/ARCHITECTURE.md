@@ -34,9 +34,10 @@ hacks.
 planning/review turn):
 
 - ⚠ `core` — `despawn(entity)`, `componentsOf(entity)`, indexed/
-  ring-buffered `eventsSince` (today it linear-scans an unbounded log),
-  incremental dirty-tracked `stateHash` (today it `JSON.stringify`s all
-  state per call). Old APIs keep working.
+  ring-buffered `eventsSince`, incremental dirty-tracked `stateHash`. All
+  landed (H0 for the first three, H2a for the hash). Old APIs keep working;
+  the hash's VALUES moved once, at the H2a re-pin, and its write-through
+  requirement is now CLAUDE.md invariant 6.
 - ⚠ `renderer-three` — `pointerHandlers` alongside the existing keyboard
   `keymap`, an `onFrame(camera)` hook, an `instancedScenery` helper, a
   texture cache, and synthetic-pointer injection in `installTestHook`.
@@ -271,12 +272,33 @@ need a ⚠ `GameStore.compact()`.
 
 **Performance budgets** (measured by the new feel probes, gated in
 verdicts): sim tick ≤ 5 ms at 300 entities; browser frame-time p95 ≤ 16.7
-ms; ≤ 300 draw calls; server state-message serialisation ≤ 3 ms/actor. Fix
-order:
+ms; ≤ 300 draw calls; server state-message serialisation ≤ 3 ms/actor.
 
-1. Indexed/ring-buffered `eventsSince` — Phase 0.
+**How to measure a per-tick number, and why the method has to be recorded
+with it.** The harness's `perf.avgTickMs` is a SINGLE cold run: it includes
+JIT warm-up, and on this machine that dominates a short scenario. H1's
+carried `checkin-rush ≤ 0.030` was written down that way, and after H2a's
+`indexSystem`/A* refactor the same measure reads 0.035–0.042 on the same
+machine while the sim is demonstrably faster — the H2a review re-measured
+both ways and recorded the discrepancy rather than chasing it. Use a WARM
+in-process bench (build the sim, run the scenario's ticks N times in one
+process, take the median) for any before/after comparison, and quote the
+method beside the number. Values as of the H2a merge: `checkin-rush` warm
+median **0.0107 ms/tick** (0.0071–0.0077 measured by the implementer on a
+quieter machine state, ~35–40% better than the pre-refactor median);
+`one-man-week` (42,000 ticks, ~195 entities) harness avgTickMs **0.446**
+against its ≤ 1.0 budget, which is unambiguous by either method.
+
+Fix order:
+
+1. Indexed/ring-buffered `eventsSince` — Phase 0. **Done.**
 2. Incremental `stateHash` with the full JSON hash kept as a `--verify` slow
-   path — Phase 2.
+   path — Phase 2. **Done in H2a**, and the slow path is not merely kept: the
+   harness asserts `stateHash() === stateHashSlow()` on every run, live and
+   replayed, because the incremental hash's correctness now rests on a house
+   rule (write-through) rather than on arithmetic. Measured at a 300-entity
+   fixture: 6x cheaper than the full walk, below the 10x the H2 spec
+   expected — reported as measured.
 3. Merged static geometry + instancing + one atlas — Phase 2.
 4. `despawn` plus "off-screen guests are rows in a demand table, not
    entities" — Phase 0/2.

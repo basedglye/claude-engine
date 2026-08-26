@@ -30,9 +30,13 @@ const ROOM_LIST_Y = 220;
 const ROOM_ROW_H = 18;
 const ROOM_ROW_W = 150;
 
-// Active rule table at H1's star tier (1) — display order matches table
-// order, per rules.ts's `evaluateRules` contract ("in table order").
-const ACTIVE_RULES = rulesForStars(H1_RULES, 1);
+// H1 froze the active rule table in a module constant at import time. H2a
+// deletes it: the star tier is world state now, the procedures card growing
+// a new line IS the player-facing difficulty curve (DESIGN's escalation
+// ruling), and a constant computed once at import is exactly the kind of
+// frozen state an escalation system cannot tolerate. The card is derived
+// from `view.data.stars` on every paint, like everything else on this
+// screen.
 
 // PROCEDURES column starts at x=320 and the surface ends at SCREEN_W=640;
 // rule descriptions run well past that in one line (H1b review: "THE NAME
@@ -174,7 +178,7 @@ export const reservaApp: ScreenAppDef<ReservaState> = {
       // leading so wrapped lines are comfortably distinct").
       nodes.push({ kind: "text", x: PROCEDURES_X, y: 140, text: "PROCEDURES", color: 12 });
       let py = 156;
-      for (const rule of ACTIVE_RULES) {
+      for (const rule of rulesForStars(H1_RULES, data.stars)) {
         const wrapped = wrapText(`- ${describeRule(rule)}`, PROCEDURES_MAX_CHARS);
         for (const wrappedLine of wrapped) {
           nodes.push({ kind: "text", x: PROCEDURES_X, y: py, text: wrappedLine, color: 14 });

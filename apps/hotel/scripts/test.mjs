@@ -5,7 +5,14 @@
 // a test framework.
 import { Rng, Sim } from "@claude-engine/core";
 import { findOverflowingNodes } from "@claude-engine/surface-ui";
-import { H1_RULES, evaluateRules, plantViolation, rulesForStars, describeRule } from "../dist-game/sim/rules.js";
+import {
+  H1_RULES,
+  evaluateRules,
+  plantViolation,
+  plantableRules,
+  rulesForStars,
+  describeRule,
+} from "../dist-game/sim/rules.js";
 import { ARCHETYPES } from "../dist-game/sim/guests.js";
 import { reservaApp } from "../dist-game/sim/reserva-app.js";
 import { auditApp } from "../dist-game/sim/audit-app.js";
@@ -17,8 +24,30 @@ import {
   screenClickCommand,
   hotelShell,
   buildScreenWorldView,
+  HOTEL_APPS,
+  pricerSetRateCommand,
+  staffHireCommand,
 } from "../dist-game/sim/game.js";
 import { jitter } from "../dist-game/sim/nav.js";
+import {
+  scoreReview,
+  reputationBySegment,
+  overallReputation,
+  starsFromReputation,
+  MAX_STARS,
+  DEFAULT_REP_PERMILLE,
+} from "../dist-game/sim/reviews.js";
+import {
+  capturePermille,
+  arrivalsForDay,
+  generateObjectives,
+  isValidRate,
+  OBJECTIVE_KINDS,
+  SEGMENT_POOL,
+  MIN_RATE_MINOR,
+  MAX_RATE_MINOR,
+  RATE_STEP_MINOR,
+} from "../dist-game/sim/economy.js";
 
 let failures = 0;
 
@@ -43,6 +72,38 @@ function cleanRes() {
 }
 
 const ctx = { day: 100, lists: {} };
+/** The fixture blacklist the H2a `listed` rows are planted and evaluated
+ *  against. Contains the clean fixture's own guest name plus decoys, so
+ *  planting has a real value to choose and evaluation has a real list to
+ *  miss. */
+const BLACKLIST_FIXTURE = ["Vex Harrow", "Ines Calloway", "Ruben Tasse"];
+const ctxWithBlacklist = { day: 100, lists: { blacklist: BLACKLIST_FIXTURE } };
+
+/**
+ * An Rng whose FIRST pick() returns a chosen rule and whose every other
+ * draw is the real seeded stream. Lets the round-trip property force one
+ * specific row while still handing `plantViolation` the FULL rule table —
+ * which matters, because the planter's cross-row propagation (keeping a
+ * planted blacklist name from also breaking `name-match`) is driven by that
+ * table. The old single-row-table trick silently removed the very rows the
+ * propagation has to see.
+ */
+function forcedRng(rule, seed) {
+  const real = new Rng(seed);
+  let firstPick = true;
+  return {
+    pick(arr) {
+      if (firstPick) {
+        firstPick = false;
+        return rule;
+      }
+      return real.pick(arr);
+    },
+    int(min, max) {
+      return real.int(min, max);
+    },
+  };
+}
 
 // --- H1_RULES shape ----------------------------------------------------
 {
@@ -63,7 +124,14 @@ const ctx = { day: 100, lists: {} };
     H1_RULES.some((r) => r.check.kind === "fieldMatch" && r.check.docField === "resCode"),
   );
   check("H1_RULES has a notExpired on the ID", H1_RULES.some((r) => r.check.kind === "notExpired" && r.check.docType === "id"));
-  check("H1_RULES rows are all minStars 1 in H1", H1_RULES.every((r) => r.minStars === 1));
+  // H2a appends the blacklist row at minStars 2 — the first row the star
+  // tier actually gates. Everything H1 shipped stays at 1.
+  check(
+    "the rule table is H1's five minStars-1 rows plus exactly one minStars-2 row (H2a's blacklist)",
+    H1_RULES.filter((r) => r.minStars === 1).length === 5 &&
+      H1_RULES.filter((r) => r.minStars === 2).length === 1 &&
+      H1_RULES.filter((r) => r.minStars === 2)[0].id === "blacklist",
+  );
   const ids = new Set(H1_RULES.map((r) => r.id));
   check("H1_RULES ids are unique", ids.size === H1_RULES.length);
   const flags = new Set(H1_RULES.map((r) => r.failFlag));
@@ -129,7 +197,7 @@ const ctx = { day: 100, lists: {} };
   const star2 = rulesForStars(tieredRules, 2);
   check("minStars filtering excludes higher-tier rows at star 1", !star1.some((r) => r.id === "loyalty-tier-check"));
   check("minStars filtering includes the higher-tier row at star 2", star2.some((r) => r.id === "loyalty-tier-check"));
-  check("minStars filtering keeps all H1 rows at star 1", star1.length === H1_RULES.length);
+  check("minStars filtering keeps every minStars-1 row at star 1", star1.length === H1_RULES.filter((r) => r.minStars === 1).length);
 
   // A guest who fails the star-2-only rule must NOT show up as a violation
   // when evaluated at star 1 (the row isn't even in the table passed in).
@@ -189,8 +257,8 @@ const ctx = { day: 100, lists: {} };
 {
   const rngA = new Rng("plant-determinism-seed");
   const rngB = new Rng("plant-determinism-seed");
-  const a = plantViolation(H1_RULES, rngA, cleanDocs(), cleanRes());
-  const b = plantViolation(H1_RULES, rngB, cleanDocs(), cleanRes());
+  const a = plantViolation(H1_RULES, rngA, cleanDocs(), cleanRes(), ctxWithBlacklist);
+  const b = plantViolation(H1_RULES, rngB, cleanDocs(), cleanRes(), ctxWithBlacklist);
   check("plantViolation is deterministic for a given Rng state", JSON.stringify(a) === JSON.stringify(b));
 }
 
@@ -206,15 +274,13 @@ const ctx = { day: 100, lists: {} };
   for (let seedIdx = 0; seedIdx < SEEDS; seedIdx++) {
     for (const rule of H1_RULES) {
       const seed = `plant-property-seed-${seedIdx}`;
-      // Force the Rng to pick THIS rule: use a single-row table so
-      // rng.pick always selects it, isolating "does this rule's planter
-      // produce exactly this rule's flag" from "does rng.pick distribute
-      // correctly" (rng.pick itself is exercised by the multi-row
-      // determinism test above and by packages/core's own rng tests).
-      const rng = new Rng(seed);
-      const singleRowTable = [rule];
-      const planted = plantViolation(singleRowTable, rng, cleanDocs(), cleanRes());
-      const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctx);
+      // Force the Rng to pick THIS rule while still passing the FULL
+      // table, isolating "does this rule's planter produce exactly this
+      // rule's flag" from "does rng.pick distribute correctly" (rng.pick
+      // itself is exercised by the multi-row determinism test above and by
+      // packages/core's own rng tests).
+      const planted = plantViolation(H1_RULES, forcedRng(rule, seed), cleanDocs(), cleanRes(), ctxWithBlacklist);
+      const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctxWithBlacklist);
       ranSeedRowPairs++;
       const exact = flags.length === 1 && flags[0] === rule.failFlag;
       if (!exact && firstFailure === null) {
@@ -225,9 +291,16 @@ const ctx = { day: 100, lists: {} };
   }
 
   check(
-    `plant/evaluate property holds exactly for ${SEEDS} seeds x ${H1_RULES.length} rules (${ranSeedRowPairs} pairs)`,
+    `plant/evaluate property holds exactly for ${SEEDS} seeds x ${H1_RULES.length} rules (${ranSeedRowPairs} pairs), INCLUDING the listed/absent blacklist row against a fixture list`,
     allExact,
   );
+  // The property above is only meaningful for the blacklist row if that row
+  // was actually exercised. H1a's version silently could not cover a
+  // `listed` row at all (the planter wrote a sentinel that was on no list,
+  // so the row passed and the "planted" fraud was uncatchable). Assert the
+  // row is in the table and its flag was one of the ones round-tripped.
+  const listedRow = H1_RULES.find((r) => r.check.kind === "listed");
+  check("round-trip actually covered a listed row (the H1a committed-wrong branch)", listedRow !== undefined);
   if (!allExact) {
     console.log("First failure:", JSON.stringify(firstFailure));
   }
@@ -239,12 +312,72 @@ const ctx = { day: 100, lists: {} };
   let allExact = true;
   for (let seedIdx = 0; seedIdx < SEEDS; seedIdx++) {
     const rng = new Rng(`plant-full-table-seed-${seedIdx}`);
-    const planted = plantViolation(H1_RULES, rng, cleanDocs(), cleanRes());
-    const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctx);
+    const planted = plantViolation(H1_RULES, rng, cleanDocs(), cleanRes(), ctxWithBlacklist);
+    const flags = evaluateRules(H1_RULES, planted.docs, planted.resFields, ctxWithBlacklist);
     const exact = flags.length === 1 && flags[0] === planted.failFlag;
     if (!exact) allExact = false;
   }
   check(`plant/evaluate property also holds when rng.pick selects the rule (${SEEDS} seeds, full table)`, allExact);
+}
+
+// --- plantableRules: a listed/absent row is only plantable with a list ----
+// H1a review item 3's other half. Planting the blacklist row against an
+// EMPTY blacklist is unsatisfiable — there is no value that is on an empty
+// list — so the row must not be offered to the planter at all, or the desk
+// gets handed a "fraud" no check can catch.
+{
+  const listedRow = H1_RULES.find((r) => r.check.kind === "listed");
+  const emptyCtx = { day: 100, lists: {} };
+  check(
+    "plantableRules: the listed/absent row is EXCLUDED when its list is empty",
+    !plantableRules(H1_RULES, emptyCtx).some((r) => r.id === listedRow.id),
+  );
+  check(
+    "plantableRules: the listed/absent row is INCLUDED once the list is non-empty",
+    plantableRules(H1_RULES, ctxWithBlacklist).some((r) => r.id === listedRow.id),
+  );
+  check(
+    "plantableRules: every non-listed row is always plantable",
+    plantableRules(H1_RULES, emptyCtx).length === H1_RULES.length - 1,
+  );
+  // And the planter refuses rather than planting something uncatchable.
+  let threw = false;
+  try {
+    plantViolation([listedRow], forcedRng(listedRow, "plant-empty-list"), cleanDocs(), cleanRes(), emptyCtx);
+  } catch {
+    threw = true;
+  }
+  check("plantViolation throws rather than plant a listed/absent row with an empty list", threw);
+
+  // The planted value must come FROM the list — that is what makes it
+  // catchable — and it must not break the name-match row on the way.
+  const planted = plantViolation(H1_RULES, forcedRng(listedRow, "plant-blacklist-1"), cleanDocs(), cleanRes(), ctxWithBlacklist);
+  const idDoc = planted.docs.find((d) => d.docType === "id");
+  check(
+    "plantViolation(listed/absent) writes a value that IS on the list",
+    BLACKLIST_FIXTURE.includes(idDoc.fields.name),
+  );
+  check(
+    "plantViolation(listed/absent) moves the reservation and slip with it, so name-match still passes",
+    planted.resFields.guestName === idDoc.fields.name &&
+      planted.docs.find((d) => d.docType === "resSlip").fields.guestName === idDoc.fields.name,
+  );
+  check(
+    "plantViolation(listed/absent) is caught by evaluateRules as EXACTLY the blacklist flag",
+    JSON.stringify(evaluateRules(H1_RULES, planted.docs, planted.resFields, ctxWithBlacklist)) ===
+      JSON.stringify([listedRow.failFlag]),
+  );
+  check(
+    "the same planted documents are CLEAN against an empty blacklist (the row is data-driven, not baked in)",
+    evaluateRules(H1_RULES, planted.docs, planted.resFields, emptyCtx).length === 0,
+  );
+}
+
+// --- star tiers gate the blacklist row -----------------------------------
+{
+  check("rulesForStars(1) excludes the blacklist row", !rulesForStars(H1_RULES, 1).some((r) => r.id === "blacklist"));
+  check("rulesForStars(2) includes the blacklist row", rulesForStars(H1_RULES, 2).some((r) => r.id === "blacklist"));
+  check("rulesForStars(1) is exactly H1's five rows", rulesForStars(H1_RULES, 1).length === 5);
 }
 
 // ============================================================================
@@ -292,7 +425,7 @@ function runUntil(sim, maxTicks, predicate) {
   return false;
 }
 
-const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" };
+const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" };
 
 // --- Guest FSM: accepted guest reaches inRoom -------------------------------
 {
@@ -371,7 +504,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- Double-entry ledger -----------------------------------------------------
 {
   const sim = new Sim("hotel-h1a-ledger-1");
-  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 3, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   let accepted = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -423,7 +556,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- Queue: distinct slots, chain advances -----------------------------------
 {
   const sim = new Sim("hotel-h1a-queue-1");
-  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 8, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   const allQueued = runUntil(sim, 5000, (s) => {
     let n = 0;
@@ -536,7 +669,7 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
 // --- despawn clears departed guests and their documents ----------------------
 {
   const sim = new Sim("hotel-h1a-despawn-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   const baseline = new Set([...sim.entities()]);
 
@@ -616,7 +749,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- ACCEPT branch: room + ACCEPT clicks check the guest in end to end ---
 {
   const sim = new Sim("hotel-h1b-decision-accept-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -664,7 +797,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- Guard: clicking ACCEPT with no room selected does not decide -------
 {
   const sim = new Sim("hotel-h1b-decision-guard-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -692,7 +825,7 @@ function focusTerminal(sim, terminalEntity) {
 // --- DENY branch: a planted violation is caught and the guest leaves ----
 {
   const sim = new Sim("hotel-h1b-decision-deny-1");
-  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal" });
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal", upkeep: false, arrivals: "fixed" });
 
   runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
   const [guestEntity] = findGuestAtQueueHead(sim);
@@ -782,13 +915,35 @@ function focusTerminal(sim, terminalEntity) {
           resFields: { guestName, resCode: worstResCode },
         },
         rooms: worstRooms,
+        // H2a: RESERVA derives its procedures card from `stars` now, so a
+        // view WITHOUT this key paints zero procedure lines and the
+        // overflow gate silently stops testing the widest thing on the
+        // screen. Worst case is the highest reachable tier.
+        stars: MAX_STARS,
         ledger: { day: 99999, revenueMinor: 999999999, expenseMinor: 999999999, closingCashMinor: -999999999 },
+        // AUDIT paints the day's objectives as of the H2a review pass, so a
+        // view WITHOUT this key stops testing the widest rows on that
+        // screen — the same silent hole the missing `stars` key opened in
+        // RESERVA. Worst case is three objectives with the longest kind
+        // slug and absurd figures.
+        objectives: OBJECTIVE_KINDS.map((t) => ({
+          day: 99999,
+          kind: t.kind,
+          target: 999999,
+          progress: 999999,
+          done: false,
+          rewardMinor: 999999999,
+        })),
       },
     };
   }
 
   const view = worstCaseView(longestName);
   const reservaNodes = reservaApp.paintSpec(reservaApp.init(), view);
+  check(
+    `overflow-gate setup: the worst-case paint actually contains all ${widestRules.length} procedure lines`,
+    widestRules.every((rule) => JSON.stringify(reservaNodes).includes(rule.description.slice(0, 24))),
+  );
   const reservaViolations = findOverflowingNodes(reservaNodes);
   check(
     `RESERVA: worst-case data (name=${JSON.stringify(longestName)}, all ${widestRules.length} rules, 4 vacant rooms) has zero surface overflows`,
@@ -797,8 +952,12 @@ function focusTerminal(sim, terminalEntity) {
   if (reservaViolations.length > 0) console.log(JSON.stringify(reservaViolations, null, 2));
 
   const auditNodes = auditApp.paintSpec(auditApp.init(), view);
+  check(
+    "overflow-gate setup: the worst-case AUDIT paint actually contains all three objective rows",
+    OBJECTIVE_KINDS.every((t) => JSON.stringify(auditNodes).includes(t.kind)),
+  );
   const auditViolations = findOverflowingNodes(auditNodes);
-  check("AUDIT: worst-case ledger figures have zero surface overflows", auditViolations.length === 0);
+  check("AUDIT: worst-case ledger figures and objective rows have zero surface overflows", auditViolations.length === 0);
   if (auditViolations.length > 0) console.log(JSON.stringify(auditViolations, null, 2));
 
   // Negative control: the checker must actually be capable of catching an
@@ -841,6 +1000,798 @@ function focusTerminal(sim, terminalEntity) {
     "overflow gate is not a no-op on shell chrome: the pre-fix glyph-row position IS flagged",
     preFixViolations.length > 0,
   );
+}
+
+// ============================================================================
+// H2a: housekeeping and maintenance (docs/PHASE-H2.md §9)
+// ============================================================================
+
+/** Every entity carrying `component`, as [entity, value]. */
+function scanAll(sim, component) {
+  return [...sim.withComponent(component)];
+}
+
+/** interact from a pose that is guaranteed in range and arc, the same way
+ *  every other decision test in this file does it. */
+function interactWith(sim, targetEntity) {
+  teleportPlayerNextTo(sim, targetEntity);
+  sim.submit(interactCommand(sim.tick + 1, targetEntity));
+  sim.step();
+}
+
+const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixture: "normal", upkeep: true, arrivals: "fixed" };
+
+// --- the component shapes ARE the zen ruling ------------------------------
+// DESIGN §6 / H2 spec §9: "no per-room timer ... consequences only at day
+// granularity". The enforcement is structural, not disciplinary: if `mess`
+// or `prop` carried any timestamp, decay/expiry/compounding would become
+// expressible, and a later phase would express it. This asserts the shape.
+{
+  const sim = new Sim("hotel-h2-zen-shape-1");
+  setupWithConfig(sim, UPKEEP_ON);
+  const props = scanAll(sim, "prop");
+  check("upkeep: one prop per bedroom at setup", props.length === scanAll(sim, "roomUnit").length);
+  const propKeys = Object.keys(props[0][1]).sort();
+  check(
+    `prop carries exactly {broken, kind, repairProgress, roomEntity} -- no timestamp of any kind (got ${propKeys.join(",")})`,
+    JSON.stringify(propKeys) === JSON.stringify(["broken", "kind", "repairProgress", "roomEntity"]),
+  );
+  const off = new Sim("hotel-h2-zen-shape-2");
+  setupWithConfig(off, { ...UPKEEP_ON, upkeep: false });
+  check("upkeep: no props are created when config.upkeep is false", scanAll(off, "prop").length === 0);
+}
+
+// --- a checkout leaves 2..4 messes; wiping them removes them --------------
+{
+  const sim = new Sim("hotel-h2-zen-mess-1");
+  setupWithConfig(sim, UPKEEP_ON);
+
+  runUntil(sim, 4000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  interactWith(sim, guestEntity);
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  const [roomEntity] = findVacantRoom(sim);
+  teleportPlayerNextTo(sim, findTerminalEntity(sim));
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check("zen: the guest checked in", sim.getComponent(roomEntity, "roomUnit").occupantEntity === guestEntity);
+
+  const checkedOut = runUntil(sim, 6000, (s) => s.eventsSince(0).some((e) => e.type === "guest.checkedOut"));
+  check("zen: the guest eventually checks out", checkedOut);
+
+  const room = sim.getComponent(roomEntity, "roomUnit");
+  const messes = scanAll(sim, "mess").filter(([, m]) => m.roomEntity === roomEntity);
+  check(`zen: checkout left 2..4 messes (got ${messes.length})`, messes.length >= 2 && messes.length <= 4);
+  check("zen: roomUnit.messCount agrees with a live mess scan", room.messCount === messes.length);
+  check("zen: the room is vacant after checkout", room.occupantEntity === 0);
+
+  // RESERVA must not offer a room the desk would refuse.
+  const viewDirty = buildScreenWorldView(sim);
+  check(
+    "zen: RESERVA's vacant-room list excludes the dirty room",
+    !viewDirty.data.rooms.some((r) => r.roomEntity === roomEntity),
+  );
+
+  // Wipe them all, one interact each.
+  const messCountBefore = messes.length;
+  for (const [messEntity] of messes) interactWith(sim, messEntity);
+  const cleanedEvents = sim.eventsSince(0).filter((e) => e.type === "room.messCleaned");
+  check(
+    `zen: one room.messCleaned per wipe (${cleanedEvents.length} of ${messCountBefore})`,
+    cleanedEvents.length === messCountBefore,
+  );
+  check(
+    "zen: every mess entity is despawned",
+    scanAll(sim, "mess").filter(([, m]) => m.roomEntity === roomEntity).length === 0,
+  );
+  check("zen: roomUnit.messCount is back to 0", sim.getComponent(roomEntity, "roomUnit").messCount === 0);
+  const viewClean = buildScreenWorldView(sim);
+  check(
+    "zen: RESERVA lists the room again once it is wiped",
+    viewClean.data.rooms.some((r) => r.roomEntity === roomEntity),
+  );
+
+  // The zen property: nothing about the DELAY produced a penalty. Messes
+  // never multiplied while dirty, and no penalty-class event exists at all.
+  const penaltyish = sim.eventsSince(0).filter((e) => /penal|fine|decay|expire|worsen|cascade/i.test(e.type));
+  check("zen: zero penalty-class events anywhere in the run", penaltyish.length === 0);
+}
+
+// --- the desk refuses a dirty or broken room, and says why ----------------
+{
+  const sim = new Sim("hotel-h2-zen-deny-1");
+  setupWithConfig(sim, { ...UPKEEP_ON, guestCount: 2 });
+  runUntil(sim, 4000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  const [roomEntity] = findVacantRoom(sim);
+
+  // Dirty the room directly -- the desk's rule is what is under test here,
+  // not the checkout that would normally produce the mess.
+  const room = sim.getComponent(roomEntity, "roomUnit");
+  sim.setComponent(roomEntity, "roomUnit", { ...room, messCount: 1 });
+
+  interactWith(sim, guestEntity);
+  const [resEntity] = findReservationForGuest(sim, guestEntity);
+  teleportPlayerNextTo(sim, findTerminalEntity(sim));
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check(
+    "zen: accepting onto a dirty room does not decide the reservation",
+    sim.getComponent(resEntity, "reservation").decided === false,
+  );
+  check(
+    "zen: the desk emits desk.denied-room {reason: not-ready}",
+    sim
+      .eventsSince(0)
+      .some((e) => e.type === "desk.denied-room" && e.payload.reason === "not-ready" && e.payload.roomEntity === roomEntity),
+  );
+
+  // Same shape for a broken prop, with the room perfectly clean.
+  sim.setComponent(roomEntity, "roomUnit", { ...sim.getComponent(roomEntity, "roomUnit"), messCount: 0 });
+  const propEntry = scanAll(sim, "prop").find(([, pr]) => pr.roomEntity === roomEntity);
+  sim.setComponent(propEntry[0], "prop", { ...propEntry[1], broken: true, repairProgress: 0 });
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check(
+    "zen: a clean room with a BROKEN prop is also refused",
+    sim.getComponent(resEntity, "reservation").decided === false,
+  );
+  check(
+    "zen: RESERVA excludes a clean room with a broken prop",
+    !buildScreenWorldView(sim).data.rooms.some((r) => r.roomEntity === roomEntity),
+  );
+
+  // Repair it: N presses, visible partial progress, then sellable again.
+  interactWith(sim, propEntry[0]);
+  const midway = sim.getComponent(propEntry[0], "prop");
+  check("zen: one repair press advances repairProgress without finishing", midway.repairProgress === 1 && midway.broken === true);
+  interactWith(sim, propEntry[0]);
+  interactWith(sim, propEntry[0]);
+  const repaired = sim.getComponent(propEntry[0], "prop");
+  check("zen: the third press completes the repair", repaired.broken === false && repaired.repairProgress === 0);
+  check(
+    "zen: prop.repaired fired",
+    sim.eventsSince(0).some((e) => e.type === "prop.repaired" && e.payload.propEntity === propEntry[0]),
+  );
+  interactWith(sim, propEntry[0]);
+  check(
+    "zen: interacting with an unbroken prop is denied, not a free repair",
+    sim.eventsSince(0).some((e) => e.type === "interact-denied" && e.payload.reason === "not-broken"),
+  );
+
+  teleportPlayerNextTo(sim, findTerminalEntity(sim));
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+  check("zen: the room is sellable once wiped and repaired", sim.getComponent(resEntity, "reservation").decided === true);
+}
+
+// --- partial repair survives a save/restore round trip --------------------
+// "Partial progress persists indefinitely" is a design ruling; restore() is
+// exactly where a half-finished job would silently reset.
+{
+  const sim = new Sim("hotel-h2-zen-restore-1");
+  setupWithConfig(sim, UPKEEP_ON);
+  sim.step();
+  const [propEntity, prop] = scanAll(sim, "prop")[0];
+  sim.setComponent(propEntity, "prop", { ...prop, broken: true, repairProgress: 0 });
+  interactWith(sim, propEntity);
+  const snapshot = sim.snapshot();
+  const restored = new Sim("hotel-h2-zen-restore-1");
+  setupWithConfig(restored, UPKEEP_ON);
+  restored.restore(snapshot);
+  const after = restored.getComponent(propEntity, "prop");
+  check("zen: half-done repair survives snapshot/restore", after.broken === true && after.repairProgress === 1);
+  check("zen: the restored sim hashes identically to the source", restored.stateHash() === snapshot.stateHash);
+}
+
+// ============================================================================
+// H2a: reviews, reputation, stars, demand, objectives (docs/PHASE-H2.md §10)
+// ============================================================================
+
+// --- scoreReview is a pure function of objective stay facts --------------
+{
+  const perfect = { waitedTicks: 0, brokenPropNights: 0, paidMinor: 5000, tierBaselineMinor: 5000 };
+  check("review: a flawless stay at the baseline rate scores 5", scoreReview(perfect).score === 5);
+
+  const waited = scoreReview({ ...perfect, waitedTicks: 700 });
+  check("review: a long wait costs a star and names itself", waited.score === 4 && waited.factors.includes("waited-long"));
+  const waitedMore = scoreReview({ ...perfect, waitedTicks: 1300 });
+  check("review: a very long wait costs two", waitedMore.score === 3 && waitedMore.factors.includes("waited-very-long"));
+
+  const broken = scoreReview({ ...perfect, brokenPropNights: 1 });
+  check("review: a broken-prop night costs a star", broken.score === 4 && broken.factors.includes("broken-prop"));
+  check(
+    "review: broken-prop damage CAPS at two stars, however many nights (no cascade)",
+    scoreReview({ ...perfect, brokenPropNights: 2 }).score === scoreReview({ ...perfect, brokenPropNights: 9 }).score,
+  );
+
+  const gouged = scoreReview({ ...perfect, paidMinor: 7000 });
+  check("review: charging well over baseline costs a star", gouged.score === 4 && gouged.factors.includes("overpriced"));
+  const bargain = scoreReview({ ...perfect, waitedTicks: 700, paidMinor: 3000 });
+  check(
+    "review: a bargain buys back at most one star",
+    bargain.score === 5 && bargain.factors.includes("good-value"),
+  );
+
+  check("review: the score never leaves 1..5", scoreReview({ waitedTicks: 99999, brokenPropNights: 9, paidMinor: 25000, tierBaselineMinor: 5000 }).score === 1);
+
+  // The anti-dark-pattern requirement, asserted: the same stay always
+  // scores the same. A randomised review score would be a variable-ratio
+  // schedule, which DESIGN §6 explicitly rules out.
+  const a = scoreReview({ waitedTicks: 640, brokenPropNights: 1, paidMinor: 6100, tierBaselineMinor: 5000 });
+  const b = scoreReview({ waitedTicks: 640, brokenPropNights: 1, paidMinor: 6100, tierBaselineMinor: 5000 });
+  check("review: scoring is deterministic — identical facts, identical outcome", JSON.stringify(a) === JSON.stringify(b));
+}
+
+// --- reputation is recomputed from a rolling window, in integers ---------
+{
+  const rows = [
+    { day: 10, segment: "business", score: 5 },
+    { day: 10, segment: "business", score: 3 },
+    { day: 10, segment: "leisure", score: 1 },
+    // Older than the window from day 10 — must be ignored.
+    { day: 2, segment: "business", score: 1 },
+  ];
+  const rep = reputationBySegment(rows, 10);
+  check("reputation: 5 and 3 average to 750 permille (integer, truncating)", rep.business === 750);
+  check("reputation: a 1-star review is 0 permille", rep.leisure === 0);
+  check("reputation: reviews outside the 7-day window are excluded", Object.keys(rep).length === 2);
+  check(
+    "reputation: every value is an integer",
+    Object.keys(rep).every((k) => Number.isInteger(rep[k])),
+  );
+  check(
+    "reputation: the key order is sorted, so the hashed component order depends only on the names",
+    JSON.stringify(Object.keys(rep)) === JSON.stringify(["business", "leisure"]),
+  );
+  check("reputation: no reviews at all falls back to the neutral default", overallReputation({}) === DEFAULT_REP_PERMILLE);
+}
+
+// --- stars: a tier is earned, and the floor is 1 -------------------------
+{
+  check("stars: one glowing review does not promote a hotel", starsFromReputation(1000, 1) === 1);
+  check("stars: enough good reviews reach 2", starsFromReputation(750, 5) === 2);
+  check("stars: a mediocre record stays at 1", starsFromReputation(400, 9) === 1);
+  check(
+    `stars: capped at MAX_STARS (${MAX_STARS}) this phase, because that is how far the CONTENT goes`,
+    starsFromReputation(1000, 50) === MAX_STARS,
+  );
+  check("stars: the floor is 1, never 0 (the recoverable one-man show)", starsFromReputation(0, 50) === 1);
+}
+
+// --- demand: price, reputation and stars move capture the right way ------
+{
+  const cheap = capturePermille(3000, 6000, 500, 1);
+  const dear = capturePermille(12000, 6000, 500, 1);
+  check("demand: a cheaper rate captures more of a segment", cheap > dear);
+  const liked = capturePermille(6000, 6000, 900, 1);
+  const disliked = capturePermille(6000, 6000, 100, 1);
+  check("demand: a better-liked hotel captures more at the same price", liked > disliked);
+  check("demand: a star tier is worth something", capturePermille(6000, 6000, 500, 2) > capturePermille(6000, 6000, 500, 1));
+  check(
+    "demand: capture stays in 0..1000 at the extremes",
+    capturePermille(MAX_RATE_MINOR, 1000, 0, 1) >= 0 && capturePermille(MIN_RATE_MINOR, 25000, 1000, 5) <= 1000,
+  );
+  check(
+    "demand: every capture value is an integer (no floats reach sim state)",
+    [cheap, dear, liked, disliked].every((v) => Number.isInteger(v)),
+  );
+
+  // Draw-at-generation: the same Rng state produces the same day.
+  const one = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE);
+  const two = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE);
+  check("demand: arrivalsForDay is deterministic for a given Rng state", JSON.stringify(one) === JSON.stringify(two));
+  check(
+    "demand: arrivals are integers and bounded by the segment pools",
+    Object.keys(one).every((k) => Number.isInteger(one[k]) && one[k] >= 0 && one[k] <= SEGMENT_POOL[k]),
+  );
+}
+
+// --- pricing bounds ------------------------------------------------------
+{
+  check("pricer: the opening rates are valid", isValidRate(5000) && isValidRate(8000));
+  check("pricer: below the floor is invalid", !isValidRate(MIN_RATE_MINOR - RATE_STEP_MINOR));
+  check("pricer: above the ceiling is invalid", !isValidRate(MAX_RATE_MINOR + RATE_STEP_MINOR));
+  check("pricer: an off-step rate is invalid", !isValidRate(MIN_RATE_MINOR + 1));
+  check("pricer: a non-integer rate is invalid", !isValidRate(5000.5));
+}
+
+// --- objectives: sim-derived targets, no punishment ----------------------
+{
+  const specs = generateObjectives(new Rng("obj-1"), 6, 4);
+  check("objectives: exactly three are posted", specs.length === 3);
+  check(
+    "objectives: every target is a positive integer and every reward is a positive integer",
+    specs.every((o) => Number.isInteger(o.target) && o.target >= 1 && Number.isInteger(o.rewardMinor) && o.rewardMinor > 0),
+  );
+  check(
+    "objectives: the check-in target never exceeds what could actually arrive",
+    specs.find((o) => o.kind === "check-in-guests").target <= 6,
+  );
+  check(
+    "objectives: the fraud objective is always 1 — never a quota that punishes a clean day",
+    specs.find((o) => o.kind === "catch-fraud").target === 1,
+  );
+  check(
+    "objectives: generation is deterministic for a given Rng state",
+    JSON.stringify(generateObjectives(new Rng("obj-1"), 6, 4)) === JSON.stringify(specs),
+  );
+  // A slow day must not post an impossible target.
+  const slow = generateObjectives(new Rng("obj-2"), 1, 4);
+  check("objectives: a one-arrival day posts a reachable check-in target", slow.find((o) => o.kind === "check-in-guests").target === 1);
+}
+
+// --- the audit recomputes from truth, and survives a restore -------------
+{
+  const sim = new Sim("hotel-h2-audit-1");
+  setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+
+  // Plant a week of strong reviews directly — the audit's job is to
+  // RECOMPUTE from these, so they are the input under test.
+  for (let i = 0; i < 5; i++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "review", { day: 1, segment: "business", score: 5, factors: [] });
+  }
+  const untilRollover = 6000 - sim.tick;
+  for (let t = 0; t < untilRollover; t++) sim.step();
+
+  const hotel = sim.getComponent(hotelEntity, "hotel");
+  check("audit: stars recomputed from the review window (5x five-star -> 2 stars)", hotel.stars === 2);
+  check("audit: repBySegment recomputed and non-default", hotel.repBySegment.business === 1000);
+  const starsChanged = sim.eventsSince(0).filter((e) => e.type === "hotel.starsChanged");
+  check("audit: hotel.starsChanged {1 -> 2} fired exactly once", starsChanged.length === 1 && starsChanged[0].payload.from === 1 && starsChanged[0].payload.to === 2);
+  const audit = sim.eventsSince(0).find((e) => e.type === "econ.audit");
+  check(
+    "audit: econ.audit carries stars, repBySegment, forecastArrivals, objectives and the printed hire threshold",
+    audit !== undefined &&
+      audit.payload.stars === 2 &&
+      typeof audit.payload.repBySegment === "object" &&
+      typeof audit.payload.forecastArrivals === "number" &&
+      Array.isArray(audit.payload.objectives) &&
+      audit.payload.objectives.length === 3 &&
+      audit.payload.hireThresholdMinor > 0,
+  );
+  check("audit: three objectives posted for the new day", [...sim.withComponent("objective")].length === 3);
+  check(
+    "audit: objective.posted fired once per objective",
+    sim.eventsSince(0).filter((e) => e.type === "objective.posted").length === 3,
+  );
+
+  // Recompute-from-truth means a restore mid-week is trivially correct: a
+  // fresh sim restored to this snapshot recomputes the SAME stars at the
+  // next audit, because nothing was accumulated anywhere.
+  const snapshot = sim.snapshot();
+  const restored = new Sim("hotel-h2-audit-1");
+  setupWithConfig(restored, { guestCount: 0, spawnTickMin: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+  restored.restore(snapshot);
+  check("audit: the restored sim hashes identically", restored.stateHash() === snapshot.stateHash);
+  for (let t = 0; t < 6000; t++) {
+    sim.step();
+    restored.step();
+  }
+  check(
+    "audit: a sim restored mid-week recomputes the identical stars and reputation a day later",
+    sim.stateHash() === restored.stateHash() &&
+      sim.getComponent(hotelEntity, "hotel").stars === restored.getComponent(hotelEntity, "hotel").stars,
+  );
+}
+
+// --- wages appear on the expense line only once someone is hired ---------
+{
+  const sim = new Sim("hotel-h2-wages-1");
+  setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+  for (let t = sim.tick; t < 6000; t++) sim.step();
+  const beforeStaffEntries = [...sim.withComponent("ledgerEntry")].filter(([, e]) => e.debitAccount === "expense:staff");
+  check("wages: no staff expense line before anyone is hired", beforeStaffEntries.length === 0);
+
+  const clerk = sim.spawn();
+  sim.setComponent(clerk, "staffed", {
+    job: "clerk",
+    wage: 2500,
+    skillPermille: 800,
+    moralePermille: 500,
+    quirk: "hums",
+    hiredDay: 2,
+    seed: 7,
+  });
+  for (let t = sim.tick; t < 12000; t++) sim.step();
+  const staffEntries = [...sim.withComponent("ledgerEntry")].filter(([, e]) => e.debitAccount === "expense:staff");
+  check("wages: a hired clerk's wage lands on the expense line at the next audit", staffEntries.length === 1 && staffEntries[0][1].amountMinor === 2500);
+}
+
+// ============================================================================
+// H2a: the app decision-path suite (docs/PHASE-H2.md exit gate 5).
+//
+// The H1b pattern obligation, applied to all four new apps: clicks at
+// coordinates derived from `hotelShell.layout()` at runtime (never pixel
+// literals), BOTH branches of every decision, and the guard. Every one of
+// these drives the same seam a human does — screen.click -> shell.reduce ->
+// app.reduce -> effect -> the sim's validated apply function.
+// ============================================================================
+
+function shellRects(sim, terminalEntity) {
+  const screenApp = sim.getComponent(terminalEntity, "screenApp");
+  return hotelShell.layout(screenApp.state, buildScreenWorldView(sim));
+}
+
+/** Click a rect by key, deriving its centre fresh from layout() first. */
+function clickRect(sim, terminalEntity, key) {
+  const rects = shellRects(sim, terminalEntity);
+  const rect = rects[key];
+  if (!rect) throw new Error(`no rect ${key} in layout(): ${Object.keys(rects).join(",")}`);
+  const point = rectClickPoint(rect);
+  sim.submit(screenClickCommand(sim.tick + 1, point.px, point.py));
+  sim.step();
+}
+
+function openApp(sim, terminalEntity, appId) {
+  clickRect(sim, terminalEntity, `taskbar:${appId}`);
+}
+
+/** A sim with the player parked at the terminal, focused, and nothing else
+ *  going on — the smallest world in which a screen decision is legal. */
+function terminalSim(seed, extraConfig) {
+  const sim = new Sim(seed);
+  setupWithConfig(sim, {
+    guestCount: 0,
+    spawnTickMin: 100000,
+    fraudRatePermille: 0,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+    ...extraConfig,
+  });
+  const terminalEntity = findTerminalEntity(sim);
+  focusTerminal(sim, terminalEntity);
+  return { sim, terminalEntity };
+}
+
+// --- the shell registers exactly the six H2a apps -----------------------
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-apps-registry");
+  const rects = shellRects(sim, terminalEntity);
+  const registered = HOTEL_APPS.map((a) => a.id);
+  check(
+    `shell registry is exactly the six H2a apps (got ${registered.join(",")})`,
+    JSON.stringify(registered) === JSON.stringify(["reserva", "audit", "ledger", "pricer", "mailbox", "staff"]),
+  );
+  check(
+    "every registered app has a taskbar hit rect",
+    registered.every((id) => rects[`taskbar:${id}`] !== undefined),
+  );
+}
+
+// --- PRICER: rate up, rate down, and the two guards ---------------------
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-pricer-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  openApp(sim, terminalEntity, "pricer");
+  check("pricer: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "pricer");
+
+  const before = sim.getComponent(hotelEntity, "hotel").rateByTier["1"];
+
+  // Guard: RATE + with no tier selected must not change anything.
+  clickRect(sim, terminalEntity, "app:up");
+  check(
+    "pricer(guard): RATE + with no tier selected changes no rate",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === before,
+  );
+
+  clickRect(sim, terminalEntity, "app:tier:1");
+  clickRect(sim, terminalEntity, "app:up");
+  const up = sim.getComponent(hotelEntity, "hotel").rateByTier["1"];
+  check(`pricer: RATE + raises tier 1 by one step (${before} -> ${up})`, up === before + RATE_STEP_MINOR);
+  check(
+    "pricer: econ.rateSet fired with the actor",
+    sim.eventsSince(0).some((e) => e.type === "econ.rateSet" && e.payload.tier === 1 && e.payload.actor === "player"),
+  );
+
+  clickRect(sim, terminalEntity, "app:down");
+  check("pricer: RATE - lowers it back", sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === before);
+
+  // Guard: the bounds. Walk the rate to the floor and try to go under it.
+  let guardTicks = 0;
+  while (sim.getComponent(hotelEntity, "hotel").rateByTier["1"] > MIN_RATE_MINOR && guardTicks < 200) {
+    clickRect(sim, terminalEntity, "app:down");
+    guardTicks++;
+  }
+  check("pricer: the rate reaches the committed floor", sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR);
+  clickRect(sim, terminalEntity, "app:down");
+  check(
+    "pricer(guard): RATE - at the floor is refused, not clamped silently past it",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR,
+  );
+
+  // And the sim refuses an out-of-bounds rate even when the app is bypassed
+  // entirely — the app's guard is a courtesy, this is the rule.
+  sim.submit(pricerSetRateCommand(sim.tick + 1, 1, MAX_RATE_MINOR + RATE_STEP_MINOR));
+  sim.step();
+  check(
+    "pricer: the COMMAND form is validated too (out-of-bounds rate refused)",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR &&
+      sim.eventsSince(0).some((e) => e.type === "screen.denied" && e.payload.reason === "rate-out-of-bounds"),
+  );
+  sim.submit(pricerSetRateCommand(sim.tick + 1, 1, MIN_RATE_MINOR + 1));
+  sim.step();
+  check(
+    "pricer: an off-step rate is refused",
+    sim.getComponent(hotelEntity, "hotel").rateByTier["1"] === MIN_RATE_MINOR,
+  );
+}
+
+// --- MAILBOX: open a message, the read flag, and the re-read guard ------
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-mailbox-1");
+  const mailEntity = sim.spawn();
+  sim.setComponent(mailEntity, "mail", {
+    day: 1,
+    kind: "bulletin",
+    subjectKey: "mail.bulletin",
+    fields: { names: "Vex Harrow" },
+    read: false,
+  });
+  openApp(sim, terminalEntity, "mailbox");
+  check("mailbox: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "mailbox");
+  check("mailbox: the message starts unread", sim.getComponent(mailEntity, "mail").read === false);
+
+  clickRect(sim, terminalEntity, `app:mail:${mailEntity}`);
+  check("mailbox: opening a message marks it read", sim.getComponent(mailEntity, "mail").read === true);
+  check(
+    "mailbox: mail.read fired once, with the actor",
+    sim.eventsSince(0).filter((e) => e.type === "mail.read" && e.payload.actor === "player").length === 1,
+  );
+
+  // Guard: re-opening an already-read message is a view change and nothing
+  // more — no second effect, no second event.
+  clickRect(sim, terminalEntity, "app:back");
+  clickRect(sim, terminalEntity, `app:mail:${mailEntity}`);
+  check(
+    "mailbox(guard): re-opening a read message emits no second mail.read",
+    sim.eventsSince(0).filter((e) => e.type === "mail.read").length === 1,
+  );
+}
+
+// --- LEDGER: paging back and forward, and the clamp at both ends --------
+{
+  // Twelve REAL closed days, run through the sim, rather than faked
+  // `ledgerEntry` rows plus a faked `hotel.day` — dayPhaseSystem recomputes
+  // the day from the tick, so a faked day is overwritten on the very next
+  // step and the history silently empties. (It did, and this test caught
+  // it.) Twelve days at 6,000 ticks each is under a second.
+  const sim = new Sim("hotel-h2-ledger-1");
+  setupWithConfig(sim, {
+    guestCount: 0,
+    spawnTickMin: 100000,
+    fraudRatePermille: 0,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+  });
+  for (let t = 0; t < 6000 * 13; t++) sim.step();
+  const terminalEntity = findTerminalEntity(sim);
+  focusTerminal(sim, terminalEntity);
+  check(
+    "ledger: twelve closed days of real history exist",
+    buildScreenWorldView(sim).data.ledgerDays.length >= 12,
+  );
+
+  openApp(sim, terminalEntity, "ledger");
+  check("ledger: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "ledger");
+  const stateOf = () => sim.getComponent(terminalEntity, "screenApp").state.appStates.ledger;
+  check("ledger: starts on the newest page", stateOf().pageOffset === 0);
+
+  // Guard at the newest end: NEWER on page 0 does nothing.
+  clickRect(sim, terminalEntity, "app:next");
+  check("ledger(guard): NEWER on the newest page does not page past it", stateOf().pageOffset === 0);
+
+  clickRect(sim, terminalEntity, "app:prev");
+  check("ledger: OLDER pages back", stateOf().pageOffset === 1);
+  clickRect(sim, terminalEntity, "app:next");
+  check("ledger: NEWER pages forward again", stateOf().pageOffset === 0);
+
+  // Guard at the oldest end.
+  for (let i = 0; i < 10; i++) clickRect(sim, terminalEntity, "app:prev");
+  const deepest = stateOf().pageOffset;
+  clickRect(sim, terminalEntity, "app:prev");
+  check(`ledger(guard): OLDER stops at the oldest page (${deepest})`, stateOf().pageOffset === deepest);
+
+  // The STAFF BUDGET line is printed whether or not it is unlocked.
+  const view = buildScreenWorldView(sim);
+  check("ledger: the view carries the hire threshold so the locked line can print it", view.data.ledger.hireThresholdMinor > 0);
+  const painted = JSON.stringify(hotelShell.paintSpec(sim.getComponent(terminalEntity, "screenApp").state, view));
+  check("ledger: the STAFF BUDGET line is on screen", painted.includes("STAFF BUDGET"));
+}
+
+// --- STAFF: HIRE and PASS, and the two guards ---------------------------
+function spawnInterviewingCandidate(sim, wageAsk) {
+  const entity = sim.spawn();
+  sim.setComponent(entity, "person", { kind: "candidate", name: "Desmond Pike", seed: 4242 });
+  sim.setComponent(entity, "candidate", {
+    wageAsk,
+    skillPermille: 800,
+    quirk: "hums showtunes",
+    state: "interviewing",
+    resumeEntity: 0,
+  });
+  return entity;
+}
+
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-staff-hire-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", { ...sim.getComponent(hotelEntity, "hotel"), cash: 50000, hireUnlocked: true });
+  const candidateEntity = spawnInterviewingCandidate(sim, 3000);
+
+  openApp(sim, terminalEntity, "staff");
+  check("staff: opens", sim.getComponent(terminalEntity, "screenApp").state.openAppId === "staff");
+
+  // Guard 1: HIRE with nobody selected decides nothing.
+  clickRect(sim, terminalEntity, "app:hire");
+  check(
+    "staff(guard): HIRE with no candidate selected hires nobody",
+    sim.getComponent(candidateEntity, "staffed") === undefined,
+  );
+
+  clickRect(sim, terminalEntity, `app:candidate:${candidateEntity}`);
+  clickRect(sim, terminalEntity, "app:hire");
+  const staffed = sim.getComponent(candidateEntity, "staffed");
+  check("staff: HIRE puts the candidate on the payroll", staffed !== undefined && staffed.wage === 3000);
+  check(
+    "staff: the hire gains an actorId, which is what makes it a second ACTOR",
+    sim.getComponent(candidateEntity, "actorId").actor === `staff:${candidateEntity}`,
+  );
+  check(
+    "staff: staff.hired fired with the wage and the deciding actor",
+    sim.eventsSince(0).some((e) => e.type === "staff.hired" && e.payload.wage === 3000 && e.payload.actor === "player"),
+  );
+  check("staff: the hire is no longer interactable as a candidate", sim.getComponent(candidateEntity, "interactable") === undefined);
+}
+
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-staff-pass-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", { ...sim.getComponent(hotelEntity, "hotel"), cash: 50000, hireUnlocked: true });
+  const candidateEntity = spawnInterviewingCandidate(sim, 3000);
+  // A candidate that can be sent away needs somewhere to walk to.
+  sim.setComponent(candidateEntity, "navAgent", {
+    goalCx: 0, goalCz: 0, path: [], pathIdx: 0, repathAtTick: 0, jitterSeed: 1, stuckTicks: 0, avoidCx: -1, avoidCz: -1,
+  });
+
+  openApp(sim, terminalEntity, "staff");
+  clickRect(sim, terminalEntity, `app:candidate:${candidateEntity}`);
+  clickRect(sim, terminalEntity, "app:pass");
+  check("staff: PASS rejects the candidate", sim.getComponent(candidateEntity, "candidate").state === "rejected");
+  check("staff: nobody was put on the payroll", sim.getComponent(candidateEntity, "staffed") === undefined);
+  check(
+    "staff: staff.rejected fired",
+    sim.eventsSince(0).some((e) => e.type === "staff.rejected" && e.payload.candidateEntity === candidateEntity),
+  );
+}
+
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-staff-cash-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", { ...sim.getComponent(hotelEntity, "hotel"), cash: 100, hireUnlocked: true });
+  const candidateEntity = spawnInterviewingCandidate(sim, 3000);
+
+  openApp(sim, terminalEntity, "staff");
+  clickRect(sim, terminalEntity, `app:candidate:${candidateEntity}`);
+  clickRect(sim, terminalEntity, "app:hire");
+  check(
+    "staff(guard): HIRE with less cash than the first wage hires nobody",
+    sim.getComponent(candidateEntity, "staffed") === undefined,
+  );
+
+  // And the sim refuses it even when the app's guard is bypassed.
+  sim.submit(staffHireCommand(sim.tick + 1, candidateEntity, true));
+  sim.step();
+  check(
+    "staff: the COMMAND form re-checks cash too (screen.denied insufficient-cash)",
+    sim.getComponent(candidateEntity, "staffed") === undefined &&
+      sim.eventsSince(0).some((e) => e.type === "screen.denied" && e.payload.reason === "insufficient-cash"),
+  );
+}
+
+// --- RESERVA's procedures card is derived from stars, not frozen --------
+// H1 froze the active table in a module constant at import. If that came
+// back, the card would be identical at both tiers and the escalation system
+// would be decorative. The card only paints while a guest is presenting, so
+// this drives paintSpec with a synthetic view rather than staging a guest.
+{
+  const cardAt = (stars) => {
+    const view = {
+      tick: 1,
+      data: {
+        queue: {
+          reservationEntity: 1,
+          guestEntity: 2,
+          docFields: { id: { name: "Alex Rivera", docNumber: "X1", expiresDay: "500" } },
+          resFields: { guestName: "Alex Rivera", resCode: "RC-1" },
+        },
+        rooms: [],
+        stars,
+        ledger: { day: 1, revenueMinor: 0, expenseMinor: 0, closingCashMinor: 0 },
+      },
+    };
+    return JSON.stringify(reservaApp.paintSpec(reservaApp.init(), view));
+  };
+  const blacklistRow = H1_RULES.find((r) => r.id === "blacklist");
+  const atOne = cardAt(1);
+  const atTwo = cardAt(2);
+  // A distinctive tail, not a prefix: the blacklist row and the name-match
+  // row share their first two dozen characters ("The name on the ID must"),
+  // so a prefix match would report the blacklist line as present at 1 star.
+  const blacklistPhrase = "blacklist bulletin";
+  check("reserva(setup): the phrase used below is unique to the blacklist row", blacklistRow.description.includes(blacklistPhrase));
+  check("reserva: the blacklist procedure is ABSENT at 1 star", !atOne.includes(blacklistPhrase));
+  check("reserva: the blacklist procedure APPEARS at 2 stars", atTwo.includes(blacklistPhrase));
+  check("reserva: the two cards genuinely differ", atOne !== atTwo);
+  check(
+    "reserva: the card grew by exactly the rows the tier activates",
+    rulesForStars(H1_RULES, 2).length === rulesForStars(H1_RULES, 1).length + 1,
+  );
+}
+
+// --- the composed-shell overflow gate, DERIVED from the registry --------
+// H1b's loop hardcoded ["reserva","audit"]. Deriving it from HOTEL_APPS is
+// the pattern obligation: registering app seven can never silently skip the
+// gate, because there is no list to forget to update.
+{
+  const { sim, terminalEntity } = terminalSim("hotel-h2-overflow-1");
+  const hotelEntity = [...sim.withComponent("hotel")][0][0];
+  sim.setComponent(hotelEntity, "hotel", {
+    ...sim.getComponent(hotelEntity, "hotel"),
+    stars: 2,
+    cash: 999999,
+    hireUnlocked: true,
+    repBySegment: { business: 1000, leisure: 1000, family: 1000 },
+  });
+  // Worst-case content for every app at once.
+  for (let day = 1; day <= 20; day++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "ledgerEntry", { day, debitAccount: "expense:staff", creditAccount: "cash", amountMinor: 999999, memo: "x" });
+  }
+  for (let i = 0; i < 20; i++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "mail", {
+      day: 20,
+      kind: "complaint",
+      subjectKey: "mail.complaint",
+      fields: { segment: "business", score: "1", factors: "waited-very-long,broken-prop,overpriced" },
+      read: false,
+    });
+  }
+  for (const kind of ["check-in-guests", "clean-messes", "catch-fraud"]) {
+    const e = sim.spawn();
+    sim.setComponent(e, "objective", { day: sim.getComponent(hotelEntity, "hotel").day, kind, target: 99, progress: 0, done: false, rewardMinor: 99999 });
+  }
+  for (let i = 0; i < 3; i++) {
+    const e = sim.spawn();
+    sim.setComponent(e, "person", { kind: "candidate", name: "Marguerite Oyelaran", seed: i });
+    sim.setComponent(e, "candidate", { wageAsk: 3500, skillPermille: 950, quirk: "will not touch the fax machine", state: "waiting", resumeEntity: 0 });
+  }
+  const e = sim.spawn();
+  sim.setComponent(e, "person", { kind: "staff", name: "Marguerite Oyelaran", seed: 9 });
+  sim.setComponent(e, "staffed", { job: "clerk", wage: 3500, skillPermille: 950, quirk: "will not touch the fax machine", hiredDay: 1, seed: 9 });
+
+  let overflowing = 0;
+  const covered = [];
+  for (const app of HOTEL_APPS) {
+    openApp(sim, terminalEntity, app.id);
+    const state = sim.getComponent(terminalEntity, "screenApp").state;
+    const violations = findOverflowingNodes(hotelShell.paintSpec(state, buildScreenWorldView(sim)));
+    covered.push(app.id);
+    if (violations.length > 0) {
+      overflowing++;
+      console.log(`  overflow in ${app.id}: ${JSON.stringify(violations.slice(0, 3))}`);
+    }
+  }
+  check(
+    `composed-shell overflow gate covers every registered app, derived from the registry (${covered.join(",")})`,
+    covered.length === HOTEL_APPS.length,
+  );
+  check("composed-shell overflow gate: zero overflowing nodes at worst-case data", overflowing === 0);
 }
 
 if (failures > 0) {

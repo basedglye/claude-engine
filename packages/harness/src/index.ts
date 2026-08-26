@@ -85,12 +85,45 @@ export interface Verdict {
   eventsTail?: readonly GameEvent[];
   /** Present only when the caller requests a replay-equivalence check (e.g. the CLI's --verify-replay). */
   replayCheck?: { verified: boolean; expectedHash: number; actualHash: number };
+  /**
+   * Incremental-vs-slow `stateHash` cross-check (docs/PHASE-H2.md contract
+   * A). `live` is the sim this verdict ran; `replay` is the replayed sim,
+   * present only when a replay actually happened (--verify-replay, or
+   * browser mode's assertion replay). A disagreement means some sim system
+   * mutated a component object in place without a setComponent() call — a
+   * P0 determinism bug, exit 3, never something to loosen.
+   */
+  hashCheck?: {
+    live: HashConsistency;
+    replay?: HashConsistency;
+  };
   /** Present iff the scenario declared checkpoints. */
   checkpoints?: Checkpoint[];
   /** Present iff run with --browser (see @claude-engine/harness/browser). */
   browser?: unknown;
   /** Present iff run with --soak (see @claude-engine/harness/soak). */
   soak?: unknown;
+}
+
+/** One incremental-vs-slow comparison. `agrees` is the only field a gate
+ *  needs; the two hashes are carried so a failure verdict names the actual
+ *  numbers instead of just "they differ". */
+export interface HashConsistency {
+  incremental: number;
+  slow: number;
+  agrees: boolean;
+}
+
+/**
+ * Assert Sim.stateHash() === Sim.stateHashSlow() (docs/PHASE-H2.md contract
+ * A / determinism rule 6). Cheap enough to run unconditionally at the end of
+ * every scenario run: one full state walk, once, against a hash the run has
+ * already been maintaining incrementally.
+ */
+export function checkHashConsistency(sim: Sim): HashConsistency {
+  const incremental = sim.stateHash();
+  const slow = sim.stateHashSlow();
+  return { incremental, slow, agrees: incremental === slow };
 }
 
 export function runScenario(scenario: Scenario): Verdict {
@@ -169,6 +202,7 @@ export function runScenario(scenario: Scenario): Verdict {
       p95TickMs: percentile(tickMs, 0.95),
       maxTickMs: tickMs.reduce((m, v) => Math.max(m, v), 0),
     },
+    hashCheck: { live: checkHashConsistency(sim) },
     ...(passed ? {} : { eventsTail: sim.eventsSince(0).slice(-50) }),
     ...(scenario.checkpoints ? { checkpoints } : {}),
   };
@@ -185,7 +219,7 @@ export function verifyReplay(
   expectedHash: number,
   commands?: readonly Command[],
   ticks?: number
-): { verified: boolean; expectedHash: number; actualHash: number } {
+): { verified: boolean; expectedHash: number; actualHash: number; hashCheck: HashConsistency } {
   // Browser-mode runs land on a wall-clock-determined final tick that can
   // differ from scenario.ticks (the static headless tick count) — the
   // caller passes the run's actual final tick so replay covers exactly the
@@ -194,7 +228,12 @@ export function verifyReplay(
   const tickCount = ticks ?? scenario.ticks;
   const sim = replayToSim(scenario, commands ?? scenario.commands ?? [], tickCount);
   const actualHash = sim.stateHash();
-  return { verified: actualHash === expectedHash, expectedHash, actualHash };
+  return {
+    verified: actualHash === expectedHash,
+    expectedHash,
+    actualHash,
+    hashCheck: checkHashConsistency(sim),
+  };
 }
 
 /**
@@ -206,6 +245,18 @@ export function verifyReplay(
 export function replayToSim(scenario: Scenario, commands: readonly Command[], ticks: number): Sim {
   const sim = new Sim(scenario.seed);
   scenario.setup(sim);
+  // Prime the incremental-hash cache exactly as the live path does
+  // (runScenario computes setupStateHash here). Without this, the replay
+  // sim's cache is built for the first time at the FINAL hash, when every
+  // entry is recomputed fresh — so its incremental/slow cross-check could
+  // never disagree, and the replay leg of the check would be vacuous.
+  // Note the honest residual: the cross-check catches an in-place mutation
+  // of a component that has been hashed at least once. A component created
+  // AND mutated in place between two hash calls is invisible until the next
+  // one — which is why per-tick hashing paths (core's replay(), checkpoints)
+  // are the sharp end of this detector, and why the house rule is enforced
+  // by review and by the core suite's negative control as well as here.
+  sim.stateHash();
   const byTick = new Map<number, Command[]>();
   for (const c of commands) {
     const list = byTick.get(c.tick) ?? [];

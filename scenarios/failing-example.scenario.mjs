@@ -8,8 +8,9 @@ function setup(sim) {
   // Simple movement system: advances player by 1 in x each tick
   sim.addSystem((s) => {
     const pos = s.getComponent(player, "pos");
-    pos.x += 1;
-    s.emit("tick_moved", { x: pos.x });
+    const x = pos.x + 1;
+    s.setComponent(player, "pos", { ...pos, x });
+    s.emit("tick_moved", { x });
   });
 }
 

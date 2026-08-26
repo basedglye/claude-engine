@@ -16,9 +16,10 @@ function setup(sim) {
         entities.set(c.actor, entity);
       }
       const pos = s.getComponent(entity, "pos");
-      pos.x += c.payload.dx;
-      pos.z += c.payload.dz;
-      s.emit("moved", { actor: c.actor, x: pos.x, z: pos.z });
+      // Write-through, never in-place (Sim.stateHash()'s Phase-H2 contract).
+      const next = { x: pos.x + c.payload.dx, z: pos.z + c.payload.dz };
+      s.setComponent(entity, "pos", next);
+      s.emit("moved", { actor: c.actor, x: next.x, z: next.z });
     }
   });
 }

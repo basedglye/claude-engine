@@ -36,9 +36,9 @@ function setupCounterGame(sim) {
     for (const c of s.commands()) {
       const state = s.getComponent(e, "counter");
       if (c.type === "inc") {
-        state.value += c.payload?.by ?? 1;
+        s.setComponent(e, "counter", { ...state, value: state.value + (c.payload?.by ?? 1) });
       } else if (c.type === "roll") {
-        state.rolls.push(fork.int(0, 99));
+        s.setComponent(e, "counter", { ...state, rolls: [...state.rolls, fork.int(0, 99)] });
       }
     }
   });

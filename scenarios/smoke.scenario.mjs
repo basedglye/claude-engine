@@ -12,9 +12,10 @@ function setup(sim) {
     for (const c of s.commands()) {
       if (c.type !== "move") continue;
       const pos = s.getComponent(player, "pos");
-      pos.x += c.payload.dx;
-      pos.y += c.payload.dy;
-      s.emit("moved", { ...pos });
+      // Write-through, never in-place (Sim.stateHash()'s Phase-H2 contract).
+      const next = { x: pos.x + c.payload.dx, y: pos.y + c.payload.dy };
+      s.setComponent(player, "pos", next);
+      s.emit("moved", { ...next });
     }
   });
 
@@ -22,8 +23,9 @@ function setup(sim) {
   sim.addSystem((s) => {
     if (s.tick % 10 !== 0) return;
     const hp = s.getComponent(player, "hp");
-    hp.value -= loot.int(1, 3);
-    s.emit("damaged", { hp: hp.value });
+    const value = hp.value - loot.int(1, 3);
+    s.setComponent(player, "hp", { value });
+    s.emit("damaged", { hp: value });
   });
 }
 

@@ -100,9 +100,13 @@ export function setup(sim: Sim): void {
       const pos = s.getComponent<PlayerPos>(entity, "pos");
       if (!pos) continue;
       const { dx, dy } = c.payload as { dx: number; dy: number };
-      pos.x += dx;
-      pos.y += dy;
-      s.emit("moved", { actor: c.actor, x: pos.x, y: pos.y });
+      // Write-through, never in-place (`pos.x += dx`): as of Phase H2,
+      // Sim.stateHash() caches a per-component digest invalidated by
+      // setComponent(), so an in-place mutation would be invisible to the
+      // hash. Same state, same value — only the write path changed.
+      const next = { x: pos.x + dx, y: pos.y + dy };
+      s.setComponent<PlayerPos>(entity, "pos", next);
+      s.emit("moved", { actor: c.actor, x: next.x, y: next.y });
     }
   });
 
@@ -112,8 +116,9 @@ export function setup(sim: Sim): void {
   sim.addSystem((s) => {
     if (s.tick % 40 !== 0) return;
     const hp = s.getComponent<PlayerHp>(player, "hp")!;
-    hp.value -= hazard.int(1, 3);
-    s.emit("damaged", { hp: hp.value });
+    const value = hp.value - hazard.int(1, 3);
+    s.setComponent<PlayerHp>(player, "hp", { value });
+    s.emit("damaged", { hp: value });
   });
 }
 

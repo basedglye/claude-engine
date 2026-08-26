@@ -298,7 +298,16 @@ async function runBrowserMode(
   };
 
   if (shouldVerifyReplay) {
-    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands, result.browser.finalTick);
+    const check = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands, result.browser.finalTick);
+    verdict.replayCheck = { verified: check.verified, expectedHash: check.expectedHash, actualHash: check.actualHash };
+    verdict.hashCheck = {
+      live: {
+        incremental: result.browser.liveHashCheck.incremental,
+        slow: result.browser.liveHashCheck.slow,
+        agrees: result.browser.liveHashCheck.agrees,
+      },
+      replay: check.hashCheck,
+    };
   }
 
   const json = JSON.stringify(verdict, null, 2);
@@ -307,10 +316,41 @@ async function runBrowserMode(
     writeFileSync(out, json, "utf8");
   }
 
+  if (hashCheckFailed(verdict)) {
+    reportHashDivergence(verdict);
+    process.exit(3);
+  }
   if (shouldVerifyReplay && !verdict.replayCheck?.verified) {
     process.exit(3);
   }
   process.exit(verdict.passed ? 0 : 1);
+}
+
+/**
+ * docs/PHASE-H2.md contract A / determinism rule 6: `stateHash()` and
+ * `stateHashSlow()` must agree everywhere. They can only disagree if sim
+ * code mutated a component object in place instead of writing through
+ * `setComponent()` — the incremental hash's cache never sees that write, so
+ * the run's whole hash stream (and every replay comparison built on it) is
+ * lying. That is a P0 determinism bug, so it exits 3 like any other replay
+ * divergence, and it is checked on EVERY run, not only under
+ * --verify-replay: a hash that does not describe the state is not a
+ * verification opt-in.
+ */
+function hashCheckFailed(verdict: Verdict): boolean {
+  const hc = verdict.hashCheck;
+  if (!hc) return false;
+  return !hc.live.agrees || hc.replay?.agrees === false;
+}
+
+function reportHashDivergence(verdict: Verdict): void {
+  const hc = verdict.hashCheck!;
+  console.error(
+    `stateHash divergence in "${verdict.scenario}": incremental !== slow. ` +
+      `A component was mutated in place without setComponent() (see Sim.stateHash()'s contract). ` +
+      `live incremental=${hc.live.incremental} slow=${hc.live.slow}` +
+      (hc.replay ? `; replay incremental=${hc.replay.incremental} slow=${hc.replay.slow}` : "")
+  );
 }
 
 async function runSoakMode(scenario: Scenario, scenarioPath: string, out: string | undefined): Promise<void> {
@@ -415,7 +455,9 @@ async function main(): Promise<void> {
   verdict.replay.scenarioModule = toRepoRelative(scenarioPath);
 
   if (shouldVerifyReplay) {
-    verdict.replayCheck = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands);
+    const check = verifyReplay(scenario, verdict.finalStateHash, verdict.replay.commands);
+    verdict.replayCheck = { verified: check.verified, expectedHash: check.expectedHash, actualHash: check.actualHash };
+    if (verdict.hashCheck) verdict.hashCheck.replay = check.hashCheck;
   }
 
   const json = JSON.stringify(verdict, null, 2);
@@ -424,6 +466,10 @@ async function main(): Promise<void> {
     writeFileSync(out, json, "utf8");
   }
 
+  if (hashCheckFailed(verdict)) {
+    reportHashDivergence(verdict);
+    process.exit(3);
+  }
   if (shouldVerifyReplay && !verdict.replayCheck?.verified) {
     process.exit(3);
   }

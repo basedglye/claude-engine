@@ -49,8 +49,7 @@ function setupMultiplayerGame(sim) {
         }
         if (entity === undefined) continue;
         const pos = s.getComponent(entity, "pos");
-        pos.x += c.payload.dx;
-        pos.z += c.payload.dz;
+        s.setComponent(entity, "pos", { x: pos.x + c.payload.dx, z: pos.z + c.payload.dz });
       }
     }
   });
@@ -169,7 +168,7 @@ async function runConformanceSuite(store, label) {
       for (const c of s.commands()) {
         if (c.type !== "noop") continue;
         const hits = s.getComponent(player, "hits");
-        hits.value += 1;
+        s.setComponent(player, "hits", { value: hits.value + 1 });
       }
     });
   });

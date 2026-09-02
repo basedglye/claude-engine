@@ -57,8 +57,9 @@ harness `screenClick` step and the `screen-readability` probe. Gates live:
 
 **Phase 1 is complete.** Phase 2 is split into H2a (everything that changes
 `stateHash`) and H2b (everything forbidden from changing it) — see
-[docs/PHASE-H2.md](PHASE-H2.md) §1. **H2a is complete and merged**; H2b is
-next.
+[docs/PHASE-H2.md](PHASE-H2.md) §1. **H2a is complete and merged**; H2b's
+implementation is complete on `hotel-phase-2b` with all four of its gates
+green, and is awaiting the human look-lock sign-off and its review gate.
 
 
 `surface-ui` + HOTELSOFT shell + RESERVA (rule-table driven from day one);
@@ -102,24 +103,45 @@ row → bulletin → a catch that was impossible a day earlier, with a pre-tier
 control); the app decision-path suite and a registry-derived composed-shell
 overflow gate. Verdict: [reviews/phase-H2a.md](reviews/phase-H2a.md).
 
-### Phase 2b — "The Look & The Sound" — next
+### Phase 2b — "The Look & The Sound" — **implementation complete, awaiting sign-off + review**
 
 Retro texture pipeline (quantize + dither atlas, UVs, instancing,
 vertex-colour lighting, PS1 shader look-lock excluding screen quads);
 `audio`; `frame-time-p95` + `draw-calls` probes and budgets; load-on-boot
-persistence; third-person boom clip.
+persistence; third-person boom clip. All landed on `hotel-phase-2b`.
 
-*Exit:* `art-lock` (both engines) with the art look-lock signed off on
-screenshots; `save-resume`; `audio-coverage`; and every headless golden
-pinned at the H2a merge byte-identical afterwards.
+*Exit criteria, measured:*
+- `art-lock` — exit 0 on **both engines** with `--verify-replay`, 70
+  commands each. `screen-readability` reads texelScale **1.38** /
+  calibContrast **241.32** / calibPitchErr **0** with the PS1 shader live on
+  every other surface — byte-for-byte H1b's numbers, which is the B6
+  screen-quad exemption proven under the shader. Non-vacuous: un-exempting
+  the quad reds exactly that target (pitchErr 0 → 0.258).
+- `save-resume` — exit 0 both engines, 29 commands each.
+- `audio-coverage` — zero uncovered, zero unknown, both controls proven.
+- `upkeep-click` — the H2a review's blocking carry, **closed**: exit 0 both
+  engines, 47 commands, clicking a mess and a candidate through the real
+  reticle raycast.
+- Byte-identical goldens — `npm run check:goldens`, **12/12**, after the
+  entire art/audio diff. One command now, not twelve.
 
-**First item for H2b** (carried from the H2a review): there is no repeatable
-browser gate for clicking a mess, a prop or a candidate. The objects render
-and were verified clickable by driving the running game, but a browser
-scenario's `setup` builds only the replay sim — the page runs the app's own
-`setup()` — so a gate can only click what the shipped world contains at the
-tick it runs, and the nearest prop is a bedroom away behind two closed
-doors. H2b owns browser gates; this is the flagship-path hole to close.
+*Still open before merge:* the **human look-lock sign-off** (§11 — Chris
+views the four committed screenshots in `apps/hotel/docs/evidence/h2b-look-*`
+and drives the build himself; the review then records `LOOK-LOCKED:
+<commit>`), and the H2b review gate itself.
+
+*Carried into the review, not fixed:* the frame-time budget is scoped to
+software rendering (ceiling 170 ms against five measured runs of 86.5–114.7)
+because the harness renders through SwiftShader where the spec's hardware
+16.7 ms is unreachable; and `save-resume` substitutes an in-place recovery
+re-invocation for a real `location.reload()`, because a reload destroys the
+in-memory command log the harness replays — so gate 8 does not prove the
+boot path survives an actual page load.
+
+**The H2a carry is closed.** The obstacle was solved rather than accepted,
+via a committed `SCENARIO_CONFIGS` table + `setupNamed` + a
+`?worldforgeConfig=` parameter the harness forwards, so the page and the
+replay sim build the same world from one committed object.
 
 ## Phase 3 — "A Real Hotel" (~3–4 wk) [S]
 

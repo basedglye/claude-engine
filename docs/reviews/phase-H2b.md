@@ -256,3 +256,109 @@ The implementer's own read is carried forward verbatim so the sign-off is not as
 ---
 
 **Phase H2b is NOT yet clear to merge.** One blocking item stands, and it is the artifact the next required step consumes. Everything else on this branch is verified, non-vacuous, and merge-ready: fix item 1, obtain the sign-off, record `LOOK-LOCKED`, and merge.
+
+---
+
+## Post-verdict addendum — blocking item 1 worked, and what it did and did not fix
+
+Written after the verdict above, by the same session acting as implementer at
+Chris's instruction ("fix the screenshots"). The verdict is untouched; this
+records what changed and, more importantly, what the work established that the
+verdict could only suspect.
+
+### The reproducibility half: FIXED, and proven the only way that counts
+
+`scenarios/art-lock.scenario.mjs` was re-derived so the walk **stops and holds
+still** at each of the three world poses, with each shot near the start of a
+~60-tick hold. Two causes of drift were found, not one:
+
+1. **Shots were taken mid-stride.** Obvious in hindsight; the walk held `KeyW`
+   almost continuously from tick 0 to 60 and all three world shots landed
+   inside that.
+2. **Capturing is itself slow, and the capture loop is serial.**
+   `browser.ts:396` polls to a tick then calls `page.screenshot()` in order, and
+   under SwiftShader one capture costs **27–37 ticks of wall clock** — so each
+   capture pushes the *next* request late. A first attempt using ~10-tick holds
+   still drifted 54 → 70, straight through the hold into the next leg. This is
+   why the holds are long rather than the ticks merely re-spaced.
+
+A third instance of the same class showed up in the terminal shot: `focusEase`
+is per-**rendered frame** (`FOCUS_EASE_STEP = 0.12`), so on hardware it settles
+in ~0.15 s but at this gate's ~10 fps it takes ~18 ticks. Capturing 7 ticks
+after the focus click produced a half-eased camera and `calibContrast` **0** —
+a red gate caused entirely by capture timing, with the sim assertions all green.
+`SHOT_TERMINAL` now sits ~47 ticks after the click.
+
+**Proof, which is byte comparison rather than an argument:** two consecutive
+Chromium runs produced **four byte-identical PNGs** —
+
+| shot | md5 | run A tick | run B tick |
+|---|---|---|---|
+| `tick-10` lobby | `99e6478a…` | 10 | 10 |
+| `tick-85` corridor | `e2c522df…` | 85 | 85 |
+| `tick-165` bedroom | `6a593b80…` | **166** | 165 |
+| `tick-345` terminal | `2b1460d6…` | 345 | 345 |
+
+Run A's bedroom capture drifted a tick **and produced the same image anyway**,
+which is precisely the property the holds exist to buy. Before this change only
+the terminal shot reproduced. Gate re-verified: **exit 0 on Chromium and
+Firefox**, `--verify-replay`, command count constant at **72** on both engines
+(was 70; the input script changed), `screen-readability` unchanged at
+texelScale **1.38** / calibContrast **241.32** / calibPitchErr **0**,
+`draw-calls` 3, `frame-time-p95` 74.0 / 84.7 ms Chromium and **16.0 ms**
+Firefox. `npm run build`, `npx eslint .`, `check-purity`, and
+`npm run check:goldens` (**12/12**) all still green — no sim code was touched.
+
+### The subject half: two of four fixed; the other two are art, and that is now established rather than suspected
+
+- **Shot 1 (lobby)** — fixed. Chosen by measurement, not taste: a scouting run
+  photographed all four cardinal directions from the spawn. South is the only
+  one that reads, because it looks *through* the corridor doorway and the frame
+  therefore carries a door frame, a receding floor and a ceiling edge. East is a
+  bare corner, north a flat door panel, and west — down the lobby's 10 m length,
+  which is what "lobby wide" naively suggests — is a near-featureless field.
+- **Shot 4 (terminal)** — unchanged and still perfect.
+- **Shot 3 (bedroom)** — the mess is now genuinely in frame, and the earlier
+  1831 mm pose was diagnosed: it stands at x3986, **outside room 3's east wall**
+  (the room spans x375..3875), so the wall occluded the mess entirely. The pose
+  is now inside the room at 1292 mm.
+- **Shots 2 and 3 still do not read** as a corridor and a bedroom.
+
+**This is not a pose problem, and the search that establishes it is the useful
+output.** Roughly a dozen framings were photographed and inspected. With no
+surface detail at gameplay distance, a frame reads only when it contains an
+opening and layered depth; flat-on views of large surfaces render as untextured
+fields whatever the room is, and oblique multi-surface views render as polygon
+soup. The legible band is narrow: **moving 600 mm forward from shot 1's pose
+destroys it.** And the mess in shot 3 renders as a dark brown box
+indistinguishable from architecture — confirmed by pitch-tracking the same dark
+slab across pitches 210/175/140 and watching it leave frame as predicted.
+
+The fixes are art-side: atlas contrast, surface/edge definition, and the mess's
+own colour (`hashedColor(kind, 0.4, 0.3)` lands dark against a dark floor).
+Those belong to the sign-off and to non-blocking item 7's missing
+`surface-contrast` probe, not to another pose iteration.
+
+### Verdict status
+
+**Blocking item 1 is discharged as far as engineering can take it**, and the
+part that remains is now correctly located: it is the *look*, which is Chris's
+call at the §11 sign-off, not a defect in the gate. The four committed
+screenshots are an honest, reproducible record of what the build currently looks
+like — which is what a sign-off needs, whether the answer is "lock it" or "the
+art needs another pass first".
+
+`LOOK-LOCKED:` remains deliberately unrecorded.
+
+### One correction, recorded because this project's rules require it
+
+While investigating, this session ran the app's dev server through
+`preview_start` and found the page world contained **no messes**, and briefly
+treated that as a product bug. It was not. `preview_start` launches in the
+*session's* worktree, which sits at `28e554a` (pre-H2b, no `setupNamed`, no
+`SCENARIO_CONFIGS`) — the wrong tree, the same trap family as the fresh-worktree
+resolution failure that opened H2b. Re-checked against a dev server started in
+the review worktree, the page has both messes, the broken lamp and two open
+doors, exactly as designed. **Nothing was wrong with `preDirty`.** Worth adding
+to HANDOFF's traps: *`preview_start` ignores which worktree you are reviewing;
+verify the served tree before believing anything it shows you.*

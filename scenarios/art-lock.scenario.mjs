@@ -93,45 +93,145 @@ import { setupNamed } from "../apps/hotel/dist-game/sim/game.js";
 const SEED = "hotel-h2-look-1";
 const CONFIG = "look-lock";
 
-// Ticks the four signed screenshots are taken at. Named, because the review
-// step refers to them by name and a bare number in a diff says nothing.
-const SHOT_LOBBY = 3;
-const SHOT_CORRIDOR = 16;
-const SHOT_BEDROOM = 26;
-const FOCUS_CLICK_TICK = 66;
-const SHOT_TERMINAL = 74;
+// SHOT TICKS, AND WHY EACH ONE SITS INSIDE A LONG HOLD.
+//
+// The H2b review found that three of the four committed screenshots did not
+// reproduce: the harness requests a tick and captures at or after it, so a
+// shot taken mid-stride lands on a different pose every run (measured:
+// requested 26 -> actual 26, 29 and 32 across three runs; only the
+// stationary terminal shot was byte-identical). A look-lock whose evidence
+// cannot be re-captured is not a lock -- nothing can be diffed against it
+// later to prove the look has not moved.
+//
+// TWO THINGS CAUSED THAT DRIFT, AND BOTH ARE HANDLED HERE.
+//
+// 1. The shot was taken while walking. The walk now STOPS at each of the
+//    three world poses and holds still; the camera is motionless for the
+//    whole window a capture can land in, so drift cannot change the frame.
+//
+// 2. Capturing is itself slow, and the capture loop is SERIAL
+//    (packages/harness/src/browser.ts: pollUntilTick -> page.screenshot, in
+//    order). Under headless SwiftShader one `page.screenshot()` costs
+//    27-37 ticks of wall clock, so each capture pushes the NEXT request
+//    late. A first attempt at this fix used ~10-tick holds and still
+//    drifted 54 -> 70, straight through the hold and into the next leg.
+//    The holds below are therefore ~60+ ticks with each shot near the START
+//    of its hold. Drift only ever runs late, never early, so that margin is
+//    one-sided. Measured after the fix: 8->8, 85->85, 155->155, 300->301.
+//
+// FOCUS EASE IS THE SAME PROBLEM WEARING A DIFFERENT HAT. The focused
+// screen view only snaps square-on to the quad once `focusEase` reaches 1,
+// and that easing is per-RENDERED-FRAME (main.ts FOCUS_EASE_STEP = 0.12,
+// so ~9 frames), not per tick. On hardware that is ~0.15s; under headless
+// SwiftShader, where this gate measures ~10fps, it is closer to a FULL
+// SECOND -- ~18 ticks. Capturing the terminal 7 ticks after the click gave
+// a half-eased camera: the screen skewed, half behind the desk, and the
+// readability probe read calibContrast 0 because `screenRect()` (sampled
+// after the run, fully eased) described a quad the pixels did not contain.
+// SHOT_TERMINAL therefore sits ~47 ticks after the click.
+//
+// If a leg is ever re-derived, the shot must stay inside its hold with the
+// margin intact. The run is ~360 ticks (~18s) for this reason; that is the
+// price of evidence that reproduces, and this gate is not on a hot path.
+const SHOT_LOBBY = 10; //    hold: ticks 0..59    (no input at all before it)
+const SHOT_CORRIDOR = 85; // hold: ticks 68..129
+const SHOT_BEDROOM = 165; // hold: ticks 147..248 (pitch lands at 150)
+const FOCUS_CLICK_TICK = 298;
+const SHOT_TERMINAL = 345; // hold: ticks 298..end
 
-/** Derived leg 1: spawn -> the pre-dirtied bedroom, ending looking at a mess. */
-const LEG_1 = [
-  { key: "KeyW", downAtTick: 0, upAtTick: 9 },
-  { pointer: "look", atTick: 9, dx: -162, dy: 0 },
-  { key: "KeyW", downAtTick: 9, upAtTick: 13 },
-  { pointer: "look", atTick: 13, dx: -234, dy: 0 },
-  { key: "KeyW", downAtTick: 13, upAtTick: 18 },
-  { pointer: "look", atTick: 18, dx: -95, dy: 0 },
-  { key: "KeyW", downAtTick: 18, upAtTick: 23 },
-  { pointer: "look", atTick: 23, dx: -65, dy: 0 },
-]
+// Pitch, in look pixels; positive is DOWN at 220 mdeg/px (reserva-readability's
+// recorded convention). derive-walk computes these geometrically from the
+// target height and range and prints them, but does NOT verify the reticle
+// raycast -- see this file's header.
+const PITCH_BEDROOM = 210; // onto a 0.25m mess at 1292mm
+const PITCH_TERMINAL = 100; // onto the 1.15m screen at 1111mm
 
-/** Derived leg 2: bedroom -> back to the front desk, facing the terminal. */
-const LEG_2 = [
-  { pointer: "look", atTick: 24, dx: -756, dy: 0 },
-  { key: "KeyW", downAtTick: 24, upAtTick: 29 },
-  { pointer: "look", atTick: 29, dx: 87, dy: 0 },
-  { key: "KeyW", downAtTick: 29, upAtTick: 34 },
-  { pointer: "look", atTick: 34, dx: 262, dy: 0 },
-  { key: "KeyW", downAtTick: 34, upAtTick: 38 },
-  { pointer: "look", atTick: 38, dx: 133, dy: 0 },
-  { key: "KeyW", downAtTick: 38, upAtTick: 43 },
-  { pointer: "look", atTick: 43, dx: 402, dy: 0 },
-  { key: "KeyW", downAtTick: 43, upAtTick: 60 },
-  { pointer: "look", atTick: 60, dx: -3, dy: 0 },
+/** Shot 1 -- the LOBBY, from the spawn, facing the way the player spawns
+ *  (yaw 0, due south). No input at all precedes it, so this pose is exact
+ *  on every engine and every run.
+ *
+ *  WHY THIS DIRECTION, MEASURED RATHER THAN CHOSEN. A scouting run shot all
+ *  four cardinal directions from this spawn and compared them: south is the
+ *  only one that reads as architecture. It looks across the lobby and
+ *  THROUGH the corridor doorway, so the frame carries a door frame, a
+ *  receding floor and a ceiling edge -- layered depth. East is a bare
+ *  corner, north is a flat door panel, and west (down the lobby's 10m
+ *  length, which is what "lobby wide" naively suggests) is a near-featureless
+ *  field, because an empty 5.5m room ending in a flat far wall has nothing
+ *  in it to read. The previous revision's lobby shot walked south while
+ *  capturing and landed one metre from the south wall.
+ *
+ *  The general rule that scouting established, worth keeping: with no
+ *  surface detail at gameplay distance, THIS look only reads where a frame
+ *  contains an opening and layered depth. Flat-on views of large surfaces
+ *  render as untextured fields whatever the room actually is. */
+const LEG_1_LOBBY = [];
+
+/** Shot 2 -- the CORRIDOR, from its mouth, looking down its 5.25m run.
+ *  Derived: --to 5250,9500 --stop-mm 5200 (walks ~1.4m south of spawn and
+ *  turns to face along the corridor). Ends tick 8 at (5875,4525) yaw 352740.
+ *
+ *  Standing deep INSIDE the corridor was tried and rejected: the side walls
+ *  are ~1m away and fill the frame at an oblique angle, which is the
+ *  polygon-soup case above. From the mouth the doorway frames the run. */
+const LEG_2_CORRIDOR = [
+  { key: "KeyW", downAtTick: 60, upAtTick: 67 },
+  { pointer: "look", atTick: 67, dx: -33, dy: 0 },
+];
+
+/** Shot 3 -- the BEDROOM (room 3), pre-dirtied by the `look-lock` config,
+ *  with the mess on the floor ahead.
+ *  Derived: --to mess:0 --stop-mm 1300 --start-tick 130.
+ *  Ends tick 147 at (3466,5318), 1292mm from the mess, pitch 210.
+ *
+ *  STOP DISTANCE IS THE FRAMING, AND IT IS A COMPROMISE. Backing off to
+ *  1831mm gives a gentler 34-degree look-down that holds more of the room,
+ *  but at that range the camera stands at x3986 -- OUTSIDE room 3's east
+ *  wall (the room spans x375..3875) -- and the wall occludes the mess
+ *  entirely. That was measured, not guessed: the 1831mm frame contains no
+ *  mess at all. 1292mm puts the camera inside the room with the mess in
+ *  frame, which is what "bedroom with mess props" has to mean. */
+const LEG_3_BEDROOM = [
+  { pointer: "look", atTick: 130, dx: 33, dy: 0 },
+  { key: "KeyW", downAtTick: 130, upAtTick: 132 },
+  { pointer: "look", atTick: 132, dx: -162, dy: 0 },
+  { key: "KeyW", downAtTick: 132, upAtTick: 136 },
+  { pointer: "look", atTick: 136, dx: -234, dy: 0 },
+  { key: "KeyW", downAtTick: 136, upAtTick: 141 },
+  { pointer: "look", atTick: 141, dx: -95, dy: 0 },
+  { key: "KeyW", downAtTick: 141, upAtTick: 146 },
+  { pointer: "look", atTick: 146, dx: -65, dy: 0 },
+  // Pitch down onto the mess for the shot, then back to level before
+  // walking on -- pitch is presentation and persists, so leaving it in
+  // would add to the terminal leg's own pitch and raycast into the floor.
+  { pointer: "look", atTick: 150, dx: 0, dy: PITCH_BEDROOM },
+  { pointer: "look", atTick: 249, dx: 0, dy: -PITCH_BEDROOM },
+];
+
+/** Shot 4 -- the focused TERMINAL, from the desk.
+ *  Derived: --to 1375,3625 --stop-mm 1300 --start-tick 255.
+ *  Ends tick 292 at (2488,3719), 1111mm from the anchor, and the tool
+ *  reports range OK / arc OK -- i.e. the sim would accept the interact,
+ *  which is what the focus click below then proves through the real
+ *  reticle raycast. */
+const LEG_4_TERMINAL = [
+  { pointer: "look", atTick: 255, dx: -756, dy: 0 },
+  { key: "KeyW", downAtTick: 255, upAtTick: 260 },
+  { pointer: "look", atTick: 260, dx: 87, dy: 0 },
+  { key: "KeyW", downAtTick: 260, upAtTick: 265 },
+  { pointer: "look", atTick: 265, dx: 262, dy: 0 },
+  { key: "KeyW", downAtTick: 265, upAtTick: 269 },
+  { pointer: "look", atTick: 269, dx: 133, dy: 0 },
+  { key: "KeyW", downAtTick: 269, upAtTick: 274 },
+  { pointer: "look", atTick: 274, dx: 402, dy: 0 },
+  { key: "KeyW", downAtTick: 274, upAtTick: 291 },
+  { pointer: "look", atTick: 291, dx: -3, dy: 0 },
 ];
 
 export default {
   name: "art-lock",
   seed: SEED,
-  ticks: 95,
+  ticks: 360,
   setup: (sim) => setupNamed(sim, CONFIG),
   assertions: [
     {
@@ -177,13 +277,15 @@ export default {
     configName: CONFIG,
     input: [
       { pointer: "lock", atTick: 0 },
-      ...LEG_1,
-      ...LEG_2,
+      ...LEG_1_LOBBY,
+      ...LEG_2_CORRIDOR,
+      ...LEG_3_BEDROOM,
+      ...LEG_4_TERMINAL,
       // Pitch down onto the monitor, then click it. Split from the walk's
       // final yaw correction so the pose is settled before the raycast --
       // a click on the same tick as a look is a click against last frame's
       // camera.
-      { pointer: "look", atTick: 62, dx: 0, dy: 100 },
+      { pointer: "look", atTick: 294, dx: 0, dy: PITCH_TERMINAL },
       { pointer: "click", atTick: FOCUS_CLICK_TICK },
     ],
     screenshotAtTicks: [SHOT_LOBBY, SHOT_CORRIDOR, SHOT_BEDROOM, SHOT_TERMINAL],
@@ -193,7 +295,7 @@ export default {
       { probe: "draw-calls" },
       { probe: "sim-tick-ms" },
     ],
-    timeoutMs: 45000,
+    timeoutMs: 90000,
   },
   feelTargets: {
     // UNCHANGED from reserva-readability. That is the point: these are

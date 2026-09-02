@@ -23,7 +23,7 @@ that no longer clips walls, and it reloads your hotel on boot.
 
 ### H2b's measured exit criteria
 
-- `art-lock` — exit 0 **both engines**, `--verify-replay`, **70 commands**
+- `art-lock` — exit 0 **both engines**, `--verify-replay`, **72 commands**
   each. `screen-readability` reads texelScale **1.38** / calibContrast
   **241.32** / calibPitchErr **0** with the shader live on everything else:
   byte-for-byte H1b's numbers, which is the B6 exemption proven under the
@@ -44,11 +44,28 @@ that no longer clips walls, and it reloads your hotel on boot.
 1. **The human look-lock sign-off.** Four screenshots are committed at
    `apps/hotel/docs/evidence/h2b-look-*.png`. §11 requires Chris to view
    them AND drive the build himself, after which the review records
-   `LOOK-LOCKED: <commit>`. No agent can do this step. The implementer's own
-   read, recorded so the sign-off is not asked to guess: the look is
-   *adequate and coherent* — three distinct value planes, legible rooms —
-   but not yet *charming*; the atlas dither does not resolve at gameplay
-   distance and the palette is narrow.
+   `LOOK-LOCKED: <commit>`. No agent can do this step.
+
+   These four were RE-CAPTURED after the H2b review's blocking item 1 (see
+   `docs/reviews/phase-H2b.md`). They are now **reproducible**: every shot
+   sits inside a long stationary hold, and two consecutive runs produced
+   four byte-identical PNGs even though one shot's capture drifted a tick.
+   Before the fix only the terminal shot reproduced.
+
+   **What is still true, and is the sign-off's actual subject:** only two of
+   the four frames read as architecture — shot 1 (the lobby looking through
+   the corridor doorway) and shot 4 (the terminal). Shots 2 and 3 are
+   legible as geometry but not as a corridor or a bedroom. That was chased
+   to ground and is NOT a pose problem: with no surface detail at gameplay
+   distance, a frame only reads when it contains an opening and layered
+   depth, and the legible band around such a pose is a few hundred
+   millimetres wide (measured: moving 600mm from shot 1's pose destroys it).
+   The mess in shot 3 IS in frame — confirmed by pitch-tracking it across
+   three pitches — but renders as a dark brown box indistinguishable from
+   the architecture around it. The fixes are art-side (atlas contrast,
+   surface/edge definition, mess colour), which is exactly what the
+   look-lock sign-off is for and what the ungated `surface-contrast` probe
+   (PHASE-H2C §3.3) would measure.
 2. **The H2b review gate.** No verdict exists at `docs/reviews/phase-H2b.md`.
 3. **Two deviations the review must rule on, not inherit:**
    - The frame-time budget is **scoped to software rendering** (ceiling 170

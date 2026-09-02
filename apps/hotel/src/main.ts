@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { Sim, type EntityId, type IWorld } from "@claude-engine/core";
+import { Sim, RestoreError, type EntityId, type IWorld, type Command, type SimSnapshot } from "@claude-engine/core";
 import {
   createRetroMaterial,
   createThreeHost,
@@ -13,17 +13,16 @@ import { SCREEN_W } from "@claude-engine/surface-ui";
 import { toBufferGeometry } from "@claude-engine/assets/web";
 import { generateDoorMesh, type GroundFloor, type DoorSpec } from "@claude-engine/interiors";
 import { createFpsController } from "@claude-engine/player-fps";
-import { webStore, createSavePump, exportSave, importSave } from "@claude-engine/save-web";
-// Deep import, not the package barrel: @claude-engine/persistence's index.ts
-// also re-exports sqliteStore/postgresStore, which pull in better-sqlite3
-// and pg (Node natives + node:crypto) at the top of their modules. Vite
-// would try to resolve those for the browser bundle and fail. recover.ts
-// itself imports only @claude-engine/core plus type-only store types
-// (docs/PHASE-H1.md section B: "verified to have no Node imports") — going
-// straight at the compiled file sidesteps the barrel's Node-only siblings
-// entirely, since it's a plain subpath import (persistence has no
-// "exports" map restricting it).
-import { recoverSim } from "@claude-engine/persistence/dist/recover.js";
+import { webStore, createSavePump, exportSave } from "@claude-engine/save-web";
+// The "./recover" exports subpath (packages/persistence/package.json) now
+// exists — it resolves straight to recover.ts's compiled output without
+// pulling in the package barrel's Node-only siblings (sqliteStore /
+// postgresStore, which import better-sqlite3 / pg and would break Vite's
+// browser bundle). This used to be a deep import to
+// `@claude-engine/persistence/dist/recover.js`, which package.json's
+// "exports" map kept alive as a "./dist/*" escape hatch purely until this
+// migration landed (H1b review's prescribed spelling, done now).
+import { recoverSim } from "@claude-engine/persistence/recover";
 import {
   setup,
   setupNamed,
@@ -88,25 +87,108 @@ if (configParam && configParam in SCENARIO_CONFIGS) {
   setup(sim);
 }
 
-// -- H1b save/load (docs/PHASE-H1.md section B + "Host (main.ts)
-//    additions"): a single fixed game id, since H1 has no save UI
-//    (listGames/deleteGame are the recorded future change, not made here).
-//    The game record is created (idempotently -- put(), not add()) before
-//    any command is submitted, so a quicksave's exportSave() always finds
-//    a record to hang commands off of. --
-const GAME_ID = "hotel-sp";
+// -- H2b load-on-boot persistence (docs/PHASE-H2.md section 5C, deferral
+//    row 1): `listGames()`/`deleteGame()` now exist, and the live game id
+//    is no longer a single fixed constant -- boot recovers the most
+//    recently played game (see recoverOnBoot below), and both quick-load
+//    and the audit-save id-switch mint a fresh derived id off whatever
+//    branch they're forking from. `gameId` is therefore `let`, not
+//    `const`, and everything downstream that needs "the id we're currently
+//    writing to" (the pump, quickSave/quickLoad, the audit-save hook) reads
+//    it live rather than closing over a fixed value.
+const GAME_ID_PREFIX = "hotel-sp";
+let gameId = GAME_ID_PREFIX;
 const store = webStore();
 // Not top-level-awaited (vite's default build target predates it) --
 // quickSave() below awaits this promise before its first store access, so
-// the record is guaranteed to exist by the time exportSave() needs it.
-const gameReady: Promise<unknown> = store.createGame({ id: GAME_ID, name: "hotel-sp", seed: sim.seed });
+// a record is guaranteed to exist under `gameId` by the time exportSave()
+// needs it. Idempotent (put(), not add()) so it is harmless to have already
+// created this exact id -- and it's superseded (gameReady reassigned) the
+// moment recoverOnBoot() finds and recovers an existing game instead of
+// starting fresh under this default id.
+let gameReady: Promise<unknown> = store.createGame({ id: gameId, name: GAME_ID_PREFIX, seed: sim.seed });
 
 // Every command submission is routed through the pump's submit (wired into
 // installTestHook's `submit` option below) -- that is what makes the
 // write-ahead guarantee real: a command is durably queued (the in-memory
 // WAL) before the sim ever sees it, not just "eventually written somewhere
-// after the fact."
-const pump = createSavePump({ store, gameId: GAME_ID, snapshotEveryTicks: 2000 });
+// after the fact." `pump` is `let`, not `const`: createSavePump() closes
+// over a fixed gameId at construction (packages/save-web has no
+// "repoint this pump" API, and that package is out of this lane's scope),
+// so switching the live game id means constructing a *new* pump and
+// reassigning this binding -- installTestHook's `submit` option below
+// closes over the variable `pump`, not a snapshot of today's pump object,
+// so every call site downstream keeps working the instant the swap
+// happens.
+let pump = createSavePump({ store, gameId, snapshotEveryTicks: 2000 });
+
+// Disambiguates fresh derived ids minted in the same millisecond (quick-load
+// spam, or a quick-load immediately followed by an audit save) -- part of
+// the `hotel-sp@<savedTick>-<n>` scheme below.
+let deriveSeq = 0;
+
+/** The `SaveFile` shape `@claude-engine/save-web`'s exportSave/importSave
+ *  round-trip (packages/save-web/src/save.ts) -- reproduced here (not
+ *  imported; it's a private, unexported interface of that module) because
+ *  this function needs `importSave`'s parsing but NOT its id-generation
+ *  (`store.createGame({name, seed})` with no `id`, which always mints a
+ *  random UUID -- see below). */
+interface HotelSaveFile {
+  v: 1;
+  game: { name: string; seed: string };
+  commands: Command[];
+  snapshot: SimSnapshot | null;
+}
+
+/**
+ * Import a captured save (exportSave's JSON) as a game record under a
+ * CHOSEN id, rather than importSave's random `crypto.randomUUID()` --
+ * docs/PHASE-H2.md section 5C's derived-id scheme
+ * (`hotel-sp@<savedTick>-<n>`) needs the id to be predictable and
+ * meaningful (it names the tick it forked from), which importSave's API
+ * has no parameter for. Otherwise identical to importSave: a fresh record,
+ * never overwriting an existing id (store.createGame's `put` is keyed on
+ * this NEW id, which deriveGameId() below guarantees is unused).
+ */
+async function importSaveAs(json: string, id: string): Promise<string> {
+  const file = JSON.parse(json) as HotelSaveFile;
+  if (file.v !== 1) {
+    throw new Error(`importSaveAs: unsupported save file version ${(file as { v: unknown }).v}`);
+  }
+  const record = await store.createGame({ id, name: file.game.name, seed: file.game.seed });
+  if (file.commands.length > 0) {
+    await store.appendCommands(record.id, file.commands);
+  }
+  if (file.snapshot) {
+    await store.saveSnapshot(record.id, file.snapshot);
+  }
+  return record.id;
+}
+
+/** `hotel-sp@<savedTick>-<n>` -- the derived-id scheme itself (section 5C).
+ *  Named by the tick it forked from so two branches born at different
+ *  points are distinguishable at a glance in `listGames()`'s output; `n`
+ *  breaks ties within the same tick. */
+function deriveGameId(atTick: number): string {
+  return `${GAME_ID_PREFIX}@${atTick}-${deriveSeq++}`;
+}
+
+/**
+ * Point every "currently active save" binding at a new game id: flush
+ * whatever the OLD pump still has queued (so no in-flight command is lost
+ * -- the WAL guarantee extends across an id switch, not just within one
+ * id's lifetime), then swap `gameId`/`pump`/`gameReady` together as one
+ * atomic-looking step. Shared by quickLoad's id-switch and recoverOnBoot's
+ * (both "start writing new commands under a different, already-populated
+ * game record" -- the audit-save id-switch section 5C also names will use
+ * this same helper once econ.audit gains a host-side save hook; not wired
+ * to that event in THIS lane, see the report). */
+async function switchLiveGame(id: string, record: Promise<unknown>): Promise<void> {
+  await pump.flush();
+  gameId = id;
+  pump = createSavePump({ store, gameId, snapshotEveryTicks: 2000 });
+  gameReady = record;
+}
 
 // F5/F9 quick-save/quick-load state (docs/PHASE-H1.md open question 6):
 // this app rebuilds the sim IN PLACE rather than reloading the page or
@@ -130,24 +212,31 @@ const pump = createSavePump({ store, gameId: GAME_ID, snapshotEveryTicks: 2000 }
 //      closure below (controller, hook, host, tickSim) keeps working
 //      unmodified -- no teardown/re-wire step, no lost commandLog.
 // The "quick load reverts to the F5 point, discarding the walk since" part
-// (the whole point of a quicksave) rides on exportSave/importSave
+// (the whole point of a quicksave) rides on exportSave/importSaveAs
 // (B8's bug-report-replay tool, repurposed as a save "slot"): F5 captures
-// the store's FULL command log for GAME_ID as of that instant into an
-// in-memory JSON string. Commands submitted after F5 keep landing in
-// GAME_ID's own continuously-growing log (autosave keeps working normally),
-// but F9 imports the captured JSON as a BRAND NEW game id (importSave never
-// reuses an id) whose command log ends exactly at the F5 tick -- so
-// recoverSim on that fresh id reconstructs precisely the F5 state, not
-// whatever GAME_ID has grown to since.
+// the CURRENT live game's FULL command log as of that instant into an
+// in-memory JSON string. Commands submitted after F5 keep landing in that
+// same id's continuously-growing log (autosave keeps working normally) --
+// but per section 5C's quick-load id semantics, F9 no longer just imports
+// into a throwaway id and discards it: it imports as a fresh DERIVED id
+// (`deriveGameId`, `hotel-sp@<savedTick>-<n>`) whose command log ends
+// exactly at the F5 tick, AND makes that derived id the new live `gameId`
+// (`switchLiveGame`) -- so every command submitted from this point on
+// lands under the branch F9 actually reverted to, not interleaved into the
+// abandoned branch's still-growing log. The abandoned branch's own record
+// is never truncated or deleted (section 5C: "the abandoned branch's
+// records are what make a save a bug report") -- it simply stops being the
+// live id.
 let savedJson: string | undefined;
 let savedTick: number | undefined;
 let savedHash: number | undefined;
 let restoredHash: number | undefined;
 // Guards tickSim (below) against advancing the live sim while a quick-load
-// is mid-flight -- the load is async (recoverSim awaits the store) and the
-// render loop's fixed-tick accumulator is not, so without this a tick could
-// step a half-restored world (docs/PHASE-H1.md risk 3's class of bug,
-// applied to the load path instead of the save path).
+// (or boot recovery, see recoverOnBoot below) is mid-flight -- the load is
+// async (recoverSim awaits the store) and the render loop's fixed-tick
+// accumulator is not, so without this a tick could step a half-restored
+// world (docs/PHASE-H1.md risk 3's class of bug, applied to the load path
+// instead of the save path).
 let loadInFlight = false;
 
 async function quickSave(): Promise<void> {
@@ -168,19 +257,24 @@ async function quickSave(): Promise<void> {
   savedTick = sim.tick;
   savedHash = snapshot.stateHash;
   await pump.flush();
-  await store.saveSnapshot(GAME_ID, snapshot);
-  savedJson = await exportSave(store, GAME_ID);
+  await store.saveSnapshot(gameId, snapshot);
+  savedJson = await exportSave(store, gameId);
 }
 
 async function quickLoad(): Promise<void> {
   if (!savedJson) return; // F9 before any F5: a deliberate no-op (see the scenario's non-vacuous guard).
   loadInFlight = true;
   try {
-    const loadedGameId = await importSave(store, savedJson);
-    const { sim: loaded } = await recoverSim(store, loadedGameId, setup);
+    const forkedFromTick = savedTick ?? sim.tick;
+    const loadedGameId = await importSaveAs(savedJson, deriveGameId(forkedFromTick));
+    const { sim: loaded, record } = await recoverSim(store, loadedGameId, setup);
     sim.restore(loaded.snapshot());
     resetEntityKeyedHostState();
     restoredHash = sim.stateHash();
+    // The id-switch: from this point on, quickSave/the pump/autosave all
+    // write under the branch F9 just reverted to, per the doc comment
+    // above.
+    await switchLiveGame(loadedGameId, Promise.resolve(record));
     // Carries {savedTick, savedHash, restoredHash} into sim-visible (and
     // therefore replay-visible) state -- see saveRestoreDebugCommand's doc
     // comment. Uses hook.submit (not a raw sim.submit) so it is also
@@ -191,6 +285,73 @@ async function quickLoad(): Promise<void> {
     loadInFlight = false;
   }
 }
+
+/**
+ * Load-on-boot (docs/PHASE-H2.md section 5C, deferral row 1 and gate 8):
+ * recovers the most recently played game via `listGames()` +
+ * `recoverSim`, instead of always starting fresh at a fixed id. Runs
+ * against the `sim` object that has ALREADY had `setup(sim)` called on it
+ * synchronously above (so rendering/controls/etc. can start immediately
+ * without blocking on IndexedDB) -- if a save is found, this rebuilds the
+ * target state via `recoverSim` against a throwaway sim exactly like
+ * `quickLoad` does, then applies it to the SAME live `sim` in place via
+ * `sim.restore()`. Same reasoning as quickLoad's doc comment above for why
+ * in-place rather than a fresh Sim/page reload; `loadInFlight` (shared with
+ * quickLoad) covers the async gap here too.
+ *
+ * RestoreError handling (open question 8): `Sim.restore()` throws
+ * `RestoreError` on a v:1 snapshot or a forkRng label mismatch --
+ * docs/PHASE-H2.md's non-goals are explicit that an H1-shaped save fails
+ * this check BY DESIGN (this app's `setup()` has grown new forkRng streams
+ * since H1; policy, not a bug). CHOICE MADE HERE: silent fresh start, not a
+ * diegetic notice. Reasoning: (1) the fresh `sim` this function inherits is
+ * already fully playable the instant this catch fires -- there is no
+ * broken or half-loaded state to explain to the player, only an absent
+ * one, which is exactly what a brand-new game looks like anyway; (2) a
+ * diegetic in-world notice is new player-visible UI, which CLAUDE.md's
+ * working conventions require to go through the i18n `t()` table -- that
+ * table, and any screen/HUD surface to host the string, live outside this
+ * lane's file scope (apps/hotel/src/main.ts and this scenario only), so
+ * building it here would mean either a scope violation or an un-i18n'd
+ * string shipped against house style. If a future lane wants the notice,
+ * this is the one call site to add it at.
+ */
+async function recoverOnBoot(): Promise<void> {
+  loadInFlight = true;
+  try {
+    const games = await store.listGames();
+    if (games.length === 0) return; // Nothing saved yet -- the fresh sim already running is correct.
+    // listGames()'s ordering contract (packages/persistence/src/store.ts):
+    // newest-first by createdAt, ties broken by id ascending -- games[0] is
+    // "the most recent game" without any further sorting here.
+    const mostRecent = games[0];
+    try {
+      const { sim: loaded, record } = await recoverSim(store, mostRecent.id, setup);
+      sim.restore(loaded.snapshot());
+      resetEntityKeyedHostState();
+      restoredHash = sim.stateHash();
+      await switchLiveGame(record.id, Promise.resolve(record));
+      // Same replay-visible marker quickLoad submits (see its doc comment):
+      // a host-only hash comparison living only in this closure is
+      // invisible to a headless replay of the captured command log, so the
+      // fact of a successful boot recovery — and the hashes involved — has
+      // to ride into sim state as a command, exactly like F9's does. This
+      // is also how the save-resume gate's F6 test trigger (see the "F6"
+      // keydown handler below) makes a boot-path recovery assertable at
+      // all without a real page navigation destroying the harness's replay
+      // bundle.
+      hook.submit(saveRestoreDebugCommand(sim.tick + 1, savedTick ?? -1, savedHash ?? -1, restoredHash));
+    } catch (err) {
+      if (!(err instanceof RestoreError)) throw err; // Anything else (a store/IDB fault) is a real bug -- surface it.
+      // Silent fresh start (see the doc comment above) -- the sim already
+      // running under the boot-time `gameId`/`gameReady` stays exactly as
+      // it is; nothing left to do.
+    }
+  } finally {
+    loadInFlight = false;
+  }
+}
+void recoverOnBoot();
 
 // Re-derive the same pure GroundFloor from the seed for meshes. Deliberately
 // NOT reusing a game.ts closure across the module boundary — main.ts calls
@@ -486,6 +647,30 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.code === "F9") {
     e.preventDefault();
     void quickLoad();
+    return;
+  }
+  // F6: the save-resume gate's test-only trigger for "reload the page and
+  // let the boot path recover" (docs/PHASE-H2.md gate 8). A REAL reload
+  // cannot be used to drive this from the harness: installTestHook's
+  // commandLog() (packages/renderer-three/src/test-hook.ts) is a plain
+  // in-memory array scoped to one page load, and runBrowserMode reads it
+  // exactly ONCE, at the end of the whole run, to build the replay bundle
+  // (packages/harness/src/browser.ts) -- a real navigation would silently
+  // truncate that bundle to whatever ran after the reload, exactly the
+  // failure mode this app's quickLoad() doc comment above already explains
+  // for F9, generalized to boot itself. F6 sidesteps it the same way
+  // quickLoad does: it re-invokes `recoverOnBoot()`, the EXACT function a
+  // real page load calls once at module init, in place, against the SAME
+  // live `sim` -- so the gate exercises the real boot-recovery code path
+  // (listGames() -> recoverSim() -> sim.restore() ->
+  // resetEntityKeyedHostState()) byte-for-byte, without ever discarding
+  // the command log a sound --verify-replay depends on. Not reachable
+  // outside a harness-driven session in any way that matters: a real
+  // player has no reason to press F6, and pressing it is harmless (it just
+  // re-recovers whatever the store's most recent game already is).
+  if (e.code === "F6") {
+    e.preventDefault();
+    void recoverOnBoot();
     return;
   }
   if (!focusedScreen) return;

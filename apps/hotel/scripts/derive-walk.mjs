@@ -49,6 +49,7 @@
  * computes enters the sim — its output is committed literals in a scenario
  * file, and the scenario's own run is what the harness verifies.
  */
+import { readFileSync } from "node:fs";
 import { Sim } from "@claude-engine/core";
 import { CELL, CELL_SIZE_MM, cellAt, cellOfMm } from "@claude-engine/space";
 // The hotel's OWN clearance-aware A*, not `space`'s raw `findPathCells`.
@@ -58,7 +59,7 @@ import { CELL, CELL_SIZE_MM, cellAt, cellOfMm } from "@claude-engine/space";
 // punished exactly as predicted — A* returned a route down a column a
 // 300mm-radius player cannot occupy, the follower drove into it, and the
 // stall looked like a follower bug for two rounds of debugging.
-import { findJitteredPath, buildOpenCellSet, makeIsOpen } from "../dist-game/sim/nav.js";
+import { findJitteredPath, buildOpenCellSet, makeIsOpen, isOccupiable as isOccupiableCell } from "../dist-game/sim/nav.js";
 import {
   setup,
   setupNamed,
@@ -92,6 +93,13 @@ const MAX_TICKS = Number(opt("max-ticks", 200));
 const START_TICK = Number(opt("start-tick", 0));
 const TARGET_HEIGHT_M = Number(opt("target-height-m", 1.0));
 const AS_JSON = flag("json");
+/** A JSON file holding an already-derived script (the `script` array from a
+ *  previous run). It is replayed first and the new derivation starts from
+ *  the pose it leaves behind — so a multi-leg gate ("walk to the mess, wipe
+ *  it, walk back and interview a candidate") is derived leg by leg instead
+ *  of as one intractable route. The emitted script contains ONLY the new
+ *  leg; concatenate them in the scenario file. */
+const AFTER = opt("after", "");
 
 if (!TO) {
   console.error("derive-walk: --to <xMm,zMm | mess:0 | candidate:0 | prop:0 | document:0> is required");
@@ -119,12 +127,31 @@ const cellCenter = (c) => ({
   zMm: c.cz * CELL_SIZE_MM + CELL_SIZE_MM / 2,
 });
 
+const prefix = AFTER ? JSON.parse(readFileSync(AFTER, "utf-8")) : [];
+
+/** Build the world and advance it to this derivation's starting point:
+ *  `--start-tick` bare ticks, then `--after`'s script replayed verbatim.
+ *  Both the planning sim and the verification sim go through this, so the
+ *  two can never disagree about where the leg begins. */
 function makeSim() {
   const sim = new Sim(SEED, { eventRetentionTicks: 60000 });
   if (CONFIG) setupNamed(sim, CONFIG);
   else setup(sim);
-  for (let t = 0; t < START_TICK; t++) sim.step();
-  return sim;
+  let yaw = 0;
+  let held = false;
+  const prefixLast = prefix.reduce((m, st) => Math.max(m, st.atTick ?? st.upAtTick ?? 0), -1);
+  const until = Math.max(START_TICK - 1, prefixLast);
+  for (let t = 0; t <= until; t++) {
+    for (const step of prefix) {
+      if (step.pointer === "look" && step.atTick === t) yaw = wrap(yaw + step.dx * MDEG_PER_PX);
+      if (step.key && step.downAtTick === t) held = true;
+      if (step.key && step.upAtTick === t) held = false;
+    }
+    sim.submit(faceCommand(t + 1, yaw));
+    if (held) sim.submit(moveCommand(t + 1, 1000, 0));
+    sim.step();
+  }
+  return { sim, yaw };
 }
 const playerPos = (sim) => sim.getComponent(PLAYER_ENTITY, "pos");
 
@@ -189,7 +216,7 @@ function losClearForRadius(grid, from, to, radiusMm, isOpen) {
 }
 
 // -- 1. plan ---------------------------------------------------------------
-const planSim = makeSim();
+const { sim: planSim, yaw: entryYaw } = makeSim();
 const floor = loadGroundFloor(SEED);
 const grid = floor.grid;
 const target = resolveTarget(planSim);
@@ -212,15 +239,49 @@ const isDoorCell = (c) => (cellAt(grid, c.cx, c.cz) & CELL.DOOR) !== 0;
 
 const startCell = cellOfMm(grid, playerPos(planSim).xMm, playerPos(planSim).zMm);
 const goalCell = cellOfMm(grid, target.xMm, target.zMm);
+/**
+ * The cell to actually route TO.
+ *
+ * A target is usually a thing to stand NEXT to, not on: a mess lies against
+ * a bedroom wall, and its own cell routinely fails `isOccupiable`'s
+ * clearance test for a 300mm collider. Handing that cell to A* returns null
+ * and the tool reports "no path" for a target the player can obviously walk
+ * up to — which is what it did for both of `art-lock`'s messes before this.
+ * So: if the goal cell is not occupiable, walk out in rings and take the
+ * nearest cell that is, deterministically (lower cz*width+cx wins a tie).
+ * `--stop-mm` then does the rest, and the range/arc check at the end is
+ * what decides whether the resulting pose is actually good enough.
+ */
+function routableGoal(cell) {
+  if (isOccupiableCell(grid, cell.cx, cell.cz, isOpen)) return cell;
+  for (let r = 1; r <= 6; r++) {
+    const ring = [];
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+        const c = { cx: cell.cx + dx, cz: cell.cz + dz };
+        if (isOccupiableCell(grid, c.cx, c.cz, isOpen)) ring.push(c);
+      }
+    }
+    ring.sort((a, b) => a.cz * grid.width + a.cx - (b.cz * grid.width + b.cx));
+    if (ring[0]) return ring[0];
+  }
+  return cell;
+}
+const routeGoal = routableGoal(goalCell);
+
 const path = findJitteredPath(
   grid,
   { cx: startCell.cx, cz: startCell.cz },
-  { cx: goalCell.cx, cz: goalCell.cz },
+  { cx: routeGoal.cx, cz: routeGoal.cz },
   isOpen,
   0,
 );
 if (!path) {
-  console.error(`derive-walk: no path from (${startCell.cx},${startCell.cz}) to (${goalCell.cx},${goalCell.cz}).`);
+  console.error(
+    `derive-walk: no path from (${startCell.cx},${startCell.cz}) to (${routeGoal.cx},${routeGoal.cz})` +
+      `${routeGoal.cx === goalCell.cx && routeGoal.cz === goalCell.cz ? "" : ` (nearest occupiable cell to the target's own (${goalCell.cx},${goalCell.cz}))`}.`
+  );
   process.exit(1);
 }
 
@@ -276,13 +337,14 @@ const LOOK_EMIT_THRESHOLD_MDEG = 2000;
 const ARRIVE_MM = 120;
 
 const script = [];
-let camYaw = 0;
+let camYaw = entryYaw;
 let walkStart = null;
 let runIdx = 0;
 const trace = [];
 let stalled = false;
 
-for (let t = START_TICK; t < START_TICK + MAX_TICKS; t++) {
+const walkFrom = planSim.tick;
+for (let t = walkFrom; t < walkFrom + MAX_TICKS; t++) {
   const p = playerPos(planSim);
   trace.push({ tick: t, xMm: p.xMm, zMm: p.zMm, camYaw });
 
@@ -351,11 +413,11 @@ if (finalDx !== 0) {
 // follower did that the emitted script does not reproduce shows up here as a
 // different final pose.
 function replay(emitted) {
-  const sim = makeSim();
-  let yaw = 0;
+  const { sim, yaw: entry } = makeSim();
+  let yaw = entry;
   let held = false;
   const last = emitted.reduce((m, s) => Math.max(m, s.atTick ?? s.upAtTick ?? 0), 0);
-  for (let t = START_TICK; t <= last; t++) {
+  for (let t = sim.tick; t <= last; t++) {
     for (const step of emitted) {
       if (step.pointer === "look" && step.atTick === t) yaw = wrap(yaw + step.dx * MDEG_PER_PX);
       if (step.key && step.downAtTick === t) held = true;

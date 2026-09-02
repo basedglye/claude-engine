@@ -2,8 +2,7 @@ import * as THREE from "three";
 import { Sim, type EntityId, type IWorld } from "@claude-engine/core";
 import { createThreeHost, installTestHook, type SceneContext, type ScreenRect } from "@claude-engine/renderer-three";
 import { SCREEN_W } from "@claude-engine/surface-ui";
-import { toBufferGeometry } from "@claude-engine/assets/web";
-import { generateDoorMesh, type GroundFloor, type DoorSpec } from "@claude-engine/interiors";
+import type { GroundFloor, DoorSpec } from "@claude-engine/interiors";
 import { createFpsController } from "@claude-engine/player-fps";
 import { webStore, createSavePump, exportSave, importSave } from "@claude-engine/save-web";
 // Deep import, not the package barrel: @claude-engine/persistence's index.ts
@@ -38,9 +37,23 @@ import { syncCharacter, pruneCharacters } from "./render/characters.js";
 import { syncUpkeepObjects } from "./render/upkeep.js";
 import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
 import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from "./render/screens.js";
+// -- The "real hotel" look (apps/hotel/docs/decisions/2026-09-02-real-hotel-look.md):
+//    host-side only; every module degrades to flat colours when the CC0
+//    payload is not fetched, and none of it touches sim state.
+import { buildArchitecture } from "./render/architecture.js";
+import { buildExterior } from "./render/exterior.js";
+import { createDoorLeaf } from "./render/door-leaf.js";
+import { configureRenderer, buildLighting, type LightingRig } from "./render/lighting.js";
+import { buildFixtures } from "./render/fixtures.js";
+import { buildDecor } from "./render/decor.js";
+import { createHud, type HudState } from "./render/hud.js";
+import { assetStatus } from "./render/assets.js";
+import type { InteractableKind, Interactable } from "./sim/components.js";
 
-const canvas = document.querySelector<HTMLCanvasElement>("#app");
-if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
+const canvasEl = document.querySelector<HTMLCanvasElement>("#app");
+if (!canvasEl) throw new Error("apps/hotel: missing #app canvas in index.html");
+// Non-null binding so closures below keep the narrowing (TS18047 otherwise).
+const canvas: HTMLCanvasElement = canvasEl;
 
 // Seed must match scenarios/fps-look-interact.scenario.mjs's declared seed
 // (docs/PHASE-H0.md exit criterion 1: "seed hotel-h0-look-1"). A browser
@@ -195,6 +208,28 @@ const controller = createFpsController({
     uvToPixel: (u, v) => focusedScreen?.surface.uvToPixel(u, v),
     makeScreenClick: (tick, px, py) => screenClickCommand(tick, px, py),
   },
+});
+
+// -- HUD (render/hud.ts): entry overlay, reticle and interaction prompt.
+//    Pure DOM with pointer-events:none, hidden entirely while a terminal is
+//    focused so the readability probe never sees it. `locked` and
+//    `thirdPerson` are mirrored here because FpsController exposes neither;
+//    the mirrors are presentation-only and never reach the sim. --
+const hud = createHud();
+let thirdPersonMirror = false;
+/** The controller's own notion of "locked" (real pointer lock OR the
+ *  harness's synthetic lock — both go through applyLockChange and land in
+ *  the input trace), so the HUD agrees with what movement is gated on. */
+function controllerLocked(): boolean {
+  const trace = controller.inputTrace();
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const entry = trace[i];
+    if (entry && entry.kind === "lock") return entry.locked;
+  }
+  return false;
+}
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyV" && !e.repeat) thirdPersonMirror = !thirdPersonMirror;
 });
 
 // Opt-in start barrier (phase-H0 round-2 review, blocking item 1): only
@@ -469,8 +504,16 @@ function findFocusedTerminal(world: IWorld): EntityId | undefined {
   return undefined;
 }
 
+let lightingRig: LightingRig | undefined;
+
 const host = createThreeHost(sim, {
   canvas,
+  // The lighting rig in render/lighting.ts replaces three-host's default
+  // ambient + sun; the renderer gets shadows and filmic tone mapping.
+  defaultLights: false,
+  onRendererCreated(renderer) {
+    configureRenderer(renderer);
+  },
   stepSim: tickSim,
   submit: (command) => hook.submit(command),
   pointerHandlers: controller.pointerHandlers,
@@ -534,13 +577,40 @@ const host = createThreeHost(sim, {
       focusedScreen = undefined;
       focusEase = 0;
     }
+
+    // HUD state, derived entirely from host-side facts already known here.
+    const pointerLocked = controllerLocked();
+    const targetEntity = pointerLocked && !focusedScreen ? controller.currentTarget() : undefined;
+    const targetKind: InteractableKind | undefined =
+      targetEntity !== undefined ? world.getComponent<Interactable>(targetEntity, "interactable")?.kind : undefined;
+    const hudState: HudState = {
+      phase: focusedScreen ? "focused" : pointerLocked ? "playing" : assetStatus.pending > 0 ? "loading" : "entry",
+      locked: pointerLocked,
+      thirdPerson: thirdPersonMirror,
+      target: targetKind,
+      loading: {
+        pending: assetStatus.pending,
+        ok: assetStatus.texturesOk + assetStatus.modelsOk,
+        missing: assetStatus.texturesMissing + assetStatus.modelsMissing,
+        manifest: assetStatus.manifest,
+      },
+    };
+    hud.update(hudState);
   },
   syncScene(ctx: SceneContext, world: IWorld, alpha: number) {
-    ctx.scenery("floor-mesh", () => {
-      const geometry = toBufferGeometry(floor.mesh);
-      const material = new THREE.MeshStandardMaterial({ vertexColors: true });
-      return new THREE.Mesh(geometry, material);
+    // The building: architecture (walls/floors/trim/desk from the same grid
+    // the sim collides against), the street outside, light fixtures and
+    // static decor. Built once; textures and glTF models upgrade in place.
+    ctx.scenery("hotel", () => {
+      const g = new THREE.Group();
+      g.add(buildArchitecture(floor));
+      g.add(buildExterior(floor));
+      g.add(buildFixtures(floor));
+      g.add(buildDecor(floor));
+      return g;
     });
+    if (!lightingRig) lightingRig = buildLighting(floor, ctx.scene, ctx.renderer);
+    lightingRig.update(world, performance.now());
 
     terminalScreens = syncTerminalScreens(ctx, world, controller.registerInteractable);
 
@@ -552,15 +622,11 @@ const host = createThreeHost(sim, {
 
       let group = doorGroups.get(entity);
       if (!group) {
-        const doorMesh = generateDoorMesh(spec);
-        const geometry = toBufferGeometry(doorMesh);
-        const material = new THREE.MeshStandardMaterial({ vertexColors: true });
-        const mesh = new THREE.Mesh(geometry, material);
-        // generateDoorMesh already positions the panel in world space
-        // (docs/PHASE-H0.md's door mesh is centered on the door cell), so
-        // pivot the group at the door center and offset the mesh by the
-        // inverse to rotate around that hinge point rather than the scene
-        // origin.
+        // createDoorLeaf positions the leaf in world space exactly like
+        // interiors' generateDoorMesh did (centered on the door span), so
+        // the same pivot trick applies: group at the door center, leaf
+        // offset by the inverse, rotate the group to swing on the hinge.
+        const mesh = createDoorLeaf(spec, { entrance: spec.doorIndex === floor.entranceDoorIndex });
         group = new THREE.Group();
         group.position.set(spec.xMm / 1000, 0, spec.zMm / 1000);
         mesh.position.set(-spec.xMm / 1000, 0, -spec.zMm / 1000);

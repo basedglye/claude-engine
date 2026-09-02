@@ -2,7 +2,7 @@ import tseslint from 'typescript-eslint';
 
 export default [
   {
-    ignores: ['**/dist/**', '**/dist-game/**', '**/dist-server/**', '**/node_modules/**', '**/vite.config.ts'],
+    ignores: ['**/dist/**', '**/dist-game/**', '**/dist-server/**', '**/node_modules/**', '**/vite.config.ts', 'apps/hotel/dev/**', 'artifacts/**', 'apps/hotel/public/**'],
   },
   ...tseslint.configs.recommended,
   {

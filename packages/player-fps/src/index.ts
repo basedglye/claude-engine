@@ -207,7 +207,15 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
   // -- Real DOM-facing normalization (no logic beyond unwrapping events) --
 
   function onLook(dxPx: number, dyPx: number): void {
-    applyLook(dxPx, dyPx);
+    // Screen-space -> yaw-space handedness. A positive sim yaw delta is a
+    // LEFT turn (heading (sin yaw, cos yaw) in a right-handed Y-up world
+    // rotates from +Z toward +X, which is on the left when facing +Z), while
+    // a positive `movementX` is the mouse moving RIGHT. Negate here, in the
+    // DOM normalizer, so a real mouse turns the way every FPS does; the
+    // synthetic `pointer.look(dx)` keeps its yaw-space meaning and every
+    // browser gate's hand-derived look script stays valid. Reported by a
+    // human driving the build, 2026-09-02 ("move mouse left, look right").
+    applyLook(-dxPx, dyPx);
   }
   function onClick(): void {
     applyClick();

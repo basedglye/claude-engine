@@ -10,14 +10,15 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @claude-engine/core && npm run build --workspace @claude-engine/space && npm run build --workspace @claude-engine/assets && npm run build --workspace @claude-engine/interiors && npm run build --workspace @claude-engine/surface-ui && npm run build --workspaces --if-present",
-    "test": "node scripts/smoke.mjs",
+    "test": "node scripts/check-workspace.mjs && node scripts/smoke.mjs",
     "harness": "npm run start --workspace @claude-engine/harness --",
     "assets:import": "npm run start --workspace @claude-engine/asset-pipeline --",
     "scaffold": "node scripts/scaffold.mjs",
     "check:plugin": "node scripts/check-plugin.mjs",
     "lint": "eslint .",
     "check:purity": "node scripts/check-purity.mjs",
-    "check:goldens": "node scripts/golden-sweep.mjs"
+    "check:workspace": "node scripts/check-workspace.mjs",
+    "check:goldens": "node scripts/check-workspace.mjs && node scripts/golden-sweep.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

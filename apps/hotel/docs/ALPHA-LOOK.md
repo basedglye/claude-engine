@@ -80,3 +80,13 @@ posable camera — the fastest way to look at anything.
 - No `monitor-crt` or `radiator` models exist in the pack; both use procedural fallbacks.
 - `hotel-phase-2b` (the PS1 track) also edits `main.ts`, `three-host.ts` and `player-fps`; expect a merge to need a hand-resolved `main.ts`.
 - No blind skeptic pass was run on this branch (the five-subagent cap was spent on the build lanes); the gate verdicts above are the verification.
+
+## Direction note (Christian, 2026-09-02, after seeing this look)
+
+The aesthetic is approved, but the **starting** hotel should be run down — a
+Motel 6: stained carpet, flat paint, fluorescent tubes, laminate desk,
+mismatched furniture, a buzzing VACANCY sign. What this branch renders is
+the *upgraded* tier. Next step for this track: a host-side condition/tier
+input to `architecture`, `decor`, `lighting` and `fixtures`, read from sim
+state (stars / PURCHASE presets, never written by the renderer), so the
+hotel visibly earns its grandeur and every golden stays byte-identical.

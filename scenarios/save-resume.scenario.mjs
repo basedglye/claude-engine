@@ -176,17 +176,20 @@ const F6_TICK = 55;
 // queue-head reasoning above) has had time to be up and walking toward
 // its queue spot.
 const WALK_START_TICK = 700;
-const LOOK_1_DX = -450;
+const LOOK_1_DX = -463;
 const WALK_TICKS_START = 700;
-const WALK_TICKS_END = 719;
-const LOOK_2_DX = 78;
+const WALK_TICKS_END = 724;
+const LOOK_2_DX = -320;
 // derive-walk's suggested pitch-down onto the target, tuned against the
 // real browser build (see the header comment's derivation note).
-const LOOK_2_DY = 41;
+const LOOK_2_DY = 207;
+/** The final turn onto the head slot, derived as its own leg. */
+const AIM_DX = 746;
+const AIM_TICK = 725;
 // A few ticks of settle margin past derive-walk's reported arrival (720)
 // before clicking, so the player has actually reached the reported pose
 // rather than clicking mid-step.
-const INTERACT_TICK = 724;
+const INTERACT_TICK = 728;
 
 // F6_TICK + 500, the exit criterion's "continue 500+ ticks through fresh
 // guest spawns" -- comfortably cleared by SETTLE_TICK below (900), which
@@ -266,9 +269,29 @@ export default {
       { pointer: "lock", atTick: 0 },
       { key: "F5", downAtTick: F5_TICK, upAtTick: F5_TICK },
       { key: "F6", downAtTick: F6_TICK, upAtTick: F6_TICK },
+      // APPROACH FROM NORTH OF THE QUEUE, NOT ALONG IT.
+      //
+      // The first derivation walked to 1011mm from the queue head and the
+      // sim agreed the pose was legal (range OK, arc OK) -- but the click
+      // never resolved to the head guest. The reason was only visible by
+      // dumping the world at the click tick: EIGHT guests were queued in a
+      // row along z=2625 from x=625 to x=2375, and the player was standing
+      // at x=1632 -- inside the line, 89mm from the guest in slot 4. The
+      // reticle hit the nearest queued guest, and `interactSystem`
+      // correctly refused it, because presenting requires queueIndex === 0.
+      // A gate aimed down the length of a queue is aimed at the wrong
+      // person by construction.
+      //
+      // So the walk now goes to the open lobby NORTH of the queue row and
+      // looks SOUTH at the head slot, where the sight line crosses no other
+      // slot. Derived with apps/hotel/scripts/derive-walk.mjs in two legs
+      // (--to 625,1625 then --to 625,2625 --after), measured: arrives tick
+      // 725 at (695,2141), 489mm from the head slot, bearing error 90 mdeg,
+      // range OK / arc OK, suggested pitch 53px.
       { pointer: "look", atTick: WALK_START_TICK, dx: LOOK_1_DX, dy: 0 },
       { key: "KeyW", downAtTick: WALK_TICKS_START, upAtTick: WALK_TICKS_END },
-      { pointer: "look", atTick: WALK_TICKS_END, dx: LOOK_2_DX, dy: LOOK_2_DY },
+      { pointer: "look", atTick: WALK_TICKS_END, dx: LOOK_2_DX, dy: 0 },
+      { pointer: "look", atTick: AIM_TICK, dx: AIM_DX, dy: LOOK_2_DY },
       { pointer: "click", atTick: INTERACT_TICK },
     ],
     screenshotAtTicks: [INTERACT_TICK, SETTLE_TICK],

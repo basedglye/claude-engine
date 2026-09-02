@@ -8,35 +8,54 @@
  * adapter: bytes in, texture out, with the filtering settings that make or
  * break the look.
  *
- * FILTERING IS NOT A DETAIL. `NearestFilter` on both min and mag, and NO
- * mipmaps, is the whole point:
- *   - magnification: bilinear would smooth the 32-colour dithered tiles
- *     into mush and throw away the Bayer pattern that gives the surfaces
- *     their texture at distance;
- *   - minification: mip filtering is precisely what H1b measured collapsing
- *     the screen's calibration contrast from 241 to 41. The screen quad has
- *     its own texture, but the same physics applies to a dithered atlas —
- *     mips average a dither pattern into flat grey, which is the exact
- *     opposite of the intended look.
- * `generateMipmaps: false` also keeps the upload cheap and the memory flat.
+ * FILTERING IS NOT A DETAIL, AND H2b GOT IT WRONG TWICE.
+ *   - magnification stays NearestFilter: up close, bilinear smooths the
+ *     32-colour tiles into mush and throws away the hard pixel edges the
+ *     look rests on.
+ *   - minification MIPMAPS, reversing H2b's original choice. See the
+ *     comment on `minFilter` below for the measurement that forced it.
+ * Anisotropy was tried and removed: it fixed grazing angles but cost
+ * 50-90ms of p95 under the harness's software rasteriser, which is most of
+ * the `art-lock` frame-time budget for a case mipmapping already mostly
+ * handles.
  */
 import * as THREE from "three";
-import { synthesizeAtlas, ATLAS_SIZE_PX, type AtlasData } from "@claude-engine/interiors";
+import { synthesizeAtlas, ATLAS_SIZE_PX, type AtlasData, type AtlasRegion } from "@claude-engine/interiors";
 
 /** Cache keyed by seed: the atlas is a pure function of it, and the host
  *  asks for it from more than one place (the floor mesh, and any future
  *  atlas-textured prop). Re-synthesizing 4 MB of pixels per call would be
  *  wasteful, and re-uploading a second identical texture doubly so. */
 const textureBySeed = new Map<string, THREE.DataTexture>();
+const regionsBySeed = new Map<string, Record<string, AtlasRegion>>();
 
 export function atlasTextureFor(seed: string): THREE.DataTexture {
   const cached = textureBySeed.get(seed);
   if (cached) return cached;
   const atlas: AtlasData = synthesizeAtlas(seed);
   const texture = new THREE.DataTexture(atlas.pixels, atlas.sizePx, atlas.sizePx, THREE.RGBAFormat);
+  // MAGNIFICATION stays NearestFilter: up close, bilinear would smooth the
+  // 32-colour tiles into mush and throw away the hard pixel edges the whole
+  // look rests on.
   texture.magFilter = THREE.NearestFilter;
-  texture.minFilter = THREE.NearestFilter;
-  texture.generateMipmaps = false;
+  // MINIFICATION now mipmaps, and this reverses the original H2b choice on
+  // purpose. Nearest minification point-samples one texel per fragment, so a
+  // surface seen at distance or at a grazing angle aliases hard -- and the
+  // PS1 vertex jitter re-snaps every vertex each frame, which makes that
+  // aliasing CRAWL. Driving the build with jitter on and off is what
+  // isolated it: the surfaces are legible with the bake alone and dissolve
+  // into swimming static the moment jitter is enabled. The two features were
+  // fighting, and the texture lost.
+  //
+  // The original argument for no mips ("mips average a dither pattern into
+  // flat grey") was correct about the OLD atlas, whose entire signal was
+  // high-frequency 4x4 Bayer noise. It does not hold for this one: the
+  // dominant signal is now the seam grid at 0.5m/1m real-world period, which
+  // is exactly the low-frequency content mipmapping preserves. What the mips
+  // average away is the noise that was never legible at that distance
+  // anyway.
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.generateMipmaps = true;
   // The mesh's UVs are already wrapped into each material's own atlas
   // region by interiors' UV emission, so nothing should ever sample outside
   // [0,1]; clamping rather than repeating means a UV bug shows up as a
@@ -62,3 +81,14 @@ export function atlasTextureFor(seed: string): THREE.DataTexture {
 }
 
 export { ATLAS_SIZE_PX };
+
+/** The atlas sub-rect for one material id, for callers that generate their
+ *  own geometry and need to UV into the shared atlas (door panels). Shares
+ *  the per-seed cache above, so this never re-synthesizes. */
+export function atlasRegionFor(seed: string, materialId: string): AtlasRegion | undefined {
+  const cached = regionsBySeed.get(seed);
+  if (cached) return cached[materialId];
+  const atlas = synthesizeAtlas(seed);
+  regionsBySeed.set(seed, atlas.regions);
+  return atlas.regions[materialId];
+}

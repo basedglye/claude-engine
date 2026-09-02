@@ -127,11 +127,17 @@ const SEAM_WIDTH_PX = 2;
  *  buys a legible edge inside the same palette budget. */
 const SHADES_PER_MATERIAL = 3;
 
-/** Lightness offsets from baseL for [seam, field-dark, field-light]. The
- *  seam is a real step down (not a -0.08 nudge) so it survives both
- *  minification and the bake's brightest multiplier; the two field shades
- *  stay close so the dither reads as texture rather than as stripes. */
-const SHADE_OFFSETS: readonly number[] = [-0.2, -0.045, 0.055];
+/** Lightness offsets from baseL for [seam, field-dark, field-light].
+ *
+ *  The seam is a real step down (not a -0.08 nudge) so it survives both
+ *  minification and the bake's brightest multiplier. The two FIELD shades
+ *  are deliberately very close: at 64 px/m a wall two metres away is
+ *  magnified, so every dithered texel is several screen pixels and any real
+ *  contrast between the field shades reads as SPECKLE, not as texture. The
+ *  first pass used +/-0.05 and the walls came out looking like static.
+ *  Keeping the field delta at ~0.045 lets the dither survive as a faint
+ *  tooth while the seam grid carries the actual legibility. */
+const SHADE_OFFSETS: readonly number[] = [-0.2, -0.02, 0.025];
 
 /** Packed RGB (u0..255 each channel) for tiles the atlas allocates but no
  *  material claims (64 slots vs. 10 materials). One shared colour, so it
@@ -314,7 +320,7 @@ export function synthesizeAtlas(seed: string): AtlasData {
           // Field: value noise dithered between the two FIELD shades (1..2).
           // A coarse checker at the seam period breaks up neighbouring tiles
           // so a large floor does not read as one repeated stamp.
-          const noise = valueNoise(matSeed, lx, ly, 24);
+          const noise = valueNoise(matSeed, lx, ly, 40);
           const half = period > 0 ? period : ATLAS_TILE_PX;
           const patternOn =
             (Math.floor(lx / half) + Math.floor(ly / half)) % 2 === 0;

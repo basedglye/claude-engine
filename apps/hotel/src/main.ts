@@ -47,7 +47,7 @@ import { syncCharacter, pruneCharacters } from "./render/characters.js";
 import { syncUpkeepObjects } from "./render/upkeep.js";
 import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
 import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from "./render/screens.js";
-import { atlasTextureFor } from "./render/atlas.js";
+import { atlasTextureFor, atlasRegionFor } from "./render/atlas.js";
 import { AMBIENT_INTENSITY, KEY_LIGHT_INTENSITY, LOOK } from "./render/look-lock.js";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
@@ -865,14 +865,21 @@ const host = createThreeHost(sim, {
 
       let group = doorGroups.get(entity);
       if (!group) {
-        const doorMesh = generateDoorMesh(spec);
+        // Doors are atlas-textured now. They used to be flat
+        // vertex-coloured slabs on the argument that "a door panel is a
+        // solid painted surface, not a textured one" — which was true of a
+        // real door and wrong on screen: with the floors and walls textured,
+        // an untextured leaf standing open in a doorway is the largest
+        // untextured object in most interior shots and reads as cardboard.
+        // The atlas has carried a `door` region since H2b synthesized it and
+        // nothing sampled it.
+        const doorMesh = generateDoorMesh(spec, atlasRegionFor(sim.seed, "door"));
         const geometry = toBufferGeometry(doorMesh);
-        // Doors carry vertex colours but no UVs (generateDoorMesh predates
-        // the atlas and a door panel is a solid painted surface, not a
-        // textured one), so this gets the jitter and skips the affine warp
-        // — `createRetroMaterial` compiles the warp out on its own when
-        // there is no map, rather than requiring the call site to know.
-        const material = createRetroMaterial({ vertexColors: true, look: LOOK });
+        const material = createRetroMaterial({
+          map: atlasTextureFor(sim.seed),
+          vertexColors: true,
+          look: LOOK,
+        });
         const mesh = new THREE.Mesh(geometry, material);
         // generateDoorMesh already positions the panel in world space
         // (docs/PHASE-H0.md's door mesh is centered on the door cell), so

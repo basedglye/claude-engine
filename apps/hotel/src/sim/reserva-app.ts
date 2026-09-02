@@ -23,12 +23,25 @@ export interface ReservaState {
   selectedRoomEntity: number;
 }
 
-const ACCEPT_RECT: Rect = { x: 8, y: 440, w: 96, h: 18 };
-const DENY_RECT: Rect = { x: 112, y: 440, w: 96, h: 18 };
+const ACCEPT_RECT: Rect = { x: 8, y: 434, w: 120, h: 20 };
+const DENY_RECT: Rect = { x: 136, y: 434, w: 120, h: 20 };
 const ROOM_LIST_X = 8;
-const ROOM_LIST_Y = 220;
-const ROOM_ROW_H = 18;
-const ROOM_ROW_W = 150;
+/** The room list used to float at y=220 with a wide gap above it and the
+ *  ACCEPT/DENY bar 200px below. Both halves of that were wrong: an idle
+ *  screen was mostly empty blue, and the action was nowhere near the choice
+ *  it acts on. The list now sits directly under the left column's content
+ *  and directly above the action bar, so "pick a room, then accept" is one
+ *  vertical read. */
+const ROOM_LIST_Y = 296;
+const ROOM_ROW_H = 20;
+const ROOM_ROW_W = 248;
+
+/** Horizontal rule under the title, and above the action bar. A 2px panel
+ *  is the cheapest structural cue this surface has, and the screen had none
+ *  -- every element floated in one undivided field of blue. */
+const HEADER_RULE_Y = 18;
+const ACTION_RULE_Y = 424;
+const RIGHT_COLUMN_TOP = 26;
 
 // H1 froze the active rule table in a module constant at import time. H2a
 // deletes it: the star tier is world state now, the procedures card growing
@@ -145,51 +158,68 @@ export const reservaApp: ScreenAppDef<ReservaState> = {
     const nodes: PaintNode[] = [];
     nodes.push({ kind: "panel", rect: { x: 0, y: 0, w: 640, h: 456 }, fill: 0 });
     nodes.push({ kind: "text", x: 8, y: 4, text: "RESERVA - CHECK-IN", color: 11 });
+    nodes.push({ kind: "panel", rect: { x: 8, y: HEADER_RULE_Y, w: 624, h: 2 }, fill: 8 });
 
     if (!data.queue) {
-      nodes.push({ kind: "text", x: 8, y: 20, text: "No guest presenting.", color: 14 });
+      // IDLE IS A STATE, NOT AN ABSENCE. The old idle screen printed one
+      // line and left ~400px of empty blue, which read as a broken app
+      // rather than a quiet desk. It now says what it is waiting for and
+      // keeps the procedures card up, so the rules can be read BEFORE a
+      // guest is standing there -- which is when a player actually has time
+      // to read them.
+      nodes.push({ kind: "text", x: 8, y: 26, text: "DESK CLEAR", color: 14 });
+      nodes.push({ kind: "text", x: 8, y: 40, text: "No guest presenting.", color: 8 });
+      nodes.push({ kind: "text", x: 8, y: 56, text: "Waiting for arrivals.", color: 8 });
     } else {
       // -- raw document fields (left column) --
-      nodes.push({ kind: "text", x: 8, y: 20, text: "PRESENTED DOCUMENTS", color: 8 });
-      let y = 32;
+      nodes.push({ kind: "text", x: 8, y: 26, text: "PRESENTED DOCUMENTS", color: 8 });
+      let y = 42;
       for (const docType of Object.keys(data.queue.docFields).sort()) {
         nodes.push({ kind: "text", x: 8, y, text: `[${docType}]`, color: 12 });
-        y += GLYPH_H;
+        y += GLYPH_H + 2;
         const fields = data.queue.docFields[docType] ?? {};
         for (const field of Object.keys(fields).sort()) {
           nodes.push({ kind: "text", x: 16, y, text: `${field}: ${fields[field]}`, color: 8 });
-          y += GLYPH_H;
+          y += GLYPH_H + 2;
         }
-        y += 2;
+        y += 4;
       }
 
       // -- raw reservation fields (right column) --
-      nodes.push({ kind: "text", x: RIGHT_COLUMN_X, y: 20, text: "RESERVATION ON FILE", color: 8 });
-      let ry = 32;
+      nodes.push({ kind: "text", x: RIGHT_COLUMN_X, y: RIGHT_COLUMN_TOP, text: "RESERVATION ON FILE", color: 8 });
+      let ry = RIGHT_COLUMN_TOP + 16;
       for (const field of Object.keys(data.queue.resFields).sort()) {
         nodes.push({ kind: "text", x: RIGHT_COLUMN_X, y: ry, text: `${field}: ${data.queue.resFields[field]}`, color: 8 });
         ry += GLYPH_H + 2;
       }
+    }
 
-      // -- procedures card: descriptions only, never results -- extra
-      // leading (PROCEDURES_LINE_H > GLYPH_H, PROCEDURES_RULE_GAP between
-      // rules) so wrapped lines read as visually distinct rows rather than
-      // crowding into an 8px-tall stack (H1b review round 3: "set the
-      // leading so wrapped lines are comfortably distinct").
-      nodes.push({ kind: "text", x: PROCEDURES_X, y: 140, text: "PROCEDURES", color: 12 });
-      let py = 156;
-      for (const rule of rulesForStars(H1_RULES, data.stars)) {
-        const wrapped = wrapText(`- ${describeRule(rule)}`, PROCEDURES_MAX_CHARS);
-        for (const wrappedLine of wrapped) {
-          nodes.push({ kind: "text", x: PROCEDURES_X, y: py, text: wrappedLine, color: 14 });
-          py += PROCEDURES_LINE_H;
-        }
-        py += PROCEDURES_RULE_GAP;
+    // -- procedures card: descriptions only, never results -- extra
+    // leading (PROCEDURES_LINE_H > GLYPH_H, PROCEDURES_RULE_GAP between
+    // rules) so wrapped lines read as visually distinct rows rather than
+    // crowding into an 8px-tall stack (H1b review round 3: "set the
+    // leading so wrapped lines are comfortably distinct").
+    //
+    // Painted in BOTH states now (it used to live inside the guest branch).
+    // The card is the game's rulebook; hiding it until the moment you are
+    // under time pressure was precisely backwards.
+    nodes.push({ kind: "text", x: PROCEDURES_X, y: 140, text: "PROCEDURES", color: 12 });
+    nodes.push({ kind: "panel", rect: { x: PROCEDURES_X, y: 152, w: SCREEN_W - PROCEDURES_X - 8, h: 1 }, fill: 8 });
+    let py = 160;
+    for (const rule of rulesForStars(H1_RULES, data.stars)) {
+      const wrapped = wrapText(`- ${describeRule(rule)}`, PROCEDURES_MAX_CHARS);
+      for (const wrappedLine of wrapped) {
+        nodes.push({ kind: "text", x: PROCEDURES_X, y: py, text: wrappedLine, color: 14 });
+        py += PROCEDURES_LINE_H;
       }
+      py += PROCEDURES_RULE_GAP;
     }
 
     // -- vacant rooms --
-    nodes.push({ kind: "text", x: 8, y: ROOM_LIST_Y - 12, text: "VACANT ROOMS", color: 8 });
+    nodes.push({ kind: "text", x: 8, y: ROOM_LIST_Y - 16, text: "VACANT ROOMS", color: 8 });
+    if (data.rooms.length === 0) {
+      nodes.push({ kind: "text", x: 8, y: ROOM_LIST_Y + 4, text: "None ready.", color: 14 });
+    }
     let ry2 = ROOM_LIST_Y;
     for (const room of data.rooms) {
       const rect = { x: ROOM_LIST_X, y: ry2, w: ROOM_ROW_W, h: ROOM_ROW_H };
@@ -203,7 +233,8 @@ export const reservaApp: ScreenAppDef<ReservaState> = {
       ry2 += ROOM_ROW_H;
     }
 
-    // -- ACCEPT / DENY --
+    // -- ACCEPT / DENY, under a rule so the action bar reads as a bar --
+    nodes.push({ kind: "panel", rect: { x: 8, y: ACTION_RULE_Y, w: 624, h: 2 }, fill: 8 });
     nodes.push({ kind: "button", rect: ACCEPT_RECT, label: "ACCEPT", color: 9 });
     nodes.push({ kind: "button", rect: DENY_RECT, label: "DENY", color: 10 });
 

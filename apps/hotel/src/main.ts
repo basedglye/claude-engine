@@ -106,7 +106,36 @@ const store = webStore();
 // created this exact id -- and it's superseded (gameReady reassigned) the
 // moment recoverOnBoot() finds and recovers an existing game instead of
 // starting fresh under this default id.
-let gameReady: Promise<unknown> = store.createGame({ id: gameId, name: GAME_ID_PREFIX, seed: sim.seed });
+/**
+ * The games that existed BEFORE this session touched the store — captured
+ * as a promise chained ahead of `createGame` below, so it can never observe
+ * this session's own record.
+ *
+ * THIS IS LOAD-BEARING, NOT TIDINESS. Boot recovery originally listed games
+ * after `createGame` had run and took `games[0]`, which is this session's
+ * OWN freshly-created `hotel-sp` — a record that by then already holds the
+ * first few ticks of commands the save pump has written. `recoverSim` then
+ * replayed those commands into a throwaway sim and `sim.restore()`d the
+ * live world back onto them, mid-run, while the render loop was ticking.
+ *
+ * The symptoms were nastily indirect and cost most of an afternoon: browser
+ * gates went to exit 3 (the recovered world no longer matched a headless
+ * replay of the same command log, and a spurious `debug.saveRestoreRecord`
+ * entered the stream), the player teleported mid-walk so `art-lock`'s
+ * camera ended up buried in geometry with no monitor in frame, and the live
+ * dev server froze at whatever tick recovery began at because `tickSim`
+ * correctly refuses to step while `loadInFlight` is true. None of those
+ * read as "boot recovery ate its own tail".
+ *
+ * Listing first makes the rule structural: recovery can only ever consider
+ * a game some EARLIER session wrote.
+ */
+const gamesBeforeBoot: Promise<{ id: string; name: string; seed: string; latestSnapshotTick?: number }[]> =
+  store.listGames();
+
+let gameReady: Promise<unknown> = gamesBeforeBoot.then(() =>
+  store.createGame({ id: gameId, name: GAME_ID_PREFIX, seed: sim.seed })
+);
 
 // Every command submission is routed through the pump's submit (wired into
 // installTestHook's `submit` option below) -- that is what makes the
@@ -316,42 +345,81 @@ async function quickLoad(): Promise<void> {
  * string shipped against house style. If a future lane wants the notice,
  * this is the one call site to add it at.
  */
+/**
+ * The recovery itself, given an already-resolved, already-ordered games
+ * list (newest-first per `listGames()`'s ordering contract): recovers
+ * `games[0]` via `recoverSim`, applies it to the live `sim` in place, and
+ * submits the replay-visible marker. Shared by `recoverOnBoot` (which
+ * filters `gamesBeforeBoot` -- see that constant's comment for why a STALE
+ * pre-boot list, not a fresh query, is what a genuine "boot" recovery must
+ * use) and the F6 test trigger below (which intentionally does NOT filter
+ * or reuse a stale list -- see F6's own comment for why a fresh query is
+ * correct there instead).
+ */
+async function recoverFromGames(games: readonly { id: string }[]): Promise<void> {
+  if (games.length === 0) return; // Nothing to recover -- the sim already running is correct.
+  const mostRecent = games[0];
+  try {
+    const { sim: loaded, record } = await recoverSim(store, mostRecent.id, setup);
+    sim.restore(loaded.snapshot());
+    resetEntityKeyedHostState();
+    restoredHash = sim.stateHash();
+    await switchLiveGame(record.id, Promise.resolve(record));
+    // Same replay-visible marker quickLoad submits (see its doc comment):
+    // a host-only hash comparison living only in this closure is
+    // invisible to a headless replay of the captured command log, so the
+    // fact of a successful recovery — and the hashes involved — has to
+    // ride into sim state as a command, exactly like F9's does. This is
+    // also how the save-resume gate's F6 test trigger (see the "F6"
+    // keydown handler below) makes a boot-path recovery assertable at all
+    // without a real page navigation destroying the harness's replay
+    // bundle.
+    hook.submit(saveRestoreDebugCommand(sim.tick + 1, savedTick ?? -1, savedHash ?? -1, restoredHash));
+  } catch (err) {
+    if (!(err instanceof RestoreError)) throw err; // Anything else (a store/IDB fault) is a real bug -- surface it.
+    // Silent fresh start (see recoverOnBoot's doc comment above) -- the sim
+    // already running stays exactly as it is; nothing left to do.
+  }
+}
+
 async function recoverOnBoot(): Promise<void> {
   loadInFlight = true;
   try {
-    const games = await store.listGames();
-    if (games.length === 0) return; // Nothing saved yet -- the fresh sim already running is correct.
-    // listGames()'s ordering contract (packages/persistence/src/store.ts):
-    // newest-first by createdAt, ties broken by id ascending -- games[0] is
-    // "the most recent game" without any further sorting here.
-    const mostRecent = games[0];
-    try {
-      const { sim: loaded, record } = await recoverSim(store, mostRecent.id, setup);
-      sim.restore(loaded.snapshot());
-      resetEntityKeyedHostState();
-      restoredHash = sim.stateHash();
-      await switchLiveGame(record.id, Promise.resolve(record));
-      // Same replay-visible marker quickLoad submits (see its doc comment):
-      // a host-only hash comparison living only in this closure is
-      // invisible to a headless replay of the captured command log, so the
-      // fact of a successful boot recovery — and the hashes involved — has
-      // to ride into sim state as a command, exactly like F9's does. This
-      // is also how the save-resume gate's F6 test trigger (see the "F6"
-      // keydown handler below) makes a boot-path recovery assertable at
-      // all without a real page navigation destroying the harness's replay
-      // bundle.
-      hook.submit(saveRestoreDebugCommand(sim.tick + 1, savedTick ?? -1, savedHash ?? -1, restoredHash));
-    } catch (err) {
-      if (!(err instanceof RestoreError)) throw err; // Anything else (a store/IDB fault) is a real bug -- surface it.
-      // Silent fresh start (see the doc comment above) -- the sim already
-      // running under the boot-time `gameId`/`gameReady` stays exactly as
-      // it is; nothing left to do.
-    }
+    // The PRE-BOOT list, never a fresh `store.listGames()` — see
+    // `gamesBeforeBoot`'s comment for what recovering this session's own
+    // record does.
+    await recoverFromGames((await gamesBeforeBoot).filter((g) => g.id !== gameId));
   } finally {
     loadInFlight = false;
   }
 }
 void recoverOnBoot();
+
+/**
+ * The save-resume gate's F6 test trigger (see the "F6" keydown handler
+ * below for why a real page reload can't be used to drive this). Unlike
+ * `recoverOnBoot`, this reads a FRESH `store.listGames()` and does NOT
+ * filter out the current `gameId` -- by the time a player (or a test)
+ * presses F6, minutes into a session, the live game's own record is
+ * exactly what a real reload's boot path would find and correctly recover
+ * (it is no longer the empty, still-being-created record `gamesBeforeBoot`
+ * exists to guard against; that race is a boot-instant-only hazard). A
+ * fresh query is required here for the SAME reason `gamesBeforeBoot` was
+ * introduced in the first place: `gamesBeforeBoot` is a promise resolved
+ * exactly once, at module init, from whatever the store held before this
+ * session existed -- reusing it here would mean F6 forever "recovers" that
+ * same stale, pre-session snapshot (or nothing, on a fresh store) no
+ * matter how much has been saved since, silently no-opping every time it
+ * is pressed after the first.
+ */
+async function recoverViaBootPathAgain(): Promise<void> {
+  loadInFlight = true;
+  try {
+    await recoverFromGames(await store.listGames());
+  } finally {
+    loadInFlight = false;
+  }
+}
 
 // Re-derive the same pure GroundFloor from the seed for meshes. Deliberately
 // NOT reusing a game.ts closure across the module boundary — main.ts calls
@@ -659,18 +727,20 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   // truncate that bundle to whatever ran after the reload, exactly the
   // failure mode this app's quickLoad() doc comment above already explains
   // for F9, generalized to boot itself. F6 sidesteps it the same way
-  // quickLoad does: it re-invokes `recoverOnBoot()`, the EXACT function a
-  // real page load calls once at module init, in place, against the SAME
-  // live `sim` -- so the gate exercises the real boot-recovery code path
-  // (listGames() -> recoverSim() -> sim.restore() ->
-  // resetEntityKeyedHostState()) byte-for-byte, without ever discarding
-  // the command log a sound --verify-replay depends on. Not reachable
-  // outside a harness-driven session in any way that matters: a real
-  // player has no reason to press F6, and pressing it is harmless (it just
-  // re-recovers whatever the store's most recent game already is).
+  // quickLoad does: it re-invokes `recoverViaBootPathAgain()` (NOT
+  // `recoverOnBoot()` itself -- see that function's own doc comment for
+  // why it must read a stale, pre-session games list and F6 must not), in
+  // place, against the SAME live `sim` -- so the gate exercises the real
+  // recovery code path (listGames() -> recoverSim() -> sim.restore() ->
+  // resetEntityKeyedHostState(), the exact sequence recoverOnBoot() also
+  // runs) byte-for-byte, without ever discarding the command log a sound
+  // --verify-replay depends on. Not reachable outside a harness-driven
+  // session in any way that matters: a real player has no reason to press
+  // F6, and pressing it is harmless (it just re-recovers whatever the
+  // store's most recent game already is).
   if (e.code === "F6") {
     e.preventDefault();
-    void recoverOnBoot();
+    void recoverViaBootPathAgain();
     return;
   }
   if (!focusedScreen) return;

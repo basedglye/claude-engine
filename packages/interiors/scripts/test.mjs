@@ -114,7 +114,17 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // colours now carry the LIGHT alone (see mesh-gen.ts's block comment above
 // FLOOR_PALETTE). Same argument as above applies unchanged: mesh bytes
 // only, and NON_MESH_GOLDEN_HASH did not move across either re-pin.
-const GOLDEN_HASH = 0xef96f6ec;
+// Re-pinned a THIRD time inside H2b (0xef96f6ec -> 0x95618e02): the bake
+// gained a per-face directional term and the UV mapping gained a half-texel
+// gutter. Both were found by looking at the built game rather than by any
+// gate. Without the normal term the positional falloffs vary only across
+// the floor plan, so two opposite walls render identically and a room reads
+// as one flat field; without the gutter a vertex landing exactly on a tile
+// period sampled the NEIGHBOURING material (measured: lobby floor quads
+// taking the corridor's grey-blue, ceiling quads taking the lobby's tan).
+// Mesh bytes only, again, and NON_MESH_GOLDEN_HASH has not moved across any
+// of the three re-pins.
+const GOLDEN_HASH = 0x95618e02;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {

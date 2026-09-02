@@ -307,6 +307,13 @@ export interface ScenarioConfig {
    *  It is FALSE in `DEFAULTS` and every Rng draw it makes is inside its
    *  own guard, so no shipped path and no pinned golden can see it. */
   preDirty: boolean;
+  /** Whether `preDirty` also stands up a round of job candidates. Defaults
+   *  to true (what `upkeep-demo` needs — its whole point is clicking one).
+   *  `look-lock` turns it OFF: candidates walk to the lobby wait cells,
+   *  which are beside the front desk, so they end up standing between the
+   *  camera and the monitor and the focus click resolves to a PERSON.
+   *  Ignored entirely when `preDirty` is false. */
+  preDirtyCandidates: boolean;
 }
 
 // H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
@@ -329,6 +336,7 @@ export const DEFAULTS: ScenarioConfig = {
   spawnIntervalMinTicks: 50,
   spawnIntervalMaxTicks: 150,
   preDirty: false,
+  preDirtyCandidates: true,
 };
 
 /**
@@ -346,6 +354,25 @@ export const DEFAULTS: ScenarioConfig = {
  */
 export const SCENARIO_CONFIGS: Record<string, ScenarioConfig> = {
   "upkeep-demo": { ...DEFAULTS, preDirty: true },
+  /**
+   * The art gate's world: pre-dirtied like `upkeep-demo`, but with NO
+   * arrivals at all.
+   *
+   * Not a convenience. `art-lock` walks the hotel for ~130 ticks, and the
+   * shipped arrival schedule puts the first guest at the front desk well
+   * inside that window — where they stand between the player and the
+   * monitor. The reticle raycast resolves against the nearest registered
+   * interactable, so the gate's focus click hit a GUEST and the terminal
+   * never focused. It cost several runs to see, because the failure
+   * surfaced as "screenRect() returned undefined" and only the tick-84
+   * screenshot showed a purple guest rig filling the frame.
+   *
+   * An art gate wants a controlled scene for the same reason a photographer
+   * clears the set: the four screenshots the look-lock is signed against
+   * should show the ROOMS, and a gate whose subject wanders into shot is
+   * not repeatable. Guests have their own gates.
+   */
+  "look-lock": { ...DEFAULTS, preDirty: true, preDirtyCandidates: false, arrivals: "fixed", guestCount: 0 },
 };
 
 /** `setup()` for a named config — the entry point both `main.ts` and the
@@ -2638,7 +2665,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     // them in through the street door is the shipped beat, it is
     // deterministic, and the gate simply waits for them (the arrival tick
     // is derived and pinned in scenarios/upkeep-click.scenario.mjs).
-    spawnCandidateRound(sim, 1, "arriving");
+    if (config.preDirtyCandidates) spawnCandidateRound(sim, 1, "arriving");
   }
 
   sim.addSystem(indexSystem);

@@ -5,7 +5,7 @@
 import { CELL, CELL_SIZE_MM, type NavGrid } from "@claude-engine/space";
 import type { MeshDataWithColors } from "@claude-engine/assets";
 import { DOOR_HEAD_HEIGHT_MM } from "./layout.js";
-import { ATLAS_TILE_PX, TEXELS_PER_METRE, type AtlasData } from "./atlas.js";
+import { ATLAS_SIZE_PX, ATLAS_TILE_PX, TEXELS_PER_METRE, type AtlasData } from "./atlas.js";
 
 export const WALL_HEIGHT_MM = 2700;
 
@@ -147,13 +147,46 @@ function computeLight(
   return { mul, warm };
 }
 
-/** Multiplies `mul` into `color` and nudges R up / B down by `warm` (a
- *  "warm lamp" shift), clamping each channel to [0,1]. */
-function litColor(color: Vec3, mul: number, warm: number): Vec3 {
+/**
+ * The per-face directional term of the bake.
+ *
+ * WHY IT EXISTS. The positional falloffs above (corridor gradient, window,
+ * lamp) vary slowly across the FLOOR PLAN and not at all with a surface's
+ * orientation, so two opposite walls a metre apart get the same value and a
+ * room renders as one flat field of colour. Driving the built game after the
+ * first H2b pass showed exactly that: floor, wall and ceiling all landed
+ * inside a ~1.3x value band and an interior read as noise rather than as a
+ * room. The pre-H2b build did not have the problem only because it ran a
+ * strong runtime DirectionalLight; moving the lighting into the bake without
+ * bringing the normal term with it is what lost the separation.
+ *
+ * The direction is a committed constant, already unit-length so no
+ * normalisation (and no transcendental) is needed: down-and-forward from
+ * high on one side, the way an interior's ceiling fixtures actually read.
+ * Floors face it and are brightest; ceilings face away and are darkest,
+ * which is correct for an interior lit from above and is also what makes a
+ * doorway silhouette legible.
+ *
+ * `FACE_AMBIENT` keeps the unlit side off the floor of the range — a wall
+ * you cannot see the texture of is not stylish, it is broken.
+ */
+const SUN_DIR: Vec3 = [0.45, 0.78, 0.44];
+const FACE_AMBIENT = 0.58;
+
+function faceLight(normal: Vec3): number {
+  const d = normal[0] * SUN_DIR[0] + normal[1] * SUN_DIR[1] + normal[2] * SUN_DIR[2];
+  return FACE_AMBIENT + (1 - FACE_AMBIENT) * Math.max(0, d);
+}
+
+/** Multiplies `mul` (positional falloffs) and the per-face directional term
+ *  into `color`, and nudges R up / B down by `warm` (a "warm lamp" shift),
+ *  clamping each channel to [0,1]. */
+function litColor(color: Vec3, mul: number, warm: number, normal: Vec3): Vec3 {
+  const m = mul * faceLight(normal);
   return [
-    clamp01(color[0] * mul + warm * 0.08),
-    clamp01(color[1] * mul),
-    clamp01(color[2] * mul - warm * 0.05),
+    clamp01(color[0] * m + warm * 0.08),
+    clamp01(color[1] * m),
+    clamp01(color[2] * m - warm * 0.05),
   ];
 }
 
@@ -240,8 +273,24 @@ function projectUv(
   }
   const localU = wrapPx(uWorldMm) / ATLAS_TILE_PX;
   const localV = wrapPx(vWorldMm) / ATLAS_TILE_PX;
-  const u = region.u0 + localU * (region.u1 - region.u0);
-  const v = region.v0 + localV * (region.v1 - region.v0);
+  // HALF-TEXEL GUTTER. `wrapPx` returns [0, ATLAS_TILE_PX), so a vertex
+  // sitting exactly on a tile period maps to localU === 0 and therefore to
+  // u === region.u0 — the shared edge between this material's tile and its
+  // neighbour's. Under NearestFilter that boundary is decided by float
+  // rounding, and a per-cell floor quad (250mm, a clean fraction of the 2m
+  // tile period) hits it on essentially every vertex. Measured before this
+  // inset: lobby floor quads sampling the CORRIDOR tile's grey-blue, and
+  // ceiling quads sampling the lobby floor's tan. Pulling both ends in by
+  // half a texel keeps every sample strictly inside its own material and
+  // costs one texel of tile period, which at 64 px/m is 16mm of world.
+  const insetU = 0.5 / ATLAS_SIZE_PX;
+  const insetV = 0.5 / ATLAS_SIZE_PX;
+  const u0 = region.u0 + insetU;
+  const v0 = region.v0 + insetV;
+  const u1 = region.u1 - insetU;
+  const v1 = region.v1 - insetV;
+  const u = u0 + localU * (u1 - u0);
+  const v = v0 + localV * (v1 - v0);
   return [u, v];
 }
 
@@ -294,9 +343,9 @@ export function buildFloorMesh(
     return FLOOR_MATERIAL[roomId] ?? DEFAULT_FLOOR_MATERIAL;
   }
 
-  function litWallColor(roomId: number, xMm: number, zMm: number): Vec3 {
+  function litWallColor(roomId: number, xMm: number, zMm: number, normal: Vec3): Vec3 {
     const { mul, warm } = computeLight(roomId, xMm, zMm, corridor, lighting);
-    return litColor(UNTINTED, mul, warm);
+    return litColor(UNTINTED, mul, warm, normal);
   }
 
   // --- Walls: scan internal x-edges (boundary between (cx,cz) and (cx+1,cz)). ---
@@ -318,13 +367,16 @@ export function buildFloorMesh(
       if (wa !== wc) {
         // Full-height wall: exactly one side is walkable.
         const walkableRoomId = wa ? rooms[idx(cx, cz)] ?? 0 : rooms[idx(cx + 1, cz)] ?? 0;
-        const color = litWallColor(walkableRoomId, bx, zMid);
         if (wa) {
           // Walkable side is -X (cell cx); face normal points -X, into cx.
-          b.addQuad([bx, 0, z0], [bx, 0, z1], [bx, H, z1], [bx, H, z0], [-1, 0, 0], color, atlas, "wall", "zy");
+          const n: Vec3 = [-1, 0, 0];
+          const color = litWallColor(walkableRoomId, bx, zMid, n);
+          b.addQuad([bx, 0, z0], [bx, 0, z1], [bx, H, z1], [bx, H, z0], n, color, atlas, "wall", "zy");
         } else {
           // Walkable side is +X (cell cx+1); face normal points +X.
-          b.addQuad([bx, 0, z1], [bx, 0, z0], [bx, H, z0], [bx, H, z1], [1, 0, 0], color, atlas, "wall", "zy");
+          const n: Vec3 = [1, 0, 0];
+          const color = litWallColor(walkableRoomId, bx, zMid, n);
+          b.addQuad([bx, 0, z1], [bx, 0, z0], [bx, H, z0], [bx, H, z1], n, color, atlas, "wall", "zy");
         }
       } else if (wa && wc && isDoor(a) !== isDoor(c)) {
         // Both walkable, but exactly one side is a DOOR cell: this boundary
@@ -333,8 +385,8 @@ export function buildFloorMesh(
         // through to the void. Two quads (one per side), door-head-height
         // to ceiling -- same shape as a full wall pair, just clipped to the
         // top band.
-        const colorNeg = litWallColor(rooms[idx(cx, cz)] ?? 0, bx, zMid);
-        const colorPos = litWallColor(rooms[idx(cx + 1, cz)] ?? 0, bx, zMid);
+        const colorNeg = litWallColor(rooms[idx(cx, cz)] ?? 0, bx, zMid, [-1, 0, 0]);
+        const colorPos = litWallColor(rooms[idx(cx + 1, cz)] ?? 0, bx, zMid, [1, 0, 0]);
         b.addQuad(
           [bx, DOOR_HEAD_HEIGHT_MM, z0],
           [bx, DOOR_HEAD_HEIGHT_MM, z1],
@@ -374,18 +426,21 @@ export function buildFloorMesh(
       const xMid = (x0 + x1) / 2;
       if (wa !== wc) {
         const walkableRoomId = wa ? rooms[idx(cx, cz)] ?? 0 : rooms[idx(cx, cz + 1)] ?? 0;
-        const color = litWallColor(walkableRoomId, xMid, bz);
         if (wa) {
           // Walkable side is -Z (cell cz); normal points -Z.
-          b.addQuad([x1, 0, bz], [x0, 0, bz], [x0, H, bz], [x1, H, bz], [0, 0, -1], color, atlas, "wall", "xy");
+          const n: Vec3 = [0, 0, -1];
+          const color = litWallColor(walkableRoomId, xMid, bz, n);
+          b.addQuad([x1, 0, bz], [x0, 0, bz], [x0, H, bz], [x1, H, bz], n, color, atlas, "wall", "xy");
         } else {
           // Walkable side is +Z (cell cz+1); normal points +Z.
-          b.addQuad([x0, 0, bz], [x1, 0, bz], [x1, H, bz], [x0, H, bz], [0, 0, 1], color, atlas, "wall", "xy");
+          const n: Vec3 = [0, 0, 1];
+          const color = litWallColor(walkableRoomId, xMid, bz, n);
+          b.addQuad([x0, 0, bz], [x1, 0, bz], [x1, H, bz], [x0, H, bz], n, color, atlas, "wall", "xy");
         }
       } else if (wa && wc && isDoor(a) !== isDoor(c)) {
         // Door header, see x-edge case above.
-        const colorNeg = litWallColor(rooms[idx(cx, cz)] ?? 0, xMid, bz);
-        const colorPos = litWallColor(rooms[idx(cx, cz + 1)] ?? 0, xMid, bz);
+        const colorNeg = litWallColor(rooms[idx(cx, cz)] ?? 0, xMid, bz, [0, 0, -1]);
+        const colorPos = litWallColor(rooms[idx(cx, cz + 1)] ?? 0, xMid, bz, [0, 0, 1]);
         b.addQuad(
           [x1, DOOR_HEAD_HEIGHT_MM, bz],
           [x0, DOOR_HEAD_HEIGHT_MM, bz],
@@ -430,8 +485,8 @@ export function buildFloorMesh(
       // room with NO atlas region falls back to its palette entry, so the
       // tints above are still load-bearing for anything unmapped.
       const hasRegion = atlas.regions[floorMaterialFor(roomId)] !== undefined;
-      const floorColor = litColor(hasRegion ? UNTINTED : (FLOOR_PALETTE[roomId] ?? DEFAULT_FLOOR_COLOR), mul, warm);
-      const ceilingColor = litColor(UNTINTED, mul, warm);
+      const floorColor = litColor(hasRegion ? UNTINTED : (FLOOR_PALETTE[roomId] ?? DEFAULT_FLOOR_COLOR), mul, warm, [0, 1, 0]);
+      const ceilingColor = litColor(UNTINTED, mul, warm, [0, -1, 0]);
       const floorMaterial = floorMaterialFor(roomId);
       // Floor, y=0, normal +Y (up, into the walkable volume above it).
       b.addQuad([x0, 0, z1], [x1, 0, z1], [x1, 0, z0], [x0, 0, z0], [0, 1, 0], floorColor, atlas, floorMaterial, "xz");

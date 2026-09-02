@@ -1,6 +1,14 @@
 import * as THREE from "three";
 import { Sim, type EntityId, type IWorld } from "@claude-engine/core";
-import { createThreeHost, installTestHook, type SceneContext, type ScreenRect } from "@claude-engine/renderer-three";
+import {
+  createRetroMaterial,
+  createThreeHost,
+  installTestHook,
+  type FrameStats,
+  type SceneContext,
+  type ScreenRect,
+  type ThreeHost,
+} from "@claude-engine/renderer-three";
 import { SCREEN_W } from "@claude-engine/surface-ui";
 import { toBufferGeometry } from "@claude-engine/assets/web";
 import { generateDoorMesh, type GroundFloor, type DoorSpec } from "@claude-engine/interiors";
@@ -18,6 +26,8 @@ import { webStore, createSavePump, exportSave, importSave } from "@claude-engine
 import { recoverSim } from "@claude-engine/persistence/dist/recover.js";
 import {
   setup,
+  setupNamed,
+  SCENARIO_CONFIGS,
   loadGroundFloor,
   faceCommand,
   moveCommand,
@@ -38,6 +48,8 @@ import { syncCharacter, pruneCharacters } from "./render/characters.js";
 import { syncUpkeepObjects } from "./render/upkeep.js";
 import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
 import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from "./render/screens.js";
+import { atlasTextureFor } from "./render/atlas.js";
+import { AMBIENT_INTENSITY, KEY_LIGHT_INTENSITY, LOOK } from "./render/look-lock.js";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#app");
 if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
@@ -58,7 +70,23 @@ if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
 const DEFAULT_SEED = "hotel-h0-look-1";
 const seedParam = new URLSearchParams(window.location.search).get("worldforgeSeed");
 const sim = new Sim(seedParam ?? DEFAULT_SEED, { eventRetentionTicks: 600 });
-setup(sim);
+// ?worldforgeConfig=<name> selects one of the committed SCENARIO_CONFIGS
+// (e.g. "upkeep-demo") in place of the plain setup(). This takes a NAME,
+// never arbitrary JSON off the query string: a named config is a fixed,
+// code-reviewed world (bounded set of pre-dirtied rooms, door states, spawn
+// points) that a scenario file can commit a seed and literals against, so a
+// browser gate stays reproducible and auditable. Accepting free-form config
+// JSON from the URL would let anyone hand the page arbitrary starting sim
+// state (or worse, non-JSON payloads probing for injection) -- the whole
+// point of the seed+input-log replay model is that a world is fully
+// described by committed, reviewable inputs, not by whatever a link happens
+// to carry. An unknown or absent name keeps today's setup(sim).
+const configParam = new URLSearchParams(window.location.search).get("worldforgeConfig");
+if (configParam && configParam in SCENARIO_CONFIGS) {
+  setupNamed(sim, configParam);
+} else {
+  setup(sim);
+}
 
 // -- H1b save/load (docs/PHASE-H1.md section B + "Host (main.ts)
 //    additions"): a single fixed game id, since H1 has no save UI
@@ -218,6 +246,14 @@ const hook = installTestHook({
   tickTimings: () => tickTimings,
   startPaused,
   screenRect: () => computeScreenRect(),
+  // The `draw-calls` / `frame-time-p95` probes (docs/PHASE-H2.md §5F).
+  // Read live through a late-bound reference: `createThreeHost` is
+  // constructed BELOW this call (it needs `hook.submit`), so the slot
+  // cannot capture the host directly. Reporting zeros before the host
+  // exists would be worse than reporting nothing, so the probes' own
+  // "refuse to report an unmeasured number" guard in the harness sees an
+  // empty sample set instead and fails as infra.
+  frameStats: (): FrameStats => hostRef?.frameStats() ?? { drawCalls: 0, frameMsSamples: [] },
 });
 
 /** The save-restore gate's hook slot (docs/PHASE-H1.md gate 4), wired the
@@ -469,8 +505,20 @@ function findFocusedTerminal(world: IWorld): EntityId | undefined {
   return undefined;
 }
 
+// Late-bound so the test hook's frameStats() slot (installed above) can reach
+// the host that is constructed below it. `let` rather than `const` because
+// the assignment genuinely happens after the declaration.
+// eslint-disable-next-line prefer-const
+let hostRef: ThreeHost | undefined;
+
 const host = createThreeHost(sim, {
   canvas,
+  // The level's lighting is BAKED into the mesh's vertex colours (H2b,
+  // interiors' `buildFloorMesh`), so the runtime rig exists only to keep
+  // unbaked host geometry — characters, messes, props, the monitor housing
+  // — from reading as flat silhouettes. See render/look-lock.ts.
+  ambientIntensity: AMBIENT_INTENSITY,
+  keyLightIntensity: KEY_LIGHT_INTENSITY,
   stepSim: tickSim,
   submit: (command) => hook.submit(command),
   pointerHandlers: controller.pointerHandlers,
@@ -537,8 +585,18 @@ const host = createThreeHost(sim, {
   },
   syncScene(ctx: SceneContext, world: IWorld, alpha: number) {
     ctx.scenery("floor-mesh", () => {
+      // H2b: the static floor/walls/ceiling is ONE merged geometry (it
+      // always was — interiors emits a single mesh), now atlas-textured
+      // with the planar UVs interiors emits and lit by the vertex-colour
+      // bake it folds in. The PS1 material is applied HERE, at the one
+      // place the level's geometry enters the scene, so "the world wears
+      // the look" is a single call rather than a convention.
       const geometry = toBufferGeometry(floor.mesh);
-      const material = new THREE.MeshStandardMaterial({ vertexColors: true });
+      const material = createRetroMaterial({
+        map: atlasTextureFor(sim.seed),
+        vertexColors: true,
+        look: LOOK,
+      });
       return new THREE.Mesh(geometry, material);
     });
 
@@ -554,7 +612,12 @@ const host = createThreeHost(sim, {
       if (!group) {
         const doorMesh = generateDoorMesh(spec);
         const geometry = toBufferGeometry(doorMesh);
-        const material = new THREE.MeshStandardMaterial({ vertexColors: true });
+        // Doors carry vertex colours but no UVs (generateDoorMesh predates
+        // the atlas and a door panel is a solid painted surface, not a
+        // textured one), so this gets the jitter and skips the affine warp
+        // — `createRetroMaterial` compiles the warp out on its own when
+        // there is no map, rather than requiring the call site to know.
+        const material = createRetroMaterial({ vertexColors: true, look: LOOK });
         const mesh = new THREE.Mesh(geometry, material);
         // generateDoorMesh already positions the panel in world space
         // (docs/PHASE-H0.md's door mesh is centered on the door cell), so
@@ -607,5 +670,7 @@ const host = createThreeHost(sim, {
     pruneHeldDocuments(world, PLAYER_ENTITY);
   },
 });
+
+hostRef = host;
 
 window.addEventListener("beforeunload", () => host.stop());

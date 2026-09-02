@@ -140,6 +140,93 @@ export function webStore(dbName = "claude-engine-save"): GameStore {
       return result ? (JSON.parse(result.snapshot) as SimSnapshot) : null;
     },
 
+    /**
+     * All stored games, newest-first by `createdAt` with ties broken by
+     * `id` ascending (the store-wide ordering contract, @claude-engine/
+     * persistence's store.ts). IDB's default object-store key order is by
+     * the keyPath (`id`), NOT insertion or `createdAt` — there is no
+     * secondary index on `createdAt` here (one more index is one more
+     * upgrade migration for a list that is expected to stay small), so we
+     * fetch every game via `getAll()` and sort explicitly rather than
+     * trusting cursor order, exactly as the contract requires.
+     */
+    async listGames(): Promise<{ id: string; name: string; seed: string; latestSnapshotTick?: number }[]> {
+      const db = await dbPromise;
+      const tx = db.transaction([GAMES_STORE, SNAPSHOTS_STORE], "readonly");
+      const games = await requestToPromise(tx.objectStore(GAMES_STORE).getAll() as IDBRequest<GameRecord[]>);
+      games.sort((a, b) => {
+        if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1; // newest first
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; // tie-break ascending
+      });
+      const snapshotsStore = tx.objectStore(SNAPSHOTS_STORE);
+      const out: { id: string; name: string; seed: string; latestSnapshotTick?: number }[] = [];
+      for (const g of games) {
+        const range = IDBKeyRange.bound([g.id, -Infinity], [g.id, Infinity]);
+        const latest = await new Promise<SnapshotRecord | null>((resolve, reject) => {
+          const req = snapshotsStore.openCursor(range, "prev");
+          req.onsuccess = () => {
+            const cursor = req.result;
+            resolve(cursor ? (cursor.value as SnapshotRecord) : null);
+          };
+          req.onerror = () => reject(req.error ?? new Error("IndexedDB cursor failed"));
+        });
+        out.push(
+          latest === null
+            ? { id: g.id, name: g.name, seed: g.seed }
+            : { id: g.id, name: g.name, seed: g.seed, latestSnapshotTick: latest.tick }
+        );
+      }
+      await txDone(tx);
+      return out;
+    },
+
+    /**
+     * Removes the game record and all its commands/snapshots in ONE
+     * readwrite transaction spanning all three object stores — the IDB
+     * equivalent of the SQL stores' single-transaction delete. A delete of
+     * a nonexistent id resolves (IDB `delete()` on a missing key is a
+     * successful no-op), matching the documented GameStore contract.
+     */
+    async deleteGame(id: string): Promise<void> {
+      const db = await dbPromise;
+      const tx = db.transaction([GAMES_STORE, COMMANDS_STORE, SNAPSHOTS_STORE], "readwrite");
+      tx.objectStore(GAMES_STORE).delete(id);
+      const commandsStore = tx.objectStore(COMMANDS_STORE);
+      // 2-element bounds, same convention as commandsSince() above: a
+      // shorter array is less than any longer array sharing its prefix, so
+      // [id, -Infinity]..[id, Infinity] covers every [id, tick, idx] key.
+      const commandsRange = IDBKeyRange.bound([id, -Infinity], [id, Infinity]);
+      await new Promise<void>((resolve, reject) => {
+        const req = commandsStore.openCursor(commandsRange, "next");
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) {
+            resolve();
+            return;
+          }
+          cursor.delete();
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error ?? new Error("IndexedDB cursor failed"));
+      });
+      const snapshotsStore = tx.objectStore(SNAPSHOTS_STORE);
+      const snapshotsRange = IDBKeyRange.bound([id, -Infinity], [id, Infinity]);
+      await new Promise<void>((resolve, reject) => {
+        const req = snapshotsStore.openCursor(snapshotsRange, "next");
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) {
+            resolve();
+            return;
+          }
+          cursor.delete();
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error ?? new Error("IndexedDB cursor failed"));
+      });
+      await txDone(tx);
+    },
+
     async close(): Promise<void> {
       const db = await dbPromise;
       db.close();

@@ -6,6 +6,12 @@ export interface MeshData {
   normals: Float32Array;
   indices: Uint32Array;
   colors?: Float32Array;
+  /** Planar UVs, 2 floats per vertex (length = 2 * vertex count).
+   *  Presentation only -- never hashed into sim state, never read by sim
+   *  code (invariant 2's asset rule, CLAUDE.md). Additive/optional so every
+   *  existing MeshData producer/consumer keeps working unchanged; only
+   *  @claude-engine/interiors' buildFloorMesh (H2b) populates it so far. */
+  uvs?: Float32Array;
   triCount: number;
 }
 

@@ -73,6 +73,25 @@ export function sqliteStore(path: string): GameStore {
   const latestSnapshotStmt = db.prepare(
     "SELECT snapshot FROM snapshots WHERE game_id = ? ORDER BY tick DESC LIMIT 1"
   );
+  // LEFT JOIN against a per-game MAX(tick) subquery: one row per game
+  // whether or not it has any snapshot yet, matching the `latestSnapshotTick`
+  // optional field. Ordering is the store-wide contract (store.ts): newest
+  // `created_at` first, ties broken by `id` ascending.
+  const listGamesStmt = db.prepare(
+    `SELECT g.id, g.name, g.seed, s.max_tick AS max_tick
+       FROM games g
+       LEFT JOIN (SELECT game_id, MAX(tick) AS max_tick FROM snapshots GROUP BY game_id) s
+         ON s.game_id = g.id
+       ORDER BY g.created_at DESC, g.id ASC`
+  );
+  const deleteGameStmt = db.prepare("DELETE FROM games WHERE id = ?");
+  const deleteCommandsStmt = db.prepare("DELETE FROM commands WHERE game_id = ?");
+  const deleteSnapshotsStmt = db.prepare("DELETE FROM snapshots WHERE game_id = ?");
+  const deleteGameTxn = db.transaction((gameId: string) => {
+    deleteCommandsStmt.run(gameId);
+    deleteSnapshotsStmt.run(gameId);
+    deleteGameStmt.run(gameId);
+  });
 
   const appendTxn = db.transaction((gameId: string, commands: readonly Command[]) => {
     const tickCounters = new Map<number, number>();
@@ -118,6 +137,17 @@ export function sqliteStore(path: string): GameStore {
       const row = latestSnapshotStmt.get(gameId) as SnapshotRow | undefined;
       if (!row) return null;
       return JSON.parse(row.snapshot) as SimSnapshot;
+    },
+    async listGames(): Promise<{ id: string; name: string; seed: string; latestSnapshotTick?: number }[]> {
+      const rows = listGamesStmt.all() as { id: string; name: string; seed: string; max_tick: number | null }[];
+      return rows.map((r) =>
+        r.max_tick === null
+          ? { id: r.id, name: r.name, seed: r.seed }
+          : { id: r.id, name: r.name, seed: r.seed, latestSnapshotTick: r.max_tick }
+      );
+    },
+    async deleteGame(id: string): Promise<void> {
+      deleteGameTxn(id);
     },
     async close(): Promise<void> {
       db.close();

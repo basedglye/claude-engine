@@ -1,0 +1,23 @@
+{
+  "name": "@claude-engine/audio",
+  "version": "0.0.1",
+  "description": "Host-side procedural SFX/muzak layer: event-stream-driven WebAudio scheduling. Never a purity root, never imported by sim code (docs/PHASE-H2.md section 5B).",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build --silent && node scripts/test.mjs"
+  },
+  "dependencies": {
+    "@claude-engine/assets": "*",
+    "@claude-engine/core": "*"
+  }
+}

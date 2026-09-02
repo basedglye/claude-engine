@@ -176,10 +176,158 @@ async function runConformanceSuite(store, label) {
   check(`[${label}] recoverSim(missing gameId) rejects`, await recoverSim(store, `missing-${randomUUID()}`, () => {}).then(() => false, () => true));
 }
 
+/**
+ * listGames()/deleteGame() suite (Phase H2b deferral-1 bundle). Creates
+ * three games with a forced createdAt spread (so newest-first ordering is
+ * unambiguous rather than accidentally passing on insertion order), writes
+ * commands + snapshots to two of them, deletes one, and asserts:
+ *  - listGames() returns every game with correct id/name/seed
+ *  - latestSnapshotTick is present only when a snapshot exists, and equals
+ *    the newest snapshot's tick
+ *  - the documented order (newest createdAt first, ties by id ascending)
+ *  - deleteGame fully removes a game's record/commands/snapshots
+ *  - a SECOND game's commands/snapshots survive untouched
+ *    (cross-contamination check)
+ *  - deleteGame on an unknown id resolves, not throws
+ *  - a delete-and-recreate with the SAME id, then recoverSim, sees only the
+ *    new log (no leftover state from the deleted game)
+ * Non-vacuity control: the "commands are gone" assertion is preceded by an
+ * assertion that the commands WERE there pre-delete, and both counts are
+ * printed — an assertion that only passes because nothing was ever written
+ * proves nothing.
+ */
+async function runListDeleteSuite(store, label) {
+  const suiteId = randomUUID();
+  const gA = `list-a-${suiteId}`;
+  const gB = `list-b-${suiteId}`;
+  const gC = `list-c-${suiteId}`;
+
+  // createGame() stamps createdAt = new Date().toISOString() internally, at
+  // whatever resolution Date.now() gives on this machine (can collide
+  // within the same synchronous suite) — create sequentially with a real
+  // gap so newest-first ordering has an unambiguous ground truth to check
+  // against, independent of the tie-break rule (which is exercised
+  // separately by not sleeping between gB2/gC2 in the ordering-detail case
+  // below).
+  await store.createGame({ id: gA, name: "List A", seed: "seed-a" });
+  await new Promise((r) => setTimeout(r, 5));
+  await store.createGame({ id: gB, name: "List B", seed: "seed-b" });
+  await new Promise((r) => setTimeout(r, 5));
+  await store.createGame({ id: gC, name: "List C", seed: "seed-c" });
+
+  // gB gets commands + two snapshots (latestSnapshotTick must report the
+  // NEWER one, 20, not the first-written one, 10). gA and gC get no
+  // snapshot at all (latestSnapshotTick must be absent, not 0/null).
+  await store.appendCommands(gB, [{ tick: 1, actor: "p1", type: "noop", payload: {} }]);
+  const fakeSnapshot = (tick, stateHash) => ({
+    v: 2,
+    tick,
+    nextEntity: 1,
+    stateHash,
+    components: {},
+    rng: { root: { seed: 0, state: [0, 0, 0, 0] }, forks: [] },
+  });
+  await store.saveSnapshot(gB, fakeSnapshot(10, 111));
+  await store.saveSnapshot(gB, fakeSnapshot(20, 222));
+
+  const games = await store.listGames();
+  const byId = new Map(games.map((g) => [g.id, g]));
+  check(`[${label}] listGames returns every created game`, byId.has(gA) && byId.has(gB) && byId.has(gC));
+  check(
+    `[${label}] listGames: correct id/name/seed for each game`,
+    byId.get(gA)?.name === "List A" &&
+      byId.get(gA)?.seed === "seed-a" &&
+      byId.get(gB)?.name === "List B" &&
+      byId.get(gB)?.seed === "seed-b" &&
+      byId.get(gC)?.name === "List C" &&
+      byId.get(gC)?.seed === "seed-c"
+  );
+  check(
+    `[${label}] listGames: latestSnapshotTick present and equal to the NEWEST snapshot's tick only where a snapshot exists`,
+    byId.get(gB)?.latestSnapshotTick === 20 &&
+      byId.get(gA)?.latestSnapshotTick === undefined &&
+      byId.get(gC)?.latestSnapshotTick === undefined
+  );
+
+  // Ordering: newest-first by createdAt (gC created last, gA created
+  // first), asserted against these 3 games (plus whatever earlier-suite
+  // games from this same run share the store — restrict the check to the
+  // relative order of gA/gB/gC specifically, since other suites' games can
+  // legitimately interleave).
+  const orderOfOurs = games.filter((g) => g.id === gA || g.id === gB || g.id === gC).map((g) => g.id);
+  check(
+    `[${label}] listGames: newest-first ordering holds across >=3 games (gC, gB, gA)`,
+    orderOfOurs.length === 3 && orderOfOurs[0] === gC && orderOfOurs[1] === gB && orderOfOurs[2] === gA
+  );
+
+  // --- non-vacuity control: confirm gB's commands/snapshots exist BEFORE
+  // the delete, so the "gone after delete" assertion below is meaningful.
+  const gBCommandsBefore = await store.commandsSince(gB, 0);
+  const gBSnapshotBefore = await store.latestSnapshot(gB);
+  console.log(
+    `[${label}] non-vacuity control: gB has ${gBCommandsBefore.length} command(s) and a snapshot (tick ${gBSnapshotBefore?.tick}) BEFORE delete`
+  );
+  check(`[${label}] non-vacuity control: gB commands present before delete`, gBCommandsBefore.length === 1);
+  check(`[${label}] non-vacuity control: gB snapshot present before delete`, gBSnapshotBefore !== null);
+
+  // Cross-contamination control: gA gets its own commands too, untouched by
+  // deleting gB.
+  await store.appendCommands(gA, [{ tick: 3, actor: "p1", type: "noop", payload: {} }]);
+
+  await store.deleteGame(gB);
+
+  const gBCommandsAfter = await store.commandsSince(gB, 0);
+  const gBSnapshotAfter = await store.latestSnapshot(gB);
+  const gBRecordAfter = await store.getGame(gB);
+  console.log(`[${label}] non-vacuity control: gB has ${gBCommandsAfter.length} command(s) AFTER delete`);
+  check(`[${label}] deleteGame: game record removed (getGame -> null)`, gBRecordAfter === null);
+  check(`[${label}] deleteGame: commandsSince returns empty (no orphaned commands)`, gBCommandsAfter.length === 0);
+  check(`[${label}] deleteGame: latestSnapshot returns null (no orphaned snapshot)`, gBSnapshotAfter === null);
+
+  const gACommandsAfter = await store.commandsSince(gA, 0);
+  check(
+    `[${label}] deleteGame(gB): a SECOND game's (gA) commands are untouched`,
+    gACommandsAfter.length === 1 && gACommandsAfter[0].tick === 3
+  );
+  const gARecordAfter = await store.getGame(gA);
+  check(`[${label}] deleteGame(gB): a SECOND game's (gA) record is untouched`, gARecordAfter?.id === gA);
+
+  // deleteGame on an unknown id resolves, not throws.
+  let unknownDeleteThrew = false;
+  try {
+    await store.deleteGame(`unknown-${randomUUID()}`);
+  } catch {
+    unknownDeleteThrew = true;
+  }
+  check(`[${label}] deleteGame(unknown id) resolves rather than throwing`, !unknownDeleteThrew);
+
+  // Round-trip: delete gB, then recreate the SAME id with a fresh log, and
+  // confirm recoverSim sees only the new log's state — no leakage from the
+  // deleted game's (already-removed) commands/snapshots.
+  await store.createGame({ id: gB, name: "List B (v2)", seed: "seed-b-v2" });
+  await store.appendCommands(gB, [{ tick: 1, actor: "p1", type: "noop", payload: {} }]);
+  const { sim: recreated } = await recoverSim(store, gB, (sim) => {
+    const player = sim.spawn();
+    sim.setComponent(player, "hits", { value: 0 });
+    sim.addSystem((s) => {
+      for (const c of s.commands()) {
+        if (c.type !== "noop") continue;
+        const hits = s.getComponent(player, "hits");
+        s.setComponent(player, "hits", { value: hits.value + 1 });
+      }
+    });
+  });
+  check(
+    `[${label}] delete-and-recreate (same id) + recoverSim: replays only the NEW log (tick 1, one noop)`,
+    recreated.tick === 1
+  );
+}
+
 const sqlitePath = join(mkdtempSync(join(tmpdir(), "claude-engine-persistence-")), "test.db");
 const sqlite = sqliteStore(sqlitePath);
 try {
   await runConformanceSuite(sqlite, "sqlite");
+  await runListDeleteSuite(sqlite, "sqlite");
 } finally {
   await sqlite.close();
   rmSync(sqlitePath, { force: true });
@@ -189,6 +337,7 @@ if (process.env.DATABASE_URL) {
   const pg = postgresStore(process.env.DATABASE_URL);
   try {
     await runConformanceSuite(pg, "postgres");
+    await runListDeleteSuite(pg, "postgres");
   } finally {
     await pg.close();
   }

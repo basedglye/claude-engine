@@ -6,11 +6,12 @@
     "lib": ["ES2022"],
     "types": []
   },
-  "include": ["src/sim/**/*.ts"],
+  "include": ["src/sim/**/*.ts", "src/render/sounds.ts"],
   "references": [
     { "path": "../../packages/core" },
     { "path": "../../packages/assets" },
     { "path": "../../packages/space" },
-    { "path": "../../packages/interiors" }
+    { "path": "../../packages/interiors" },
+    { "path": "../../packages/audio" }
   ]
 }

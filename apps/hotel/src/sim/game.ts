@@ -33,6 +33,7 @@ import {
   moveCircle,
   cellAt,
   cellOfMm,
+  findPathCells,
   CELL,
   CELL_SIZE_MM,
   type NavGrid,
@@ -288,6 +289,24 @@ export interface ScenarioConfig {
    *  of a bulletin that is only delivered at a day rollover. */
   spawnIntervalMinTicks: number;
   spawnIntervalMaxTicks: number;
+  /** H2b. Pre-dirty the hotel AT SETUP: messes and a broken prop in the
+   *  bedroom nearest the lobby, and a round of job candidates already
+   *  standing at their lobby wait cells.
+   *
+   *  WHY THIS EXISTS. A browser scenario's `setup` builds only the REPLAY
+   *  sim; the page runs the app's own `setup()`, so a browser gate can
+   *  only click what the SHIPPED world contains at the tick it runs. In a
+   *  cold run there are no messes (nobody has checked out) and no
+   *  candidates (cash has not crossed the hire threshold), which is
+   *  exactly why H2a shipped with no repeatable gate for clicking any of
+   *  them — the H2a review made that the first item of H2b's list and
+   *  ruled it blocking if H2b arrived without it. This flag is the
+   *  reviewer's own prescribed route ("a scenario config that pre-dirties
+   *  a lobby-adjacent room at setup"), and `upkeep-click` is the gate.
+   *
+   *  It is FALSE in `DEFAULTS` and every Rng draw it makes is inside its
+   *  own guard, so no shipped path and no pinned golden can see it. */
+  preDirty: boolean;
 }
 
 // H1a shipped `spawnTickMax` in ScenarioConfig but guestSpawnSystem never
@@ -309,7 +328,33 @@ export const DEFAULTS: ScenarioConfig = {
   startingCashMinor: 0,
   spawnIntervalMinTicks: 50,
   spawnIntervalMaxTicks: 150,
+  preDirty: false,
 };
+
+/**
+ * Named scenario configs the HOST may select, by `?worldforgeConfig=<name>`.
+ *
+ * The point of naming them here, in sim code, rather than letting the host
+ * accept an arbitrary JSON config off the query string, is twofold: the
+ * shipped build exposes no way to invent a world (only to pick one of a
+ * committed few — CLAUDE.md's "no dev/debug commands reachable from
+ * production builds", applied to world construction the same way
+ * `?worldforgeSeed` already is), and the browser page and the scenario's
+ * headless replay import the SAME object, so the two worlds cannot drift.
+ * A browser gate whose replay sim was built from a different config would
+ * diverge on tick 1 with no symptom beyond exit 3.
+ */
+export const SCENARIO_CONFIGS: Record<string, ScenarioConfig> = {
+  "upkeep-demo": { ...DEFAULTS, preDirty: true },
+};
+
+/** `setup()` for a named config — the entry point both `main.ts` and the
+ *  `upkeep-click` scenario file call, so neither can pick a different one. */
+export function setupNamed(sim: Sim, name: string): void {
+  const config = SCENARIO_CONFIGS[name];
+  if (!config) throw new Error(`setupNamed: no committed scenario config named "${name}"`);
+  setupWithConfig(sim, config);
+}
 
 function wrapMdeg(mdeg: number): number {
   let m = mdeg % FULL_TURN_MDEG;
@@ -2074,72 +2119,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
 
     // -- the first-hire beat: applications, then printed resumes --
     if (hotel.hireUnlocked && !hasAnyStaffOrCandidates(s)) {
-      const specs: { spec: ReturnType<typeof generateCandidate>; index: number }[] = [];
-      for (let i = 0; i < CANDIDATES_PER_ROUND; i++) {
-        specs.push({ spec: generateCandidate(staffRng, i), index: i });
-      }
-      queueMail(s, hotel.day, "applications", "mail.applications", { count: String(specs.length) });
-      for (const { spec, index } of specs) {
-        const candidateEntity = s.spawn();
-        const spawnMm = cellMm(streetCell.cx, streetCell.cz);
-        s.setComponent<Pos>(candidateEntity, "pos", spawnMm);
-        s.setComponent<Pos>(candidateEntity, "prevPos", spawnMm);
-        s.setComponent<Yaw>(candidateEntity, "yaw", { mdeg: 0 });
-        s.setComponent<Yaw>(candidateEntity, "prevYaw", { mdeg: 0 });
-        s.setComponent<Collider>(candidateEntity, "collider", { radiusMm: GUEST_RADIUS_MM });
-        s.setComponent<NavAgent>(candidateEntity, "navAgent", {
-          goalCx: candidateWaitCellFor(index).cx,
-          goalCz: candidateWaitCellFor(index).cz,
-          path: [],
-          pathIdx: 0,
-          repathAtTick: 0,
-          jitterSeed: spec.seed,
-          stuckTicks: 0,
-          avoidCx: -1,
-          avoidCz: -1,
-        });
-        s.setComponent<Person>(candidateEntity, "person", { kind: "candidate", name: spec.name, seed: spec.seed });
-
-        // The resume is a REAL document entity on the printer tray, read
-        // through the exact held-item path IDs already use.
-        const resumeEntity = s.spawn();
-        const trayMm = { xMm: printerTrayMm.xMm + index * 300, zMm: printerTrayMm.zMm };
-        s.setComponent<DocumentComp>(resumeEntity, "document", {
-          docType: "resume",
-          fields: {
-            name: spec.name,
-            wageAsk: String(spec.wageAsk),
-            skill: String(spec.skillPermille),
-            quirk: spec.quirk,
-          },
-          ownerEntity: candidateEntity,
-          heldBy: 0,
-        });
-        s.setComponent<Pos>(resumeEntity, "pos", trayMm);
-        s.setComponent<Interactable>(resumeEntity, "interactable", {
-          kind: "document",
-          xMm: trayMm.xMm,
-          zMm: trayMm.zMm,
-          radiusMm: INTERACTABLE_RADIUS_MM,
-          arcMdeg: INTERACTABLE_ARC_MDEG,
-        });
-        s.emit("printer.printed", { docType: "resume", documentEntity: resumeEntity, candidateEntity });
-
-        s.setComponent<Candidate>(candidateEntity, "candidate", {
-          wageAsk: spec.wageAsk,
-          skillPermille: spec.skillPermille,
-          quirk: spec.quirk,
-          state: "arriving",
-          resumeEntity,
-        });
-        s.setComponent<Interactable>(candidateEntity, "interactable", {
-          kind: "candidate",
-          xMm: spawnMm.xMm,
-          zMm: spawnMm.zMm,
-          radiusMm: INTERACTABLE_RADIUS_MM,
-          arcMdeg: INTERACTABLE_ARC_MDEG,
-        });
-      }
+      spawnCandidateRound(s, hotel.day, "arriving");
     }
 
     // -- blacklist bulletins, once the tier that reads them is live --
@@ -2152,6 +2132,96 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         queueMail(s, hotel.day, "bulletin", "mail.bulletin", { names: name });
         s.emit("mail.bulletinDelivered", { listId: "blacklist", name, day: hotel.day });
       }
+    }
+  }
+
+  /**
+   * One round of job applications: the mail, the printed resumes on the
+   * tray, and the candidate NPCs themselves.
+   *
+   * Extracted from `mailSystem` in H2b so the `preDirty` config can stand a
+   * round of candidates up AT SETUP through the identical code path the
+   * shipped hire beat uses (see `ScenarioConfig.preDirty`). A separate
+   * "just for the gate" spawn path would give us a gate certifying
+   * something the game never does — the same defect shape as a clerk with
+   * a back door, which this project spent a review round proving absent.
+   *
+   * `arrival` decides only where they START. "arriving" puts them at the
+   * street door and lets `candidateSystem` walk them in, which is the beat
+   * as designed; "waiting" places them on their own wait cell already
+   * interviewable, which is what a browser gate needs at a tick it can
+   * reach. Everything else — specs, resumes, components, events — is one
+   * code path.
+   */
+  function spawnCandidateRound(s: Sim, day: number, arrival: "arriving" | "waiting"): void {
+    const specs: { spec: ReturnType<typeof generateCandidate>; index: number }[] = [];
+    for (let i = 0; i < CANDIDATES_PER_ROUND; i++) {
+      specs.push({ spec: generateCandidate(staffRng, i), index: i });
+    }
+    queueMail(s, day, "applications", "mail.applications", { count: String(specs.length) });
+    for (const { spec, index } of specs) {
+      const waitCell = candidateWaitCellFor(index);
+      const startCell = arrival === "arriving" ? streetCell : waitCell;
+      const candidateEntity = s.spawn();
+      const spawnMm = cellMm(startCell.cx, startCell.cz);
+      s.setComponent<Pos>(candidateEntity, "pos", spawnMm);
+      s.setComponent<Pos>(candidateEntity, "prevPos", spawnMm);
+      s.setComponent<Yaw>(candidateEntity, "yaw", { mdeg: 0 });
+      s.setComponent<Yaw>(candidateEntity, "prevYaw", { mdeg: 0 });
+      s.setComponent<Collider>(candidateEntity, "collider", { radiusMm: GUEST_RADIUS_MM });
+      s.setComponent<NavAgent>(candidateEntity, "navAgent", {
+        goalCx: waitCell.cx,
+        goalCz: waitCell.cz,
+        path: [],
+        pathIdx: 0,
+        repathAtTick: 0,
+        jitterSeed: spec.seed,
+        stuckTicks: 0,
+        avoidCx: -1,
+        avoidCz: -1,
+      });
+      s.setComponent<Person>(candidateEntity, "person", { kind: "candidate", name: spec.name, seed: spec.seed });
+
+      // The resume is a REAL document entity on the printer tray, read
+      // through the exact held-item path IDs already use.
+      const resumeEntity = s.spawn();
+      const trayMm = { xMm: printerTrayMm.xMm + index * 300, zMm: printerTrayMm.zMm };
+      s.setComponent<DocumentComp>(resumeEntity, "document", {
+        docType: "resume",
+        fields: {
+          name: spec.name,
+          wageAsk: String(spec.wageAsk),
+          skill: String(spec.skillPermille),
+          quirk: spec.quirk,
+        },
+        ownerEntity: candidateEntity,
+        heldBy: 0,
+      });
+      s.setComponent<Pos>(resumeEntity, "pos", trayMm);
+      s.setComponent<Interactable>(resumeEntity, "interactable", {
+        kind: "document",
+        xMm: trayMm.xMm,
+        zMm: trayMm.zMm,
+        radiusMm: INTERACTABLE_RADIUS_MM,
+        arcMdeg: INTERACTABLE_ARC_MDEG,
+      });
+      s.emit("printer.printed", { docType: "resume", documentEntity: resumeEntity, candidateEntity });
+
+      s.setComponent<Candidate>(candidateEntity, "candidate", {
+        wageAsk: spec.wageAsk,
+        skillPermille: spec.skillPermille,
+        quirk: spec.quirk,
+        state: arrival,
+        resumeEntity,
+      });
+      s.setComponent<Interactable>(candidateEntity, "interactable", {
+        kind: "candidate",
+        xMm: spawnMm.xMm,
+        zMm: spawnMm.zMm,
+        radiusMm: INTERACTABLE_RADIUS_MM,
+        arcMdeg: INTERACTABLE_ARC_MDEG,
+      });
+      if (arrival === "waiting") s.emit("staff.candidateArrived", { candidateEntity });
     }
   }
 
@@ -2494,6 +2564,81 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         restoredHash: payload.restoredHash,
       });
     }
+  }
+
+  // === preDirty (H2b) ====================================================
+  //
+  // Everything the `upkeep-click` browser gate has to be able to walk up to
+  // and click, standing in the world at tick 0: messes and a broken prop in
+  // the bedroom nearest the lobby, and a round of candidates already
+  // waiting. See `ScenarioConfig.preDirty` for why a browser gate cannot
+  // simply play until these appear.
+  //
+  // Placed LAST in setup, after the systems' helper closures exist and
+  // after every other spawn, so it can only ever append entities — the same
+  // ordering discipline the prop block above records for the headon
+  // fixture. Guarded, so `DEFAULTS` reaches none of it and no pinned
+  // golden can move.
+  if (config.preDirty) {
+    // The bedroom nearest the lobby spawn, ties broken by roomId: a fixed,
+    // derived choice rather than a committed literal, so it survives a
+    // layout change instead of silently pointing at the wrong room.
+    const spawnCell = cellOfMm(grid, floor.spawn.xMm, floor.spawn.zMm);
+    const ranked = [...floor.bedrooms]
+      .map((bedroom) => ({
+        bedroom,
+        distSq: (bedroom.goalCx - spawnCell.cx) ** 2 + (bedroom.goalCz - spawnCell.cz) ** 2,
+      }))
+      .sort((a, b) => a.distSq - b.distSq || a.bedroom.roomId - b.bedroom.roomId);
+    const nearest = ranked[0]?.bedroom;
+    const roomEntity = nearest === undefined ? undefined : roomEntityByRoomId.get(nearest.roomId);
+    if (roomEntity !== undefined) {
+      spawnMessesFor(sim, roomEntity);
+      for (const [entity, prop] of sim.withComponent<Prop>("prop")) {
+        if (prop.roomEntity !== roomEntity || prop.broken) continue;
+        sim.setComponent<Prop>(entity, "prop", { ...prop, broken: true, repairProgress: 0 });
+        sim.emit("prop.broke", { propEntity: entity, roomEntity });
+        break;
+      }
+    }
+    // Open the doors between the lobby and the pre-dirtied room. Not a
+    // convenience: guests never close doors behind them (the H2 ruling,
+    // re-deferred to Phase 3), so a hotel with a checked-out room in it
+    // genuinely has that room's doors standing open — this config is
+    // reproducing the state, not skipping past a mechanic. It keeps the
+    // gate about the click it exists to prove instead of about a
+    // door-opening pose that would be its own derivation.
+    if (roomEntity !== undefined && nearest !== undefined) {
+      const spawnCellForDoors = cellOfMm(grid, floor.spawn.xMm, floor.spawn.zMm);
+      const route = findPathCells(
+        grid,
+        { cx: spawnCellForDoors.cx, cz: spawnCellForDoors.cz },
+        { cx: nearest.goalCx, cz: nearest.goalCz },
+        () => true,
+      );
+      const doorIndicesOnRoute = new Set<number>();
+      for (const cell of route ?? []) {
+        floor.doors.forEach((doorSpec) => {
+          for (const portalCell of portalCellsByDoorIndex[doorSpec.doorIndex] ?? []) {
+            if (portalCell.cx === cell.cx && portalCell.cz === cell.cz) doorIndicesOnRoute.add(doorSpec.doorIndex);
+          }
+        });
+      }
+      for (const [entity, door] of sim.withComponent<Door>("door")) {
+        if (!doorIndicesOnRoute.has(door.doorIndex) || door.open) continue;
+        sim.setComponent<Door>(entity, "door", { ...door, open: true });
+        sim.emit("door", { doorIndex: door.doorIndex, open: true });
+      }
+    }
+
+    // "arriving", not "waiting": a candidate placed straight onto their
+    // wait cell lands ON the lobby spawn point for this layout — the
+    // player would start the run standing inside another person, which is
+    // both a bad screenshot and a state real play never produces. Walking
+    // them in through the street door is the shipped beat, it is
+    // deterministic, and the gate simply waits for them (the arrival tick
+    // is derived and pinned in scenarios/upkeep-click.scenario.mjs).
+    spawnCandidateRound(sim, 1, "arriving");
   }
 
   sim.addSystem(indexSystem);

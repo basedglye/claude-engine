@@ -125,6 +125,41 @@ export function postgresStore(url: string): GameStore {
       if (!row) return null;
       return JSON.parse(row.snapshot) as SimSnapshot;
     },
+    async listGames(): Promise<{ id: string; name: string; seed: string; latestSnapshotTick?: number }[]> {
+      await ready;
+      // Same shape as sqliteStore's: LEFT JOIN a per-game MAX(tick)
+      // subquery so games without a snapshot still get one row, ordered by
+      // the store-wide contract (store.ts) — newest created_at first, ties
+      // broken by id ascending.
+      const res = await pool.query(
+        `SELECT g.id, g.name, g.seed, s.max_tick
+           FROM games g
+           LEFT JOIN (SELECT game_id, MAX(tick) AS max_tick FROM snapshots GROUP BY game_id) s
+             ON s.game_id = g.id
+           ORDER BY g.created_at DESC, g.id ASC`
+      );
+      return (res.rows as { id: string; name: string; seed: string; max_tick: number | string | null }[]).map((r) =>
+        r.max_tick === null || r.max_tick === undefined
+          ? { id: r.id, name: r.name, seed: r.seed }
+          : { id: r.id, name: r.name, seed: r.seed, latestSnapshotTick: Number(r.max_tick) }
+      );
+    },
+    async deleteGame(id: string): Promise<void> {
+      await ready;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("DELETE FROM commands WHERE game_id = $1", [id]);
+        await client.query("DELETE FROM snapshots WHERE game_id = $1", [id]);
+        await client.query("DELETE FROM games WHERE id = $1", [id]);
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
     async close(): Promise<void> {
       await pool.end();
     },

@@ -27,7 +27,8 @@
  */
 import * as THREE from "three";
 import type { EntityId, IWorld } from "@claude-engine/core";
-import type { SceneContext } from "@claude-engine/renderer-three";
+import { createRetroMaterial, type SceneContext } from "@claude-engine/renderer-three";
+import { LOOK } from "./look-lock.js";
 import type { Candidate, DocumentComp, Mess, Pos, Prop, Yaw } from "../sim/components.js";
 import { syncCharacter } from "./characters.js";
 
@@ -89,7 +90,11 @@ export function syncUpkeepObjects(
       live.add(entity);
       const object = ctx.objectFor(entity, () => {
         const geometry = new THREE.BoxGeometry(MESS_SIZE_M, MESS_SIZE_M * 0.5, MESS_SIZE_M);
-        const material = new THREE.MeshStandardMaterial({ color: hashedColor(`mess:${mess.kind}`, 0.4, 0.3) });
+        // H2b: the PS1 material, same factory as the level (see
+        // render/look-lock.ts). Untextured, so only the vertex jitter
+        // compiles in.
+        const material = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+        material.color = hashedColor(`mess:${mess.kind}`, 0.4, 0.3);
         const meshObject = new THREE.Mesh(geometry, material);
         // A quarter-turn per kind, so a room full of them does not read as
         // a grid of identical boxes.
@@ -107,7 +112,8 @@ export function syncUpkeepObjects(
       live.add(entity);
       const object = ctx.objectFor(entity, () => {
         const geometry = new THREE.BoxGeometry(PROP_W_M, PROP_H_M, PROP_W_M * 0.6);
-        const material = new THREE.MeshStandardMaterial({ color: hashedColor(`prop:${prop.kind}`, 0.3, 0.4) });
+        const material = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+        material.color = hashedColor(`prop:${prop.kind}`, 0.3, 0.4);
         return new THREE.Mesh(geometry, material);
       });
       object.position.set(pos.xMm / 1000, PROP_H_M / 2, pos.zMm / 1000);
@@ -120,7 +126,7 @@ export function syncUpkeepObjects(
       const mended = prop.broken && prop.repairProgress > 0 ? prop.repairProgress / 3 : 0;
       object.rotation.z = brokenLean * (1 - Math.min(1, mended));
       const mesh = object as THREE.Mesh;
-      const material = mesh.material as THREE.MeshStandardMaterial | undefined;
+      const material = mesh.material as THREE.MeshLambertMaterial | undefined;
       if (material && "emissive" in material) {
         material.emissive.setRGB(prop.broken ? 0.25 : 0, 0, 0);
       }
@@ -136,7 +142,8 @@ export function syncUpkeepObjects(
       live.add(entity);
       const object = ctx.objectFor(entity, () => {
         const geometry = new THREE.BoxGeometry(TRAY_DOC_W_M, 0.01, TRAY_DOC_H_M);
-        const material = new THREE.MeshStandardMaterial({ color: 0xf2ead6 });
+        const material = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+        material.color = new THREE.Color(0xf2ead6);
         return new THREE.Mesh(geometry, material);
       });
       object.position.set(pos.xMm / 1000, TRAY_Y_M, pos.zMm / 1000);

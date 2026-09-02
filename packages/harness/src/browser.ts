@@ -74,6 +74,11 @@ export interface BrowserSpec {
   probes?: readonly ProbeSpec[];
   /** Abort (exit 2) if the run exceeds this. Default 30_000. */
   timeoutMs?: number;
+  /** Name of a committed `SCENARIO_CONFIGS` entry (e.g. "upkeep-demo") to
+   *  hand the app via ?worldforgeConfig=, exactly the way `scenario.seed`
+   *  is handed over via ?worldforgeSeed= below. Purely additive — a
+   *  scenario that omits it navigates exactly as before. */
+  configName?: string;
 }
 
 export type ProbeSpec =
@@ -85,7 +90,13 @@ export type ProbeSpec =
   // second capture) at the focused screen's projected pose. `appId` is
   // carried for report/debugging symmetry with other probes; the analysis
   // itself only needs the hook's screenRect() and the screenshot bytes.
-  | { probe: "screen-readability"; appId: string };
+  | { probe: "screen-readability"; appId: string }
+  // docs/PHASE-H2.md section 5F. Both read the app's `frameStats()` hook
+  // slot; a scenario that declares either against an app that does not
+  // expose it fails as BrowserInfraError (exit 2), matching the
+  // `sim-tick-ms` precedent rather than silently reporting zeros.
+  | { probe: "frame-time-p95"; sampleMs?: number }
+  | { probe: "draw-calls" };
 
 export interface BrowserRunReport {
   app: string;
@@ -177,6 +188,7 @@ export async function runBrowserScenario(
   // cost a full debugging session once; the guard below makes a mismatch
   // impossible to ship silently.
   let navUrl = withQueryParam(url, "worldforgeSeed", scenario.seed);
+  if (spec.configName) navUrl = withQueryParam(navUrl, "worldforgeConfig", spec.configName);
   if (needsStartBarrier) navUrl = withQueryParam(navUrl, "worldforgeStartPaused", "1");
 
   // Headless Chromium's default GL backend fails to compile Three.js's
@@ -267,6 +279,20 @@ export async function runBrowserScenario(
         throw new BrowserInfraError(
           `Scenario "${scenario.name}" requests the "screen-readability" probe, but the app's test hook exposes no ` +
             `"screenRect" (window.__WORLDFORGE__.screenRect). The app must pass a screenRect() function to installTestHook.`
+        );
+      }
+    }
+
+    const wantsFrameStats = (spec.probes ?? []).some((p) => p.probe === "frame-time-p95" || p.probe === "draw-calls");
+    if (wantsFrameStats) {
+      const hookHasFrameStats = await page.evaluate(
+        () => typeof (window as unknown as { __WORLDFORGE__: { frameStats?: unknown } }).__WORLDFORGE__.frameStats === "function"
+      );
+      if (!hookHasFrameStats) {
+        throw new BrowserInfraError(
+          `Scenario "${scenario.name}" requests a frame-statistics probe ("frame-time-p95" / "draw-calls"), but the ` +
+            `app's test hook exposes no "frameStats" (window.__WORLDFORGE__.frameStats). The app must pass a ` +
+            `frameStats() function to installTestHook (see @claude-engine/renderer-three's ThreeHost.frameStats).`
         );
       }
     }
@@ -738,6 +764,74 @@ async function runProbe(
     return { texelScale: result.texelScale, calibContrast: result.calibContrast, calibPitchErr: result.calibPitchErr };
   }
 
+  if (spec.probe === "draw-calls") {
+    // Two readings: the maximum seen over a short observation window and
+    // the value at the final frame. A single sample would miss the frame
+    // where every guest, mess and prop is on screen at once, which is
+    // exactly the frame the <= 300 budget is written about.
+    const DRAW_CALL_SAMPLE_MS = 500;
+    const sampleMs = Math.min(DRAW_CALL_SAMPLE_MS, Math.max(0, deadline - Date.now()));
+    const result = await page.evaluate(async (ms) => {
+      const hook = (window as unknown as { __WORLDFORGE__: { frameStats?: () => { drawCalls: number } } }).__WORLDFORGE__;
+      const start = performance.now();
+      let max = 0;
+      let last = 0;
+      let reads = 0;
+      do {
+        const stats = hook.frameStats?.();
+        if (stats) {
+          reads++;
+          last = stats.drawCalls;
+          if (last > max) max = last;
+        }
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      } while (performance.now() - start < (ms as number));
+      return { max, atFinalTick: last, reads };
+    }, sampleMs);
+    // A budget check against a number nobody measured is worse than no
+    // check: `max: 0` would sail through `drawCalls.max <= 300` while
+    // proving nothing. Refuse to report it.
+    if (result.reads === 0 || result.max === 0) {
+      throw new BrowserInfraError(
+        `The "draw-calls" probe read no non-zero draw count in ${sampleMs}ms (${result.reads} reads). The app's ` +
+          `frameStats() must report THREE.WebGLRenderer.info.render.calls after each render; a zero here means the ` +
+          `page is not rendering or the slot is stubbed, not that the budget was met.`
+      );
+    }
+    return { max: result.max, atFinalTick: result.atFinalTick };
+  }
+
+  if (spec.probe === "frame-time-p95") {
+    // The hook's ring already holds the run's recent frame deltas; when a
+    // sampleMs is given we additionally wait that long so the window is
+    // populated from THIS phase of the run rather than from page start-up
+    // (the first frames after a WebGL context comes up are not what a
+    // player feels, and including them would make the budget meaningless
+    // in both directions).
+    const sampleMs = Math.min(spec.sampleMs ?? 1000, Math.max(0, deadline - Date.now()));
+    const samples = await page.evaluate(async (ms) => {
+      const hook = (window as unknown as { __WORLDFORGE__: { frameStats?: () => { frameMsSamples: readonly number[] } } }).__WORLDFORGE__;
+      const start = performance.now();
+      while (performance.now() - start < (ms as number)) {
+        await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      }
+      return (hook.frameStats?.().frameMsSamples ?? []).slice();
+    }, sampleMs);
+    // Same refusal as `draw-calls`: an empty sample set must not be
+    // reported as a p95 of 0 ms, which would pass every budget ever
+    // written and mean nothing.
+    if (samples.length === 0) {
+      throw new BrowserInfraError(
+        `The "frame-time-p95" probe collected no frame samples in ${sampleMs}ms. The app's frameStats() must return ` +
+          `wall-clock deltas between rendered frames; an empty window means the render loop is not running.`
+      );
+    }
+    const sorted = [...samples].sort((a, b) => a - b);
+    const p95Ms = sorted[Math.min(sorted.length - 1, Math.floor(0.95 * sorted.length))]!;
+    const avgMs = samples.reduce((sum, v) => sum + v, 0) / samples.length;
+    return { p95Ms, avgMs, samples: samples.length };
+  }
+
   if (spec.probe === "fps") {
     const sampleMs = Math.min(spec.sampleMs ?? 1000, Math.max(0, deadline - Date.now()));
     const samples = await page.evaluate(async (ms) => {
@@ -836,7 +930,11 @@ function lookupProbeValue(probes: Record<string, Record<string, number>>, key: s
         ? "sim-tick-ms"
         : probeKey === "screenReadability"
           ? "screen-readability"
-          : probeKey;
+          : probeKey === "frameTimeP95"
+            ? "frame-time-p95"
+            : probeKey === "drawCalls"
+              ? "draw-calls"
+              : probeKey;
   return probeName && field ? probes[probeName]?.[field] : undefined;
 }
 

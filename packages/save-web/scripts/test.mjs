@@ -469,9 +469,128 @@ async function runExportImport() {
   await store.close();
 }
 
+// --- listGames()/deleteGame() (Phase H2b deferral-1 bundle). Mirrors
+// packages/persistence/scripts/test.mjs's runListDeleteSuite so the two
+// backends are provably interchangeable, including the ordering contract
+// (store-wide, @claude-engine/persistence's store.ts) and the
+// cross-contamination / non-vacuity controls. -----------------------------
+async function runListDeleteSuite() {
+  const store = webStore(freshDbName());
+  const suiteId = randomUUID();
+  const gA = `list-a-${suiteId}`;
+  const gB = `list-b-${suiteId}`;
+  const gC = `list-c-${suiteId}`;
+
+  await store.createGame({ id: gA, name: "List A", seed: "seed-a" });
+  await new Promise((r) => setTimeout(r, 5));
+  await store.createGame({ id: gB, name: "List B", seed: "seed-b" });
+  await new Promise((r) => setTimeout(r, 5));
+  await store.createGame({ id: gC, name: "List C", seed: "seed-c" });
+
+  const fakeSnapshot = (tick, stateHash) => ({
+    v: 2,
+    tick,
+    nextEntity: 1,
+    stateHash,
+    components: {},
+    rng: { root: { seed: 0, state: [0, 0, 0, 0] }, forks: [] },
+  });
+  await store.appendCommands(gB, [{ tick: 1, actor: "p1", type: "noop", payload: {} }]);
+  await store.saveSnapshot(gB, fakeSnapshot(10, 111));
+  await store.saveSnapshot(gB, fakeSnapshot(20, 222)); // newer -> must win
+
+  const games = await store.listGames();
+  const byId = new Map(games.map((g) => [g.id, g]));
+  check("[save-web] listGames returns every created game", byId.has(gA) && byId.has(gB) && byId.has(gC));
+  check(
+    "[save-web] listGames: correct id/name/seed for each game",
+    byId.get(gA)?.name === "List A" &&
+      byId.get(gA)?.seed === "seed-a" &&
+      byId.get(gB)?.name === "List B" &&
+      byId.get(gB)?.seed === "seed-b" &&
+      byId.get(gC)?.name === "List C" &&
+      byId.get(gC)?.seed === "seed-c"
+  );
+  check(
+    "[save-web] listGames: latestSnapshotTick present and equal to the NEWEST snapshot's tick only where a snapshot exists",
+    byId.get(gB)?.latestSnapshotTick === 20 &&
+      byId.get(gA)?.latestSnapshotTick === undefined &&
+      byId.get(gC)?.latestSnapshotTick === undefined
+  );
+
+  const orderOfOurs = games.filter((g) => g.id === gA || g.id === gB || g.id === gC).map((g) => g.id);
+  check(
+    "[save-web] listGames: newest-first ordering holds across >=3 games (gC, gB, gA)",
+    orderOfOurs.length === 3 && orderOfOurs[0] === gC && orderOfOurs[1] === gB && orderOfOurs[2] === gA
+  );
+
+  // --- non-vacuity control: confirm gB's commands/snapshot exist BEFORE
+  // the delete.
+  const gBCommandsBefore = await store.commandsSince(gB, 0);
+  const gBSnapshotBefore = await store.latestSnapshot(gB);
+  console.log(
+    `[save-web] non-vacuity control: gB has ${gBCommandsBefore.length} command(s) and a snapshot (tick ${gBSnapshotBefore?.tick}) BEFORE delete`
+  );
+  check("[save-web] non-vacuity control: gB commands present before delete", gBCommandsBefore.length === 1);
+  check("[save-web] non-vacuity control: gB snapshot present before delete", gBSnapshotBefore !== null);
+
+  // Cross-contamination control: gA gets its own commands, untouched by
+  // deleting gB.
+  await store.appendCommands(gA, [{ tick: 3, actor: "p1", type: "noop", payload: {} }]);
+
+  await store.deleteGame(gB);
+
+  const gBCommandsAfter = await store.commandsSince(gB, 0);
+  const gBSnapshotAfter = await store.latestSnapshot(gB);
+  const gBRecordAfter = await store.getGame(gB);
+  console.log(`[save-web] non-vacuity control: gB has ${gBCommandsAfter.length} command(s) AFTER delete`);
+  check("[save-web] deleteGame: game record removed (getGame -> null)", gBRecordAfter === null);
+  check("[save-web] deleteGame: commandsSince returns empty (no orphaned commands)", gBCommandsAfter.length === 0);
+  check("[save-web] deleteGame: latestSnapshot returns null (no orphaned snapshot)", gBSnapshotAfter === null);
+
+  const gACommandsAfter = await store.commandsSince(gA, 0);
+  check(
+    "[save-web] deleteGame(gB): a SECOND game's (gA) commands are untouched",
+    gACommandsAfter.length === 1 && gACommandsAfter[0].tick === 3
+  );
+  const gARecordAfter = await store.getGame(gA);
+  check("[save-web] deleteGame(gB): a SECOND game's (gA) record is untouched", gARecordAfter?.id === gA);
+
+  let unknownDeleteThrew = false;
+  try {
+    await store.deleteGame(`unknown-${randomUUID()}`);
+  } catch {
+    unknownDeleteThrew = true;
+  }
+  check("[save-web] deleteGame(unknown id) resolves rather than throwing", !unknownDeleteThrew);
+
+  // Round-trip: delete-and-recreate the SAME id, confirm recoverSim sees
+  // only the new log.
+  await store.createGame({ id: gB, name: "List B (v2)", seed: "seed-b-v2" });
+  await store.appendCommands(gB, [{ tick: 1, actor: "p1", type: "noop", payload: {} }]);
+  const { sim: recreated } = await recoverSim(store, gB, (sim) => {
+    const player = sim.spawn();
+    sim.setComponent(player, "hits", { value: 0 });
+    sim.addSystem((s) => {
+      for (const c of s.commands()) {
+        if (c.type !== "noop") continue;
+        const hits = s.getComponent(player, "hits");
+        s.setComponent(player, "hits", { value: hits.value + 1 });
+      }
+    });
+  });
+  check(
+    "[save-web] delete-and-recreate (same id) + recoverSim: replays only the NEW log (tick 1, one noop)",
+    recreated.tick === 1
+  );
+
+  await store.close();
+}
+
 await runStoreConformance();
 await runIntraTickOrdering();
 await runLatestSnapshot();
+await runListDeleteSuite();
 await runSimRoundTrip("normal store");
 await runSimRoundTrip("slow store (risk 3)", slowStoreWrapper);
 await runHotelRoundTrip("hotel: normal store");

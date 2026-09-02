@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@claude-engine/assets": "*",
+    "@claude-engine/audio": "*",
     "@claude-engine/core": "*",
     "@claude-engine/interiors": "*",
     "@claude-engine/persistence": "*",

@@ -6,6 +6,10 @@ import {
   generateDoorMesh,
   DOOR_HEAD_HEIGHT_MM,
   WALL_HEIGHT_MM,
+  synthesizeAtlas,
+  ATLAS_SIZE_PX,
+  ATLAS_TILE_PX,
+  TEXELS_PER_METRE,
 } from "../dist/index.js";
 import { CELL, CELL_SIZE_MM, cellAt, cellOfMm, findPathCells, findRoute, moveCircle, roomAt } from "@claude-engine/space";
 
@@ -46,8 +50,29 @@ function serializeGroundFloor(gf) {
       normals: Array.from(gf.mesh.normals),
       indices: Array.from(gf.mesh.indices),
       colors: Array.from(gf.mesh.colors),
+      uvs: Array.from(gf.mesh.uvs ?? []),
       triCount: gf.mesh.triCount,
     },
+  });
+}
+
+// Serialization of everything EXCEPT `mesh` -- the sim-visible surface of a
+// GroundFloor. H2b's UV emission + lighting bake touch `mesh` bytes only
+// (per docs/PHASE-H2.md section 5D); this hash is what proves it: if H2b
+// ever moves THIS hash, sim-visible data leaked out of the mesh-only change,
+// which is the actual invariant-2 violation to catch (mesh output is
+// presentation, never hashed into sim state -- but that only holds if
+// nothing else moved alongside it).
+function serializeNonMeshFields(gf) {
+  return JSON.stringify({
+    grid: gf.grid,
+    rooms: gf.rooms,
+    portals: gf.portals,
+    doors: gf.doors,
+    spawn: gf.spawn,
+    desk: gf.desk,
+    entranceDoorIndex: gf.entranceDoorIndex,
+    bedrooms: gf.bedrooms,
   });
 }
 
@@ -72,7 +97,24 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // row north and one column east so a 300mm-radius guest can actually
 // stand on a slot. No grid cell, portal, door or mesh vertex changed --
 // only the serialized `desk` block, which this hash covers.
-const GOLDEN_HASH = 0x752bc750;
+// Re-pinned for H2b (previous value: 0x752bc750): buildFloorMesh now emits
+// per-vertex UVs (planar projection into the retro atlas, TEXELS_PER_METRE
+// density) and bakes a corridor/window/lamp vertex-colour lighting
+// multiplier -- both change `mesh.positions`/`colors`/`uvs` bytes for every
+// seed, this one included. This is legal under invariant 2 (asset-synthesis
+// output is presentation, never hashed into sim state) because it is
+// EXCLUSIVELY a mesh-bytes change: `NON_MESH_GOLDEN_HASH` below, which
+// covers every other field, is unchanged from before this diff -- see that
+// hash's own comment for how it proves the separation.
+// Re-pinned a SECOND time inside H2b (0xbf2459e0 -> 0xef96f6ec) when the
+// albedo moved out of the vertex colours and into the atlas. The first
+// H2b pass emitted `atlasColour x roomTint x light`, which describes each
+// material's colour twice and lands at roughly its square -- driving the
+// built game showed the entire hotel rendered as uniform dark mud. Vertex
+// colours now carry the LIGHT alone (see mesh-gen.ts's block comment above
+// FLOOR_PALETTE). Same argument as above applies unchanged: mesh bytes
+// only, and NON_MESH_GOLDEN_HASH did not move across either re-pin.
+const GOLDEN_HASH = 0xef96f6ec;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {
@@ -84,6 +126,23 @@ const GOLDEN_HASH = 0x752bc750;
   const h = hashStr(sa);
   console.log(`  golden hash for seed "${GOLDEN_SEED}": 0x${h.toString(16)}`);
   check(`golden: hash matches pinned value 0x${GOLDEN_HASH.toString(16)}`, h === GOLDEN_HASH);
+}
+
+// --- H2b: non-mesh-field hash, pinned separately -- proves the UV/lighting
+// diff changed `mesh` bytes ONLY. Computed once (see the commit this test
+// change ships in) and pinned like any other golden; if a future PR moves
+// THIS hash without an explicit, reviewed reason, sim-visible data leaked
+// out of what should be a presentation-only change. -----------------------
+const NON_MESH_GOLDEN_HASH = 0x03ea4ca5;
+{
+  const gf = generateGroundFloor(GOLDEN_SEED);
+  const s = serializeNonMeshFields(gf);
+  const h = hashStr(s);
+  console.log(`  non-mesh-fields hash for seed "${GOLDEN_SEED}": 0x${h.toString(16)}`);
+  check(
+    `H2b: non-mesh fields (grid/rooms/portals/doors/spawn/desk/entranceDoorIndex/bedrooms) hash matches pinned value 0x${NON_MESH_GOLDEN_HASH.toString(16)} (proves H2b's mesh diff carried zero sim-visible data)`,
+    h === NON_MESH_GOLDEN_HASH
+  );
 }
 
 // --- One-source-of-truth property: every wall quad <-> every grid boundary,
@@ -617,6 +676,275 @@ const GOLDEN_HASH = 0x752bc750;
 
   console.log(`  H1a risk-1 (queue bypass): ${risk1Ok}/${N} seeds passed`);
   check(`H1a: a departing guest's path from any bedroom goal to the street never crosses the queue chain, across all ${N} seeds`, risk1Ok === N);
+}
+
+// --- H2b: atlas invariants (docs/PHASE-H2.md section 11, mechanical gate 1). -
+{
+  const ATLAS_SEED = GOLDEN_SEED;
+  const atlas = synthesizeAtlas(ATLAS_SEED);
+
+  check("atlas: palette.length <= 32", atlas.palette.length <= 32);
+  console.log(`  atlas palette size: ${atlas.palette.length}`);
+
+  // Deterministic: same seed twice -> byte-identical pixels/regions/palette;
+  // different seed -> different pixels.
+  {
+    const a = synthesizeAtlas(ATLAS_SEED);
+    const b = synthesizeAtlas(ATLAS_SEED);
+    const c = synthesizeAtlas("hotel-h2-look-2");
+    check("atlas: same seed twice -> byte-identical pixels", Buffer.from(a.pixels).equals(Buffer.from(b.pixels)));
+    check("atlas: same seed twice -> identical regions", JSON.stringify(a.regions) === JSON.stringify(b.regions));
+    check("atlas: same seed twice -> identical palette", JSON.stringify(a.palette) === JSON.stringify(b.palette));
+    check("atlas: different seed -> different pixels", !Buffer.from(a.pixels).equals(Buffer.from(c.pixels)));
+  }
+
+  // Every material id buildFloorMesh can stamp has a region; every region is
+  // inside [0,1] and non-degenerate. buildFloorMesh's own vocabulary (see
+  // FLOOR_MATERIAL/DEFAULT_FLOOR_MATERIAL/"wall"/"ceiling" in mesh-gen.ts)
+  // is a subset of this list -- "door" is reserved for a later lane (door
+  // geometry lives outside this package's H2b scope) but still gets a region
+  // since the atlas vocabulary is committed up front.
+  const STAMPABLE_MATERIAL_IDS = [
+    "floor:lobby",
+    "floor:corridor",
+    "floor:room1",
+    "floor:room2",
+    "floor:room3",
+    "floor:room4",
+    "floor:default",
+    "wall",
+    "ceiling",
+    "door",
+  ];
+  {
+    let allOk = true;
+    for (const id of STAMPABLE_MATERIAL_IDS) {
+      const r = atlas.regions[id];
+      if (!r) {
+        allOk = false;
+        console.log(`  atlas FAIL: no region for material id "${id}"`);
+        continue;
+      }
+      const inRange = [r.u0, r.v0, r.u1, r.v1].every((v) => v >= 0 && v <= 1);
+      const nonDegenerate = r.u1 > r.u0 && r.v1 > r.v0;
+      if (!inRange || !nonDegenerate) {
+        allOk = false;
+        console.log(`  atlas FAIL: region for "${id}" out of [0,1] or degenerate: ${JSON.stringify(r)}`);
+      }
+    }
+    check("atlas: every material id buildFloorMesh can stamp has a region, inside [0,1] and non-degenerate", allOk);
+  }
+
+  // Dither present: on a known near-flat tile region (value noise's lattice
+  // spacing is 32px, so an 8px-wide sample window is locally near-constant),
+  // the Bayer4x4 pattern should show up as high-frequency, period-4
+  // alternation -- horizontally adjacent pixels differ (mean abs diff > 0),
+  // and the row's period-4 autocorrelation beats its period-3 autocorrelation
+  // (4 is the Bayer matrix's period; 3 is an arbitrary non-matching period
+  // used as the "this isn't just noise" control). Made non-vacuous by also
+  // running the same assertions against a synthetic FLAT (undithered) tile
+  // constructed right here, which must FAIL both checks.
+  function meanAbsHDiff(getPixel, x0, y0, w, h) {
+    let sum = 0;
+    let n = 0;
+    for (let y = y0; y < y0 + h; y++) {
+      for (let x = x0; x < x0 + w - 1; x++) {
+        sum += Math.abs(getPixel(x, y) - getPixel(x + 1, y));
+        n++;
+      }
+    }
+    return n > 0 ? sum / n : 0;
+  }
+  function periodAutocorrelation(getPixel, x0, y0, w, h, period) {
+    // Mean product of (value - rowMean) at x and x+period, one row's worth,
+    // normalized by variance -- a standard windowed autocorrelation.
+    let corrSum = 0;
+    let varSum = 0;
+    for (let y = y0; y < y0 + h; y++) {
+      const rowVals = [];
+      for (let x = x0; x < x0 + w; x++) rowVals.push(getPixel(x, y));
+      const mean = rowVals.reduce((a, v) => a + v, 0) / rowVals.length;
+      for (let i = 0; i < rowVals.length; i++) varSum += (rowVals[i] - mean) ** 2;
+      for (let i = 0; i + period < rowVals.length; i++) {
+        corrSum += (rowVals[i] - mean) * (rowVals[i + period] - mean);
+      }
+    }
+    return varSum > 0 ? corrSum / varSum : 0;
+  }
+
+  // Real atlas: sample the top-left 16x16 px of the "wall" tile (deep
+  // enough inside the 128px tile, and small enough relative to the 32px
+  // noise lattice spacing, to be near-flat pre-dither).
+  {
+    const region = atlas.regions["wall"];
+    const tileX0 = Math.round(region.u0 * ATLAS_SIZE_PX);
+    const tileY0 = Math.round(region.v0 * ATLAS_SIZE_PX);
+    const getR = (x, y) => atlas.pixels[(y * ATLAS_SIZE_PX + x) * 4];
+    const meanDiff = meanAbsHDiff(getR, tileX0, tileY0, 16, 16);
+    const ac4 = periodAutocorrelation(getR, tileX0, tileY0, 16, 16, 4);
+    const ac3 = periodAutocorrelation(getR, tileX0, tileY0, 16, 16, 3);
+    console.log(`  dither probe (real atlas, "wall" tile): meanAbsHDiff=${meanDiff.toFixed(3)} ac4=${ac4.toFixed(3)} ac3=${ac3.toFixed(3)}`);
+    check("atlas: dithered region has nonzero horizontal pixel alternation (meanAbsHDiff > 0)", meanDiff > 0);
+    check("atlas: dithered region's period-4 autocorrelation exceeds its period-3 autocorrelation (Bayer4x4 signature)", ac4 > ac3);
+  }
+
+  // Control: a synthetic FLAT (undithered, constant-value) tile, same
+  // sampling code. Must fail the meanAbsHDiff>0 check outright (which also
+  // makes the ac4>ac3 comparison moot at 0-vs-0) -- printed either way so
+  // the control's result is visible, per the task's "print that control's
+  // result" instruction.
+  {
+    const FLAT_VALUE = 120;
+    const getFlat = () => FLAT_VALUE;
+    const meanDiffFlat = meanAbsHDiff(getFlat, 0, 0, 16, 16);
+    const ac4Flat = periodAutocorrelation(getFlat, 0, 0, 16, 16, 4);
+    const ac3Flat = periodAutocorrelation(getFlat, 0, 0, 16, 16, 3);
+    console.log(
+      `  dither probe (synthetic FLAT control): meanAbsHDiff=${meanDiffFlat.toFixed(3)} ac4=${ac4Flat.toFixed(3)} ac3=${ac3Flat.toFixed(3)} (expected to FAIL the dither-present assertions)`
+    );
+    const controlCorrectlyFlat = meanDiffFlat === 0;
+    check(
+      "atlas: dither-present assertion is non-vacuous -- a synthetic flat/undithered tile fails meanAbsHDiff > 0 (the real atlas's pass is meaningful)",
+      controlCorrectlyFlat
+    );
+  }
+}
+
+// --- H2b: texel density -- UV extent * region size / quad world size ∈
+// 64 ± 16 px/m on both axes, for every wall/floor/ceiling quad (docs/
+// PHASE-H2.md section 11, mechanical gate 2). --------------------------------
+{
+  const atlas = synthesizeAtlas(GOLDEN_SEED);
+  const gf = generateGroundFloor(GOLDEN_SEED);
+  const pos = gf.mesh.positions;
+  const uv = gf.mesh.uvs;
+  const ind = gf.mesh.indices;
+
+  check("texel density: mesh carries a uvs array sized 2 floats/vertex", uv.length === (pos.length / 3) * 2);
+
+  function findRegion(u, v) {
+    for (const id of Object.keys(atlas.regions)) {
+      const r = atlas.regions[id];
+      if (u >= r.u0 - 1e-9 && u < r.u1 + 1e-9 && v >= r.v0 - 1e-9 && v < r.v1 + 1e-9) return r;
+    }
+    return null;
+  }
+
+  let checkedQuads = 0;
+  let densityOk = true;
+  const TOLERANCE = 16;
+  const TARGET = 64; // TEXELS_PER_METRE, checked directly below too.
+  check("texel density: TEXELS_PER_METRE constant is 64", TEXELS_PER_METRE === 64);
+  check("texel density: ATLAS_TILE_PX constant is 128", ATLAS_TILE_PX === 128);
+
+  for (let q = 0; q * 6 < ind.length; q++) {
+    const base = q * 6;
+    const corners = [ind[base], ind[base + 1], ind[base + 2], ind[base + 3]];
+    const xs = corners.map((vi) => pos[vi * 3]);
+    const ys = corners.map((vi) => pos[vi * 3 + 1]);
+    const zs = corners.map((vi) => pos[vi * 3 + 2]);
+    const us = corners.map((vi) => uv[vi * 2]);
+    const vs = corners.map((vi) => uv[vi * 2 + 1]);
+
+    const allSameY = ys.every((y) => Math.abs(y - ys[0]) < 1e-9);
+    const region = findRegion(us[0], vs[0]);
+    if (!region) {
+      densityOk = false;
+      console.log(`  texel density FAIL: quad ${q} UV (${us[0]},${vs[0]}) matches no atlas region`);
+      continue;
+    }
+    const regionSizeUPx = (region.u1 - region.u0) * ATLAS_SIZE_PX; // == ATLAS_TILE_PX
+    const regionSizeVPx = (region.v1 - region.v0) * ATLAS_SIZE_PX;
+
+    // World size (metres) per axis, straight from positions (never from
+    // UVs -- UVs may have wrapped, positions never do).
+    let worldSizeU;
+    let worldSizeV;
+    let axisLabel;
+    if (allSameY) {
+      // Floor/ceiling: u<->X, v<->Z.
+      worldSizeU = Math.max(...xs) - Math.min(...xs);
+      worldSizeV = Math.max(...zs) - Math.min(...zs);
+      axisLabel = "xz";
+    } else {
+      const xConst = xs.every((x) => Math.abs(x - xs[0]) < 1e-9);
+      if (xConst) {
+        // X-facing wall: u<->Z, v<->Y.
+        worldSizeU = Math.max(...zs) - Math.min(...zs);
+        worldSizeV = Math.max(...ys) - Math.min(...ys);
+        axisLabel = "zy";
+      } else {
+        // Z-facing wall: u<->X, v<->Y.
+        worldSizeU = Math.max(...xs) - Math.min(...xs);
+        worldSizeV = Math.max(...ys) - Math.min(...ys);
+        axisLabel = "xy";
+      }
+    }
+    if (worldSizeU <= 1e-9 || worldSizeV <= 1e-9) continue; // degenerate, skip
+
+    // Reconstruct each axis' true (unwrapped) texel extent. A quad's
+    // corners only ever take 2 distinct values per axis (min/max), so the
+    // true extent is exactly worldSize*TEXELS_PER_METRE by construction of
+    // wrapPx() in mesh-gen.ts (a pure per-vertex modulo of that value) --
+    // the meaningful thing to verify is that the STORED (wrapped) UV data
+    // is actually consistent with that, not just assume it. `nWraps` is
+    // the number of full tile periods the raw texel run crosses (>0 only
+    // for full-height walls, since WALL_HEIGHT_MM=2.7m exceeds the tile's
+    // 2m period -- see mesh-gen.ts's addQuad doc comment); `localDeltaPx`
+    // is the observed wrapped delta between the max- and min-world corner,
+    // read back from the stored UVs through this quad's own region rect.
+    // u axis.
+    {
+      // Find the corner with min/max world coordinate along u's source axis
+      // rather than min/max UV (UVs wrap; positions don't).
+      const uSourceVals = axisLabel === "xz" ? xs : axisLabel === "zy" ? zs : xs;
+      let minI = 0;
+      let maxI = 0;
+      for (let i = 1; i < 4; i++) {
+        if (uSourceVals[i] < uSourceVals[minI]) minI = i;
+        if (uSourceVals[i] > uSourceVals[maxI]) maxI = i;
+      }
+      const uLocalMinPx = ((us[minI] - region.u0) / (region.u1 - region.u0)) * regionSizeUPx;
+      const uLocalMaxPx = ((us[maxI] - region.u0) / (region.u1 - region.u0)) * regionSizeUPx;
+      const rawTexels = worldSizeU * TEXELS_PER_METRE;
+      const nWraps = Math.floor(rawTexels / ATLAS_TILE_PX + 1e-9);
+      const localDeltaPx = (((uLocalMaxPx - uLocalMinPx) % ATLAS_TILE_PX) + ATLAS_TILE_PX) % ATLAS_TILE_PX;
+      const extentPx = nWraps * ATLAS_TILE_PX + localDeltaPx;
+      const density = extentPx / worldSizeU;
+      if (Math.abs(density - TARGET) > TOLERANCE) {
+        densityOk = false;
+        console.log(
+          `  texel density FAIL (u): quad ${q} axis=${axisLabel} worldSizeU=${worldSizeU.toFixed(3)}m extentPx=${extentPx.toFixed(1)} density=${density.toFixed(1)}px/m`
+        );
+      }
+    }
+    // v axis.
+    {
+      const vSourceVals = ys && !allSameY ? ys : zs;
+      let minI = 0;
+      let maxI = 0;
+      for (let i = 1; i < 4; i++) {
+        if (vSourceVals[i] < vSourceVals[minI]) minI = i;
+        if (vSourceVals[i] > vSourceVals[maxI]) maxI = i;
+      }
+      const vLocalMinPx = ((vs[minI] - region.v0) / (region.v1 - region.v0)) * regionSizeVPx;
+      const vLocalMaxPx = ((vs[maxI] - region.v0) / (region.v1 - region.v0)) * regionSizeVPx;
+      const rawTexels = worldSizeV * TEXELS_PER_METRE;
+      const nWraps = Math.floor(rawTexels / ATLAS_TILE_PX + 1e-9);
+      const localDeltaPx = (((vLocalMaxPx - vLocalMinPx) % ATLAS_TILE_PX) + ATLAS_TILE_PX) % ATLAS_TILE_PX;
+      const extentPx = nWraps * ATLAS_TILE_PX + localDeltaPx;
+      const density = extentPx / worldSizeV;
+      if (Math.abs(density - TARGET) > TOLERANCE) {
+        densityOk = false;
+        console.log(
+          `  texel density FAIL (v): quad ${q} axis=${axisLabel} worldSizeV=${worldSizeV.toFixed(3)}m extentPx=${extentPx.toFixed(1)} density=${density.toFixed(1)}px/m`
+        );
+      }
+    }
+    checkedQuads++;
+  }
+  console.log(`  texel density: checked ${checkedQuads} wall/floor/ceiling quads`);
+  check(`texel density: every wall/floor/ceiling quad's UV extent implies ${TARGET}±${TOLERANCE} px/m on both axes`, densityOk);
 }
 
 if (failures > 0) {

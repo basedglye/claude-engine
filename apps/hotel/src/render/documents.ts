@@ -23,7 +23,8 @@
  */
 import * as THREE from "three";
 import type { EntityId, IWorld } from "@claude-engine/core";
-import type { SceneContext } from "@claude-engine/renderer-three";
+import { createRetroMaterial, type SceneContext } from "@claude-engine/renderer-three";
+import { LOOK } from "./look-lock.js";
 import type { DocumentComp } from "../sim/components.js";
 import { GLYPH_H, type PaintNode } from "@claude-engine/surface-ui";
 import { paintScreen } from "@claude-engine/surface-ui/host";
@@ -120,7 +121,15 @@ function createHeldDocEntry(): HeldDocEntry {
   texture.magFilter = THREE.LinearFilter;
 
   const geometry = new THREE.PlaneGeometry(DOC_W_M, DOC_H_M);
-  const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide, depthTest: false });
+  // EXEMPT, for the same reason the screen quad is (ARCHITECTURE B6):
+  // this is a sheet of text held 40cm from the eye, and an affine warp on
+  // it would destroy the one thing the player is holding it up to do —
+  // read it. Routed through the factory rather than merely omitting the
+  // material, so the exemption is a positive fact `retroFlagsOf` can read
+  // back and a reviewer can grep for.
+  const material = createRetroMaterial({ map: texture, vertexColors: false, look: LOOK, exempt: true, unlit: true });
+  material.side = THREE.DoubleSide;
+  material.depthTest = false;
   const mesh = new THREE.Mesh(geometry, material);
   mesh.renderOrder = 999; // always draw on top, like a prop held up to the lens
   mesh.visible = false;

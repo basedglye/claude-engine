@@ -1,6 +1,17 @@
 import { Sim } from "@claude-engine/core";
 import type { GameRecord, GameStore } from "./store.js";
 
+// Import this module from browser code as `@claude-engine/persistence/recover`
+// (the "./recover" exports subpath, package.json) — never via the barrel
+// (`@claude-engine/persistence`), which pulls in better-sqlite3 and pg that
+// Vite cannot resolve for a browser bundle (the H1b review's prescribed
+// spelling). package.json ALSO exposes a "./dist/*" escape hatch purely so
+// existing deep imports (apps/hotel/src/main.ts currently does
+// `@claude-engine/persistence/dist/recover.js`) keep resolving under the
+// new restrictive "exports" map — that hatch exists only until main.ts
+// migrates to the "./recover" subpath, which is a separate H2b lane's job
+// this same phase. Do not add new deep imports; use "./recover".
+
 /**
  * Snapshot -> restore -> replay tail: the co-designed payoff of Phase 3
  * Scope A's Sim.restore(). Reconstructs a live Sim whose stateHash() equals

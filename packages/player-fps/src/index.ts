@@ -19,6 +19,22 @@ export interface FpsControllerOptions {
   thirdPersonBoomM?: number; // default 3.5
   /** KeyboardEvent.code that toggles first/third person. Default "KeyV". */
   toggleViewKey?: string;
+  /** Third-person spring-arm occlusion test (docs/PHASE-H2.md §4 row 4f,
+   *  apps/hotel/docs/ARCHITECTURE.md B4: "the third-person spring arm
+   *  clamps against walls via a `space` occlusion query"). Given the
+   *  player's world position and the naive (unoccluded) boom position —
+   *  both in METRES, matching this module's onFrame boundary where mm/mdeg
+   *  sim units are converted to m/deg for Three — return the clamped boom
+   *  DISTANCE in metres (not a point): the caller already knows the boom
+   *  direction (sim yaw), so a distance is the smaller, harder-to-misuse
+   *  contract and avoids the caller reconstructing direction from a
+   *  returned point. Absent => the boom keeps its pre-H2b naive behaviour
+   *  (fixed distance, no occlusion test), so a game with no nav grid --
+   *  most scenario/unit-test worlds -- is unaffected. The implementation
+   *  is expected to wrap `losClear`/`cellOfMm` from `@claude-engine/space`
+   *  against the level's NavGrid; that wiring belongs to the app (apps/
+   *  hotel), not to this package, which must stay engine-generic. */
+  boomClip?(fromXM: number, fromZM: number, toXM: number, toZM: number): number;
   /** H1b screen-focus support (docs/PHASE-H1.md "The screen contract").
    *  Optional and additive: a game with no in-world screens never sets
    *  this, and `syntheticPointer.screenClick` is simply absent (matching
@@ -81,6 +97,15 @@ const DEFAULT_EYE_HEIGHT_M = 1.6;
 const DEFAULT_BOOM_M = 3.5;
 const DEFAULT_TOGGLE_KEY = "KeyV";
 const PITCH_CLAMP_MDEG = 89_000; // ~89 deg, presentation-only clamp
+// Pull the boom in from a clamped occlusion hit by a hair so the camera's
+// near clip plane doesn't poke through the wall it just stopped at (a
+// boom sitting exactly ON the wall still straddles the near plane and
+// flickers/z-fights against the wall face it's supposed to be outside of).
+const BOOM_SKIN_M = 0.05;
+// Never let the boom collapse closer than this to the player -- otherwise
+// a player standing flush against a wall (occlusion clamps the boom to
+// ~0m) would put the camera inside their own head/model.
+const BOOM_MIN_DISTANCE_M = 0.3;
 
 export function createFpsController(opts: FpsControllerOptions): FpsController {
   const yawDriftThresholdMdeg = opts.yawDriftThresholdMdeg ?? DEFAULT_YAW_DRIFT_THRESHOLD_MDEG;
@@ -278,6 +303,16 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
   }
 
   function registerInteractable(entity: EntityId, object: THREE.Object3D): void {
+    // H1b deferral row 2: re-registering the same entity with a DIFFERENT
+    // object used to leave the old object's reverse entry in
+    // objectToEntity forever -- a leak, and worse, a stale mapping that
+    // could resolve a raycast hit on a disposed/detached object to a still
+    // -live entity. Drop the old reverse entry first so only the current
+    // object resolves back to this entity.
+    const prevObject = interactables.get(entity);
+    if (prevObject !== undefined && prevObject !== object) {
+      objectToEntity.delete(prevObject);
+    }
     interactables.set(entity, object);
     objectToEntity.set(object, entity);
   }
@@ -385,15 +420,34 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     if (!thirdPerson) {
       camera.position.set(xM, eyeHeightM, zM);
     } else {
-      // Naive spring-arm boom: placed directly behind the SIM yaw (not the
-      // free-look camera yaw), at a fixed distance, no collision sweep
-      // against the level geometry. Accepted jank for H0 per
-      // docs/PHASE-H0.md open question 4 — the boom can clip through walls;
-      // a proper implementation would sphere-cast the boom against the nav
-      // grid / scene and pull it in on hit. Deliberately deferred.
+      // Spring-arm boom: placed directly behind the SIM yaw (not the
+      // free-look camera yaw), at a fixed distance. H2b (docs/PHASE-H2.md
+      // §4 row 4f, closing H0 open question 4 / ARCHITECTURE.md B4) added
+      // the optional `boomClip` occlusion test below; without it (no nav
+      // grid wired up) the boom keeps this naive fixed-distance placement.
       const simYawRad = (simYawMdeg / 1000) * (Math.PI / 180);
-      const boomX = xM - Math.sin(simYawRad) * thirdPersonBoomM;
-      const boomZ = zM - Math.cos(simYawRad) * thirdPersonBoomM;
+      const dirX = -Math.sin(simYawRad);
+      const dirZ = -Math.cos(simYawRad);
+      let boomDistM = thirdPersonBoomM;
+      if (opts.boomClip) {
+        const naiveX = xM + dirX * thirdPersonBoomM;
+        const naiveZ = zM + dirZ * thirdPersonBoomM;
+        const clippedM = opts.boomClip(xM, zM, naiveX, naiveZ);
+        // Only pull in by the skin when the query actually found something
+        // closer than the naive distance -- an unoccluded report (clippedM
+        // at or beyond the naive distance) means there's no wall to keep
+        // clear of, so skinning it would shave a fixed 5cm off every
+        // unoccluded third-person shot for no reason. When it IS occluded,
+        // pull in by the skin so the near clip plane clears the wall the
+        // boom stopped at, then floor at BOOM_MIN_DISTANCE_M so the camera
+        // never collapses into the player's own head against a wall.
+        boomDistM =
+          clippedM < thirdPersonBoomM
+            ? Math.max(BOOM_MIN_DISTANCE_M, clippedM - BOOM_SKIN_M)
+            : Math.min(thirdPersonBoomM, clippedM);
+      }
+      const boomX = xM + dirX * boomDistM;
+      const boomZ = zM + dirZ * boomDistM;
       camera.position.set(boomX, eyeHeightM, boomZ);
     }
 

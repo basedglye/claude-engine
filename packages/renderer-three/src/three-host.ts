@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { Command, EntityId, IWorld } from "@claude-engine/core";
 import { startHostLoop } from "./host-loop.js";
+import type { FrameStats } from "./test-hook.js";
 
 /**
  * Everything a game's `syncScene` callback needs to draw the current world.
@@ -56,10 +57,22 @@ export interface ThreeHostOptions {
   /** Called once per animation frame after syncScene, before render — the
    *  hook player-fps uses to drive the camera at refresh rate. */
   onFrame?(camera: THREE.Camera, world: IWorld, alpha: number): void;
+  /** Scene light levels (H2b). Additive and optional: a game that bakes its
+   *  lighting into vertex colours wants a bright, near-flat rig, and one
+   *  that does not wants the historical default. Defaults are the
+   *  pre-H2b values, so no existing caller changes. */
+  ambientIntensity?: number;
+  keyLightIntensity?: number;
 }
 
 export interface ThreeHost {
   stop(): void;
+  /** Render statistics for the H2b `draw-calls` / `frame-time-p95` probes
+   *  (see `FrameStats` in test-hook.ts). Lives here rather than in the app
+   *  because the WebGLRenderer — the only thing that knows the real draw
+   *  count — is owned by this host and deliberately never handed out. The
+   *  app wires this into `installTestHook({ frameStats })`. */
+  frameStats(): FrameStats;
 }
 
 /** A top-down-friendly orthographic camera: `viewHeight` world units are
@@ -85,8 +98,8 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
   const scene = new THREE.Scene();
   const camera = options.camera ?? new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
 
-  const ambient = new THREE.AmbientLight(0xffffff, 0.6);
-  const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+  const ambient = new THREE.AmbientLight(0xffffff, options.ambientIntensity ?? 0.6);
+  const sun = new THREE.DirectionalLight(0xffffff, options.keyLightIntensity ?? 0.8);
   sun.position.set(5, 10, 5);
   scene.add(ambient, sun);
 
@@ -201,6 +214,16 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     }
   }
 
+  // -- frame statistics (H2b probes) ------------------------------------
+  // A bounded ring: a long browser gate must not grow an unbounded array,
+  // and a p95 over the whole run is what the budget is written against, so
+  // the window is large enough (600 frames ~ 10s at 60Hz) to be a real
+  // distribution rather than a spot reading.
+  const MAX_FRAME_SAMPLES = 600;
+  const frameMsSamples: number[] = [];
+  let lastFrameMs: number | undefined;
+  let lastDrawCalls = 0;
+
   const stopLoop = startHostLoop(world, {
     onTick: () => {
       pumpInput();
@@ -211,10 +234,24 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
       syncScene(ctx, w, alpha);
       onFrame?.(camera, w, alpha);
       renderer.render(scene, camera);
+      // Read AFTER render(): renderer.info.render.calls is reset at the
+      // start of each render and filled during it, so sampling before would
+      // report the previous frame's count off by one frame — a small lie,
+      // but exactly the kind a probe should not tell.
+      lastDrawCalls = renderer.info.render.calls;
+      const nowMs = performance.now();
+      if (lastFrameMs !== undefined) {
+        frameMsSamples.push(nowMs - lastFrameMs);
+        if (frameMsSamples.length > MAX_FRAME_SAMPLES) frameMsSamples.shift();
+      }
+      lastFrameMs = nowMs;
     },
   });
 
   return {
+    frameStats(): FrameStats {
+      return { drawCalls: lastDrawCalls, frameMsSamples: frameMsSamples.slice() };
+    },
     stop(): void {
       stopLoop();
       window.removeEventListener("resize", resize);

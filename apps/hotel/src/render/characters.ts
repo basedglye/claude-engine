@@ -21,7 +21,8 @@
 import * as THREE from "three";
 import type { EntityId } from "@claude-engine/core";
 import { angleDeltaMdeg, FULL_TURN_MDEG } from "@claude-engine/space";
-import type { SceneContext } from "@claude-engine/renderer-three";
+import { createRetroMaterial, type SceneContext } from "@claude-engine/renderer-three";
+import { LOOK } from "./look-lock.js";
 import type { Guest, GuestState, Pos, Yaw } from "../sim/components.js";
 
 // -- deterministic visual variety (no host-side randomness: see file doc) --
@@ -82,7 +83,11 @@ export interface CharacterRig {
 function makeLimb(length: number, thick: number, color: THREE.Color, hangDown: boolean): { pivot: THREE.Group; mesh: THREE.Mesh } {
   const pivot = new THREE.Group();
   const geometry = new THREE.BoxGeometry(thick, length, thick);
-  const material = new THREE.MeshStandardMaterial({ color });
+  // H2b: host geometry wears the same PS1 material as the level, so the
+  // vertex jitter is a property of the WORLD rather than of one mesh. No
+  // map, so `createRetroMaterial` compiles the affine warp out by itself.
+  const material = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+  material.color = color;
   const mesh = new THREE.Mesh(geometry, material);
   // Offset the mesh so the pivot sits at one end (shoulder/hip), matching a
   // hinge rather than rotating the limb's own centre.
@@ -101,13 +106,15 @@ export function createCharacterRig(guest: Guest): CharacterRig {
   root.scale.setScalar(scale);
 
   const torsoGeom = new THREE.BoxGeometry(TORSO_W, TORSO_H, TORSO_D);
-  const torsoMat = new THREE.MeshStandardMaterial({ color });
+  const torsoMat = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+  torsoMat.color = color;
   const torso = new THREE.Mesh(torsoGeom, torsoMat);
   torso.position.y = HIP_Y + TORSO_H / 2;
   root.add(torso);
 
   const headGeom = new THREE.BoxGeometry(HEAD_SIZE, HEAD_SIZE, HEAD_SIZE);
-  const headMat = new THREE.MeshStandardMaterial({ color: color.clone().offsetHSL(0, 0, 0.12) });
+  const headMat = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+  headMat.color = color.clone().offsetHSL(0, 0, 0.12);
   const head = new THREE.Mesh(headGeom, headMat);
   head.position.y = SHOULDER_Y + HEAD_SIZE / 2 + 0.02;
   root.add(head);

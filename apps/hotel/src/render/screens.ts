@@ -14,10 +14,11 @@
  */
 import * as THREE from "three";
 import type { EntityId, IWorld } from "@claude-engine/core";
-import type { SceneContext } from "@claude-engine/renderer-three";
+import { createRetroMaterial, type SceneContext } from "@claude-engine/renderer-three";
 import { SCREEN_H, SCREEN_W } from "@claude-engine/surface-ui";
 import { createScreenSurface } from "@claude-engine/surface-ui/host";
 import { hotelShell, buildScreenWorldView, type Terminal, type ScreenApp, type Pos, type Yaw } from "../sim/game.js";
+import { LOOK } from "./look-lock.js";
 
 export const SCREEN_W_M = 0.55;
 export const SCREEN_H_M = SCREEN_W_M * (SCREEN_H / SCREEN_W);
@@ -55,7 +56,12 @@ function createTerminalGroup(surface: ReturnType<typeof createScreenSurface>): {
   const group = new THREE.Group();
 
   const housingGeometry = new THREE.BoxGeometry(HOUSING_W_M, HOUSING_H_M, HOUSING_DEPTH_M);
-  const housingMaterial = new THREE.MeshStandardMaterial({ color: 0x2b2b2e });
+  // The HOUSING is world geometry and takes the look; only the screen
+  // PLANE below is exempt. Keeping the bezel jittering with everything
+  // else is what makes the still monitor face read as a screen rather
+  // than as a hole in the effect.
+  const housingMaterial = createRetroMaterial({ vertexColors: false, look: LOOK }) as THREE.MeshLambertMaterial;
+  housingMaterial.color = new THREE.Color(0x2b2b2e);
   const housing = new THREE.Mesh(housingGeometry, housingMaterial);
   group.add(housing);
 
@@ -66,7 +72,28 @@ function createTerminalGroup(surface: ReturnType<typeof createScreenSurface>): {
   // plane read as blank/invisible from the "wrong" side even when the
   // orientation math was correct for the OTHER side (H1b review finding).
   const screenGeometry = new THREE.PlaneGeometry(SCREEN_W_M, SCREEN_H_M);
-  const screenMaterial = new THREE.MeshBasicMaterial({ map: surface.texture, side: THREE.DoubleSide });
+  // H2b, ARCHITECTURE B6: THE screen-quad exemption. This goes through the
+  // same factory as every world surface with `exempt: true`, which compiles
+  // BOTH the vertex jitter and the affine UV warp out. It is deliberately
+  // not "a plain MeshBasicMaterial that happens to have no shader on it":
+  // an exemption that lives in the absence of a call is an exemption that
+  // silently ends the day someone gives every material the retro treatment
+  // in a loop. Routing it through the factory makes the exemption a
+  // positive, greppable, runtime-readable fact (`retroFlagsOf`), and
+  // `art-lock` measures it with the shader live on everything else.
+  //
+  // `unlit: true` keeps the CanvasTexture unmodulated by scene lighting —
+  // the readability probe's calibration strip has to measure the texture,
+  // not the light rig, and H1b already shipped this quad unlit for exactly
+  // that reason.
+  const screenMaterial = createRetroMaterial({
+    map: surface.texture,
+    vertexColors: false,
+    look: LOOK,
+    exempt: true,
+    unlit: true,
+  });
+  screenMaterial.side = THREE.DoubleSide;
   const screenMesh = new THREE.Mesh(screenGeometry, screenMaterial);
   screenMesh.position.set(0, 0, SCREEN_Z_OFFSET_M);
   group.add(screenMesh);

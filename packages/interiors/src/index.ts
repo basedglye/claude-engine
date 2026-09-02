@@ -6,21 +6,32 @@ import type { NavGrid, PortalGraph } from "@claude-engine/space";
 import type { MeshDataWithColors } from "@claude-engine/assets";
 import { generateLayout, type DoorSpec } from "./layout.js";
 import { buildFloorMesh } from "./mesh-gen.js";
+import { synthesizeAtlas } from "./atlas.js";
 
 export type { DoorSpec } from "./layout.js";
 export { DOOR_WIDTH_CELLS, DOOR_HEAD_HEIGHT_MM } from "./layout.js";
 export { WALL_HEIGHT_MM } from "./mesh-gen.js";
 export type { MeshDataWithColors } from "@claude-engine/assets";
 export { generateDoorMesh } from "./door-mesh.js";
+export {
+  synthesizeAtlas,
+  ATLAS_SIZE_PX,
+  ATLAS_TILE_PX,
+  TEXELS_PER_METRE,
+  type AtlasData,
+  type AtlasRegion,
+} from "./atlas.js";
 
 export interface GroundFloor {
   grid: NavGrid;
   rooms: number[]; // room-id per cell (parallel to grid.cells)
   portals: PortalGraph;
   doors: DoorSpec[];
-  /** One static mesh for floor+walls+ceiling, vertex-coloured, no UVs.
-   *  Positions in METRES (renderer space; mm/1000) -- geometry is
-   *  presentation, the grid is truth. */
+  /** One static mesh for floor+walls+ceiling, vertex-coloured, with planar
+   *  UVs (H2b) mapped into the retro texture atlas (`synthesizeAtlas`) at
+   *  TEXELS_PER_METRE density, plus a baked corridor/window/lamp lighting
+   *  multiplier folded into `colors`. Positions in METRES (renderer space;
+   *  mm/1000) -- geometry is presentation, the grid is truth. */
   mesh: MeshDataWithColors;
   spawn: { xMm: number; zMm: number; yawMdeg: number }; // lobby center
   /** Front desk: the desk prop cells are FURNITURE in `grid` (see
@@ -47,7 +58,19 @@ export interface GroundFloor {
  *  description to drift). Deterministic: same seed, same bytes, forever. */
 export function generateGroundFloor(seed: string): GroundFloor {
   const layout = generateLayout(seed);
-  const mesh = buildFloorMesh(layout.grid, layout.rooms);
+  // Atlas is a pure function of the same seed -- no separate atlas seed to
+  // thread through and keep in sync. Lighting anchors (entrance door, desk)
+  // come straight out of `layout`; buildFloorMesh's own signature stays
+  // (grid, rooms, atlas, lighting) rather than growing a long positional
+  // list, per the H2b task brief.
+  const atlas = synthesizeAtlas(seed);
+  const entranceDoor = layout.doors[layout.entranceDoorIndex];
+  const mesh = buildFloorMesh(layout.grid, layout.rooms, atlas, {
+    entranceXMm: entranceDoor ? entranceDoor.xMm : layout.spawn.xMm,
+    entranceZMm: entranceDoor ? entranceDoor.zMm : layout.spawn.zMm,
+    deskXMm: layout.desk.xMm,
+    deskZMm: layout.desk.zMm,
+  });
   return {
     grid: layout.grid,
     rooms: layout.rooms,

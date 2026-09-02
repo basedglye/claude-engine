@@ -58,6 +58,27 @@ export interface ScreenRect {
   texelScale: number;
 }
 
+/**
+ * Per-frame render statistics for the `draw-calls` and `frame-time-p95`
+ * probes (docs/PHASE-H2.md section 5F). Additive and optional, exactly like
+ * `tickTimings`/`screenRect`: this package supplies only the slot, and an
+ * app with no interest in the budgets simply never sets it.
+ *
+ * `drawCalls` is the renderer's own count for the LAST rendered frame
+ * (THREE.WebGLRenderer.info.render.calls), not an estimate — a probe that
+ * counted meshes instead would report a number the GPU never saw, which is
+ * the "a gate can report a number that is not true" trap this project has
+ * already paid for once.
+ *
+ * `frameMsSamples` are wall-clock deltas between consecutive rendered
+ * frames, in milliseconds — the thing a player actually feels, and
+ * deliberately NOT the sim's per-tick cost (`tickTimings` is that).
+ */
+export interface FrameStats {
+  drawCalls: number;
+  frameMsSamples: readonly number[];
+}
+
 export interface WorldforgeHook {
   world: IWorld;
   /** The ONLY sim-affecting capability — standard command ingress. */
@@ -85,6 +106,9 @@ export interface WorldforgeHook {
   tickTimings?(): readonly number[];
   /** Present iff `installTestHook` was called with `startPaused: true`. */
   startBarrier?: StartBarrier;
+  /** Present iff the app wired render-loop statistics (H2b — the
+   *  `draw-calls` / `frame-time-p95` probes). See `FrameStats`. */
+  frameStats?(): FrameStats;
   /** Present iff the app wired screen-focus rendering (H1b). This package
    *  supplies only the slot — it stays game-agnostic exactly like `pointer`
    *  and `tickTimings`; the app (e.g. @claude-engine/hotel) supplies the
@@ -126,6 +150,8 @@ export function installTestHook(opts: {
   startPaused?: boolean;
   /** Present iff the app wired screen-focus rendering (see `ScreenRect`). */
   screenRect?: () => ScreenRect | undefined;
+  /** Present iff the app wired render-loop statistics (see `FrameStats`). */
+  frameStats?: () => FrameStats;
 }): WorldforgeHook {
   const log: Command[] = [];
   const hook: WorldforgeHook = {
@@ -159,6 +185,7 @@ export function installTestHook(opts: {
   if (opts.pointer) hook.pointer = opts.pointer;
   if (opts.tickTimings) hook.tickTimings = opts.tickTimings;
   if (opts.screenRect) hook.screenRect = opts.screenRect;
+  if (opts.frameStats) hook.frameStats = opts.frameStats;
   if (opts.startPaused) {
     let released = false;
     hook.startBarrier = {

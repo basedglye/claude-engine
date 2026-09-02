@@ -16,7 +16,8 @@
     "scaffold": "node scripts/scaffold.mjs",
     "check:plugin": "node scripts/check-plugin.mjs",
     "lint": "eslint .",
-    "check:purity": "node scripts/check-purity.mjs"
+    "check:purity": "node scripts/check-purity.mjs",
+    "check:goldens": "node scripts/golden-sweep.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

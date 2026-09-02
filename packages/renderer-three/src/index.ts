@@ -13,4 +13,14 @@ export {
   type SyntheticPointer, type TickQueueEntry,
   type StartBarrier,
   type ScreenRect,
+  type FrameStats,
 } from "./test-hook.js";
+export {
+  createRetroMaterial,
+  retroFlagsOf,
+  instancedScenery,
+  type RetroLook,
+  type RetroMaterialOptions,
+  type RetroMaterialFlags,
+  type InstancedScenery,
+} from "./retro.js";

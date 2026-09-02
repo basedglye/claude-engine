@@ -48,7 +48,11 @@ import { buildFixtures } from "./render/fixtures.js";
 import { buildDecor } from "./render/decor.js";
 import { createHud, type HudState } from "./render/hud.js";
 import { assetStatus } from "./render/assets.js";
-import type { InteractableKind, Interactable } from "./sim/components.js";
+import type { InteractableKind, Interactable, Hotel } from "./sim/components.js";
+import { RENOVATE_COST_MINOR } from "./sim/economy.js";
+import { createWalkthrough } from "./render/walkthrough.js";
+import type { HotelTier } from "./render/procedural.js";
+import { installHoverLookFallback } from "./render/pointer-fallback.js";
 
 const canvasEl = document.querySelector<HTMLCanvasElement>("#app");
 if (!canvasEl) throw new Error("apps/hotel: missing #app canvas in index.html");
@@ -505,6 +509,50 @@ function findFocusedTerminal(world: IWorld): EntityId | undefined {
 }
 
 let lightingRig: LightingRig | undefined;
+let lightingTier = -1;
+const sceneryByTier = new Map<number, THREE.Object3D>();
+
+/** The hotel singleton, read fresh each frame (invariant 4: hosts render,
+ *  sims decide -- the tier is sim state the renderer only ever reads). */
+function readHotel(world: IWorld): Hotel | undefined {
+  for (const entity of world.entities()) {
+    const hotel = world.getComponent<Hotel>(entity, "hotel");
+    if (hotel) return hotel;
+  }
+  return undefined;
+}
+
+/** True within ~1.5 m of the clerk-side terminal anchor -- the walkthrough's
+ *  "walk to the desk" step. Presentation-only distance in mm. */
+function playerNearDesk(world: IWorld): boolean {
+  const pos = world.getComponent<Pos>(PLAYER_ENTITY, "pos");
+  if (!pos) return false;
+  const dx = pos.xMm - floor.desk.xMm;
+  const dz = pos.zMm - floor.desk.zMm;
+  return dx * dx + dz * dz <= 1500 * 1500;
+}
+
+// -- Walkthrough (render/walkthrough.ts): event-driven, skippable with H,
+//    never blocks input. Reads the sim's event stream incrementally. --
+const walkthrough = createWalkthrough();
+/** Events are consumed by TICK, not by index: the sim trims its event log
+ *  to a retention window, so an index cursor would skip or repeat. */
+let walkthroughLastTick = -1;
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyH" && !e.repeat && !focusedScreen) walkthrough.skip();
+});
+
+// -- Pointer-lock fallback (render/pointer-fallback.ts): when a sandboxed
+//    host refuses pointer lock (the claude.ai artifact iframe does), look
+//    follows the hovering cursor instead. Deltas go through the REAL mouse
+//    path so the handedness fix in player-fps applies; lock state goes
+//    through the same normalizer a real pointerlockchange would. --
+installHoverLookFallback(canvas, {
+  requestLock: () => canvas.requestPointerLock(),
+  isLocked: () => document.pointerLockElement === canvas,
+  onLook: (dx, dy) => controller.pointerHandlers.onLook?.(dx, dy),
+  setLocked: (locked) => controller.pointerHandlers.onPointerLockChange?.(locked),
+});
 
 const host = createThreeHost(sim, {
   canvas,
@@ -583,7 +631,20 @@ const host = createThreeHost(sim, {
     const targetEntity = pointerLocked && !focusedScreen ? controller.currentTarget() : undefined;
     const targetKind: InteractableKind | undefined =
       targetEntity !== undefined ? world.getComponent<Interactable>(targetEntity, "interactable")?.kind : undefined;
+    // Walkthrough: feed only the events since the last frame.
+    const newEvents = sim.eventsSince(walkthroughLastTick + 1);
+    if (newEvents.length > 0) walkthroughLastTick = newEvents[newEvents.length - 1]!.tick;
+    const hotelNow = readHotel(world);
+    walkthrough.advance({
+      tick: sim.tick,
+      events: newEvents.map((e) => ({ type: e.type, payload: (e.payload ?? {}) as Record<string, unknown> })),
+      hotel: hotelNow ? { tier: hotelNow.tier, cash: hotelNow.cash, stars: hotelNow.stars, day: hotelNow.day } : undefined,
+      nearDesk: playerNearDesk(world),
+      renovateCostMinor: hotelNow ? (RENOVATE_COST_MINOR[hotelNow.tier + 1] ?? 0) : 0,
+    });
     const hudState: HudState = {
+      walkthrough: walkthrough.current(),
+      endCard: walkthrough.endCard(),
       phase: focusedScreen ? "focused" : pointerLocked ? "playing" : assetStatus.pending > 0 ? "loading" : "entry",
       locked: pointerLocked,
       thirdPerson: thirdPersonMirror,
@@ -601,16 +662,28 @@ const host = createThreeHost(sim, {
     // The building: architecture (walls/floors/trim/desk from the same grid
     // the sim collides against), the street outside, light fixtures and
     // static decor. Built once; textures and glTF models upgrade in place.
-    ctx.scenery("hotel", () => {
+    // Keyed by tier: each tier's scenery is built once on first sight and
+    // swapped by visibility, so a RENOVATE press changes the building the
+    // same frame the sim changes `hotel.tier`.
+    const tierNumber = readHotel(world)?.tier ?? 0;
+    const hotelTier: HotelTier = tierNumber >= 2 ? 2 : tierNumber === 1 ? 1 : 0;
+    const tierGroup = ctx.scenery(`hotel-t${hotelTier}`, () => {
       const g = new THREE.Group();
-      g.add(buildArchitecture(floor));
-      g.add(buildExterior(floor));
-      g.add(buildFixtures(floor));
-      g.add(buildDecor(floor));
+      g.add(buildArchitecture(floor, hotelTier));
+      g.add(buildExterior(floor, hotelTier));
+      g.add(buildFixtures(floor, hotelTier));
+      g.add(buildDecor(floor, hotelTier));
       return g;
     });
-    if (!lightingRig) lightingRig = buildLighting(floor, ctx.scene, ctx.renderer);
-    lightingRig.update(world, performance.now());
+    sceneryByTier.set(hotelTier, tierGroup);
+    for (const [t, g] of sceneryByTier) g.visible = t === hotelTier;
+    if (lightingTier !== hotelTier || !lightingRig) {
+      lightingRig?.dispose();
+      lightingRig = buildLighting(floor, ctx.scene, ctx.renderer, hotelTier);
+      lightingTier = hotelTier;
+    }
+    const rig: LightingRig = lightingRig;
+    rig.update(world, performance.now());
 
     terminalScreens = syncTerminalScreens(ctx, world, controller.registerInteractable);
 

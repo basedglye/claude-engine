@@ -362,3 +362,107 @@ the review worktree, the page has both messes, the broken lamp and two open
 doors, exactly as designed. **Nothing was wrong with `preDirty`.** Worth adding
 to HANDOFF's traps: *`preview_start` ignores which worktree you are reviewing;
 verify the served tree before believing anything it shows you.*
+
+---
+
+## Second addendum — the rooms did not read because the texture pipeline was never uploaded
+
+Chris's report was "fix the atlas contrast so the rooms read, there's no
+contrast". Chasing it found a one-line rendering bug that made the whole of
+H2b's art lane invisible, and the review above (mine) attributed the symptom
+to a narrow palette without finding it. Recorded in full, because the way it
+hid is more instructive than the fix.
+
+### The measurement that located it
+
+The first suspicion was the value structure, and that was measurable. Sampling
+the atlas per material and the baked vertex light per surface class, over the
+same mesh the engine ships:
+
+| surface | atlas albedo | baked light | product |
+|---|---|---|---|
+| floor | 130.2 | x0.888 | **0.454** |
+| wall | 194.4 | x0.653 | **0.497** |
+| ceiling | 210.4 | x0.568 | **0.468** |
+
+The albedo ladder climbs 1.62x; the bake's light ladder descends 1.56x,
+because a ceiling faces away from `SUN_DIR` and a floor faces into it. They
+are near-reciprocal, so the product is flat: a **1.09x spread** across floor,
+wall and ceiling. Not "low contrast" — *cancellation*. Fixing that (see the
+palette comment now in `atlas.ts`) took the modelled spread to **2.97x**.
+
+### But the fix changed nothing on screen, which is what exposed the real bug
+
+Re-running `art-lock` after the palette change produced frames that were
+statistically identical to the old ones: dynamic range 1.37-1.48x before and
+after, and 100% of saturated pixels still in a single 30-degree hue bucket —
+even though the atlas now had cool blue-grey walls (hue 213) and a 2.97x
+ladder. An atlas that cannot move the pixels is not being sampled.
+
+`packages/assets/src/web/geometry.ts`'s `toBufferGeometry` sets `position`,
+`normal`, `color` and the index — and **never set `uv`**, although H2b added
+`MeshData.uvs` as the spec's own additive change (§5D). Three.js with a `map`
+and no `uv` attribute does not fail loudly: it samples texel (0,0) for every
+fragment. Texel (0,0) sits in `floor:lobby` — warm, saturation 0.30 — so the
+entire hotel rendered in one flat tan, modulated only by the vertex-colour
+light bake. That is precisely the measured signature: one hue, and an
+on-screen dynamic range equal to the light ladder alone.
+
+**The whole H2b texture lane was invisible from the day it landed**: atlas
+synthesis, planar UVs, the half-texel gutter, and all three mesh-golden
+re-pins. It also explains an entry in the branch's own history — the second
+re-pin's note that moving albedo out of vertex colours and into the atlas
+made "the entire hotel render as uniform dark mud". Of course it did: that
+commit moved the colour into a texture nothing was sampling.
+
+The fix is one line, `if (mesh.uvs) geometry.setAttribute("uv", ...)`.
+
+### Why every gate stayed green
+
+This is the defect shape this project keeps catching, and it beat the whole
+battery, including my own review:
+
+- `interiors`' texel-density test asserts UVs exist and are correctly scaled
+  **in the mesh data** — true, and irrelevant to whether they reach the GPU.
+- The atlas unit tests assert the atlas is well-formed — also true, also
+  irrelevant.
+- `art-lock`'s `screen-readability` probe measures the one surface in the
+  game that is deliberately **exempt** from the atlas, so it was never going
+  to notice.
+- The `draw-calls` and `frame-time` probes are indifferent to what a texture
+  samples.
+- And the human half — the look-lock sign-off, the one step that would have
+  caught it in a second — had not happened yet.
+
+Non-blocking item 7 of the verdict above (the missing `surface-contrast`
+probe, PHASE-H2C §3.3) is now upgraded in importance: a probe that measured
+rendered floor/wall/ceiling separation would have failed on day one. It
+should be treated as the phase's outstanding gate, not a nice-to-have.
+
+### State after the fix
+
+`npm run build`, `npx eslint .`, `check-purity`, **553 tests**, and
+`check:goldens` **12/12** all green — no sim code was touched, and the
+interiors mesh golden did **not** move (the atlas change alters no mesh
+bytes; UV regions are assigned by index). `art-lock` exits 0 on both engines
+with `screen-readability` unchanged at 1.38 / 241.32 / 0, and the four
+screenshots still reproduce byte-identically across runs.
+
+The rooms now read: tiled floors with grout lines in perspective, cool
+panelled walls against warm floors, a dark ceiling, and per-room accent
+floors (the bedrooms are visibly blue, magenta and green).
+
+### What is still outstanding
+
+**The four screenshot compositions want re-tuning for a textured world.**
+Every pose in this file was derived while the hotel was an untextured field,
+and two of them were chosen specifically to work around that — the "only
+frames with a doorway and layered depth read" rule in the header was a
+consequence of the bug, not a property of the art. Shots 2 and 3 now show
+real tiled surfaces but are still framed against a near wall at a steep
+pitch. Re-deriving them against the fixed renderer is quick and is the
+natural next step before the sign-off.
+
+A browser-testable demo of the fixed look was published for the sign-off, so
+Chris can walk the real ground-floor mesh and toggle the bug on and off
+rather than judge from four fixed frames.

@@ -40,27 +40,98 @@ const MATERIAL_IDS = [
   "door",
 ] as const;
 
-/** Base hue/saturation/lightness per material, loosely mirroring
- *  mesh-gen.ts's flat FLOOR_PALETTE/WALL_COLOR/CEILING_COLOR tints so the
- *  atlas reads as "the same rooms, now textured" rather than a different
- *  palette. h in [0,360), s/l in [0,1]. */
+/**
+ * Base hue/saturation/lightness per material.
+ *
+ * THESE LIGHTNESSES ARE CHOSEN AGAINST THE LIGHTING BAKE, NOT IN ISOLATION.
+ * The H2b review measured why the rooms did not read, and it was not "low
+ * contrast" -- it was CANCELLATION. The old palette climbed in albedo
+ * (floor 130 / wall 194 / ceiling 210 mean luminance) while mesh-gen.ts's
+ * bake descends in light (floor x0.888 / wall x0.653 / ceiling x0.568,
+ * because a ceiling faces away from SUN_DIR and a floor faces into it).
+ * The two ladders are near-reciprocal, so the product landed at
+ * 0.454 / 0.497 / 0.468 -- a 1.09x spread. Every surface in the hotel
+ * rendered the same value, which is exactly the "there's no contrast"
+ * report.
+ *
+ * The fix is to make albedo REINFORCE the bake instead of fighting it:
+ * bright floors (they catch the light), mid walls, dark ceilings (they are
+ * in shadow). That is also how an interior lit from above actually reads.
+ * Target render = baseL x the measured per-class light multiplier:
+ *   floor   ~0.66 x 0.888 = 0.59
+ *   wall    ~0.55 x 0.653 = 0.36
+ *   ceiling ~0.39 x 0.568 = 0.22   -> a ~2.6x spread, floor to ceiling.
+ * If the bake's SUN_DIR or FACE_AMBIENT ever changes these must be
+ * re-derived; the interiors unit test now pins the rendered spread so a
+ * regression is caught rather than eyeballed.
+ *
+ * HUE CARRIES A SECOND, INDEPENDENT SIGNAL: temperature. Floors are warm
+ * (h ~28-42), walls and ceilings are cool (h ~212-220). The old palette had
+ * the lobby floor at h35 and the wall at h40 -- the same hue as well as the
+ * same value, so a floor-meets-wall corner carried no cue at all.
+ * Warm-vs-cool survives the bake's warm lamp tint, which a 5-degree hue gap
+ * cannot. Per-room floors keep accent hues (blue/magenta/green) so bedrooms
+ * are told apart at a glance.
+ */
 const MATERIAL_BASE_HSL: Record<(typeof MATERIAL_IDS)[number], readonly [number, number, number]> = {
-  "floor:lobby": [35, 0.3, 0.55],
-  "floor:corridor": [220, 0.06, 0.55],
-  "floor:room1": [210, 0.28, 0.55],
-  "floor:room2": [320, 0.22, 0.52],
-  "floor:room3": [130, 0.24, 0.55],
-  "floor:room4": [35, 0.32, 0.5],
-  "floor:default": [0, 0, 0.5],
-  wall: [40, 0.14, 0.72],
-  ceiling: [0, 0, 0.85],
-  door: [25, 0.4, 0.35],
+  "floor:lobby": [35, 0.32, 0.68],
+  "floor:corridor": [28, 0.16, 0.62],
+  "floor:room1": [205, 0.3, 0.66],
+  "floor:room2": [325, 0.26, 0.64],
+  "floor:room3": [135, 0.28, 0.66],
+  "floor:room4": [42, 0.34, 0.65],
+  "floor:default": [30, 0.1, 0.64],
+  wall: [212, 0.14, 0.55],
+  ceiling: [220, 0.12, 0.39],
+  door: [18, 0.5, 0.26],
 };
 
-/** Shades synthesized per material -- kept small (3) so
- *  MATERIAL_IDS.length * SHADES_PER_MATERIAL + 1 filler <= 32 (the
- *  palette-size gate), with headroom (10*3+1=31). */
+/**
+ * Real-world period of each material's seam grid, in atlas pixels. At
+ * TEXELS_PER_METRE = 64, 32px = 0.5m tiles and 64px = 1m panels.
+ *
+ * WHY SEAMS ARE THE TEXTURE BUDGET. The old tile was value noise plus a
+ * 16px checker at +/-0.06 lightness, dithered across three shades spanning
+ * +/-0.08 -- all of it high-frequency, low-amplitude detail that falls
+ * below one screen pixel at any normal viewing distance and is smeared
+ * further by the PS1 material's affine warp. It measurably vanished.
+ * Low-frequency, HIGH-contrast features survive minification where fine
+ * noise cannot, so the contrast budget goes into a dark line at tile and
+ * panel boundaries: floor tiles and wall panels read as architecture at
+ * 3-4m, and a flat-on view of a large surface gains the internal structure
+ * it previously had none of. `door` gets period 0 -- a door leaf is one
+ * painted panel, and a grid on it would read as a window.
+ */
+const SEAM_PERIOD_PX: Record<(typeof MATERIAL_IDS)[number], number> = {
+  "floor:lobby": 32,
+  "floor:corridor": 32,
+  "floor:room1": 32,
+  "floor:room2": 32,
+  "floor:room3": 32,
+  "floor:room4": 32,
+  "floor:default": 32,
+  wall: 64,
+  ceiling: 64,
+  door: 0,
+};
+
+/** Seam line width, atlas px. Two px at 64px/m is ~3cm -- a grout line. */
+const SEAM_WIDTH_PX = 2;
+
+/** Shades synthesized per material. Still 3 (so
+ *  MATERIAL_IDS.length * SHADES_PER_MATERIAL + 1 = 31 <= 32, the
+ *  palette-size gate), but no longer a symmetric spread about baseL.
+ *  Index 0 is the SEAM shade -- much darker, used only for tile and panel
+ *  boundary lines -- and 1..2 are the two field shades the dither
+ *  alternates between. Spending one of three shades on the seam is what
+ *  buys a legible edge inside the same palette budget. */
 const SHADES_PER_MATERIAL = 3;
+
+/** Lightness offsets from baseL for [seam, field-dark, field-light]. The
+ *  seam is a real step down (not a -0.08 nudge) so it survives both
+ *  minification and the bake's brightest multiplier; the two field shades
+ *  stay close so the dither reads as texture rather than as stripes. */
+const SHADE_OFFSETS: readonly number[] = [-0.2, -0.045, 0.055];
 
 /** Packed RGB (u0..255 each channel) for tiles the atlas allocates but no
  *  material claims (64 slots vs. 10 materials). One shared colour, so it
@@ -194,8 +265,7 @@ export function synthesizeAtlas(seed: string): AtlasData {
     const s = clamp01(baseS + (matRng.next() * 2 - 1) * 0.05);
     const shades: [number, number, number][] = [];
     for (let level = 0; level < SHADES_PER_MATERIAL; level++) {
-      // Levels spread symmetrically around baseL, e.g. 3 levels -> [-0.08, 0, +0.08].
-      const offset = (level - (SHADES_PER_MATERIAL - 1) / 2) * 0.08;
+      const offset = SHADE_OFFSETS[level] ?? 0;
       const l = clamp01(baseL + offset);
       const rgb = hslToRgb255(h, s, l);
       shades.push(rgb);
@@ -232,14 +302,26 @@ export function synthesizeAtlas(seed: string): AtlasData {
         rgb = FILLER_RGB;
       } else {
         const matSeed = materialSeed[id]!;
-        // Value noise (smooth base texture) plus a coarse checker "pattern"
-        // term (procedural synthesis = noise + pattern, per the spec).
-        const noise = valueNoise(matSeed, lx, ly, 32);
-        const patternOn = (Math.floor(lx / 16) + Math.floor(ly / 16)) % 2 === 0;
-        const pattern = patternOn ? 0.06 : -0.06;
-        const combined = clamp01(noise * 0.85 + 0.075 + pattern);
-        const levelIdx = ditherQuantize(combined, SHADES_PER_MATERIAL, x, y);
-        rgb = materialShades[id]![levelIdx]!;
+        const period = SEAM_PERIOD_PX[id];
+        // Seam first: a dark line on the tile/panel grid. Drawn on the
+        // boundary of the material's OWN tile so it still lines up when
+        // mesh-gen repeats the region (projectUv wraps mod ATLAS_TILE_PX).
+        const onSeam =
+          period > 0 && (lx % period < SEAM_WIDTH_PX || ly % period < SEAM_WIDTH_PX);
+        if (onSeam) {
+          rgb = materialShades[id]![0]!;
+        } else {
+          // Field: value noise dithered between the two FIELD shades (1..2).
+          // A coarse checker at the seam period breaks up neighbouring tiles
+          // so a large floor does not read as one repeated stamp.
+          const noise = valueNoise(matSeed, lx, ly, 24);
+          const half = period > 0 ? period : ATLAS_TILE_PX;
+          const patternOn =
+            (Math.floor(lx / half) + Math.floor(ly / half)) % 2 === 0;
+          const combined = clamp01(noise * 0.9 + (patternOn ? 0.09 : -0.02));
+          const levelIdx = ditherQuantize(combined, SHADES_PER_MATERIAL - 1, x, y);
+          rgb = materialShades[id]![1 + levelIdx]!;
+        }
       }
       pixels[off] = rgb[0];
       pixels[off + 1] = rgb[1];

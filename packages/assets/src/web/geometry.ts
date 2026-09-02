@@ -8,6 +8,18 @@ export function toBufferGeometry(mesh: MeshData): THREE.BufferGeometry {
   geometry.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
   geometry.setAttribute("normal", new THREE.BufferAttribute(mesh.normals, 3));
   if (mesh.colors) geometry.setAttribute("color", new THREE.BufferAttribute(mesh.colors, 3));
+  // H2b added MeshData.uvs (planar atlas UVs, docs/PHASE-H2.md section 5D)
+  // but this function was never taught to upload them. Three.js with a
+  // `map` and NO `uv` attribute does not fail loudly -- it samples texel
+  // (0,0) for every fragment, so the whole hotel rendered in one flat
+  // colour lifted from the atlas's top-left pixel, modulated only by the
+  // vertex-colour light bake. That is why the rooms had "no contrast": the
+  // entire texture pipeline (atlas synthesis, planar UVs, the half-texel
+  // gutter, three mesh-golden re-pins) was invisible, and no gate caught it
+  // because the interiors tests assert UVs exist in the DATA, the atlas
+  // tests assert the atlas is well-formed, and art-lock's readability probe
+  // measures the one quad that is deliberately EXEMPT from the atlas.
+  if (mesh.uvs) geometry.setAttribute("uv", new THREE.BufferAttribute(mesh.uvs, 2));
   geometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
   return geometry;
 }

@@ -247,3 +247,69 @@ arc.
 
 **Images**
 - apps/hotel/docs/alpha-loop/reviews/W2-shots/round2/t0-facade.png
+
+## 2026-09-02 (night) — Alpha loop cycle 1 lands: motel tier, RENOVATE, walkthrough, single-file build
+
+**Shipped**
+- `hotel.tier` on the hotel singleton and the `hotel.renovate` command
+  (four ordered refusals), reachable from LEDGER's RENOVATE button and
+  the bare command; demand, segment eligibility and rate ceilings scale
+  with tier; the owner bot prices at what its eligible guests will pay
+  (`a3ef444`).
+- Motel-tier look: procedural canvas textures (stained carpet, scuffed
+  paint, drop ceiling with fluorescents, laminate desk, chain-link lot,
+  neon VACANCY), an interpolated tier 1, tier 2 unchanged; scenery and
+  light rig rebuild on tier change.
+- Event-driven nine-step walkthrough hint line and the tier-2 end card,
+  skippable with H, hidden while a screen is focused.
+- `scripts/build-artifact.mjs`: a single-file build (1.8 MB, all assets
+  inlined, sealed fetch shim, freshness check), a hover-look pointer
+  fallback for sandboxes that refuse pointer lock, and `netlify.toml`.
+
+**Verified**
+- `docs/alpha-loop/reviews/W1.md` round 5: **PASS**. The entrance
+  deadlock (spawn cell doubling as the departure goal) is fixed with
+  goal-aware yielding, region despawn and rank-allocated overflow
+  parking.
+- `docs/alpha-loop/reviews/W2.md`, `W3.md`, `W4.md`: **PASS** (W2 and W3
+  on round 2, W4 on round 1), each independently reconfirmed by the COO
+  rather than taken on the lane's own report.
+- Quiet-tree run: 13 headless gates and 5 browser gates green.
+- `alpha-loop` scenario: hash **402826283**, 9/9 assertions.
+- The tuned 14-day arc (owner bot, seed `hotel-alpha-loop-1`): tier 0 → 1
+  renovation on day 3, first hire shortly after, tier 1 → 2 renovation
+  on day 7, revenue nonzero every day, closes at **$3,203.50**, zero
+  stuck guests.
+- Single-file artifact (1.8 MB) published:
+  https://claude.ai/code/artifact/96023cbe-3604-4734-9f40-688d888dedb4
+
+**This one hurt**
+- The deadlock: guests spawn onto the same street cell that departing
+  guests path to for despawn. Arrivals that missed a queue slot parked on
+  that cell forever — their goal *was* the cell they stood on, so
+  pathfinding returned instantly and they never yielded, never moved,
+  never got reaped. They became a permanent plug that blocked every
+  `leaving` guest behind them. The existing lower-id-yields rule couldn't
+  break it because the blocking agent wasn't part of the ordering at
+  all — an agent standing on its own goal was being treated as "about to
+  leave" instead of "a wall." Round 5 fixed it with goal-aware yielding,
+  a despawn region, and rank-allocated overflow parking.
+- The economy: the first cut of the tiered economy gated the demand
+  *quota* by hotel tier but not which guest *segment* could book, so a
+  business traveler could book a tier-0 motel — the motel couldn't earn
+  enough to afford renovation until leisure guests were allowed to book
+  at tier 0 and the owner bot stopped pricing at the rate ceiling.
+
+**Next**
+- Start cycle 2: playtest QA on the built single-file artifact, tuning
+  against the `alpha-loop` gate numbers, and `docs/WALKTHROUGH.md`
+  written by driving the real build with screenshots. **Not started.**
+
+**Known issues**
+- Same host-side limitations carried from earlier entries (lobby depth,
+  guest models, CRT/radiator fallbacks) — none of cycle 1 touches those.
+- Overflow and candidate wait-cell pools are not deduped against each
+  other (carried forward, non-blocking, W1 round 5 §6).
+
+**Images**
+- apps/hotel/docs/alpha-loop/reviews/W2-shots/round2/t0-lobby-east.png

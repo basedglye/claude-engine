@@ -414,7 +414,7 @@ reading the lane's report.
 5. **Browser gates** (`--browser --verify-replay`, and
    `--browser-engine firefox` for the two that run on both):
    `fps-look-interact`, `reserva-readability`, `save-restore`,
-   `demo-visual`. Command counts must still be exactly 12 / 20 / 69 / 18 —
+   `demo-visual`. Command counts must still be exactly 8 / 18 / 69 / 18 (re-pinned by C3-W1 for the deep lobby; were 12 / 20 / 69 / 18) —
    a green streak over a varying count is not a pass.
 6. **Non-vacuity is evidenced, not asserted.** The report must name the
    exact edit made, the exact assertion string that went red, and four

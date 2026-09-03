@@ -62,3 +62,15 @@ C2-W1 re-runs its 11 beats on the integrated build with hold-T time compression,
 a corrected driver (read every document, compare by procedure rule, not by
 same-named keys), and the fraud rate live; reaches tier 2 and the end card in one
 session; rewrites WALKTHROUGH.md with real tier-2 frames.
+
+## Lane 5 (after lane 4): a missed fraud must cost something
+
+C3-W4's perturbation showed accepting every guest passes every gate: `desk.fraudMissed`
+is emitted and consumed by nothing (reviews score wait, broken props and price only).
+CEO ruling: a missed fraud is a **skip** — at checkout the fraudulent guest pays
+nothing (the stay's `paidMinor` is charged back as an `expense:chargeback` ledger
+line) and files no review, but the audit posts a "fraud loss" line and the hotel
+takes a reputation hit in that guest's segment equivalent to one 1-star review.
+Caught fraud stays as it is. `alpha-loop`'s "accept everything" perturbation must
+then go red on solvency or stars, and `fraud-catch`/`fraud-catch-b`/`escalation-stars`
+must keep their meaning (re-pin hashes honestly). Sim files only; no bot changes.

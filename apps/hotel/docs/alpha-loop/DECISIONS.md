@@ -23,3 +23,22 @@ Inputs: SPARK-1.md (what-ifs), BALLAST-1.md (grounding).
 No human has run door-to-end-card in one sitting; only the headless bot has.
 A live dev server is up for the owner to do exactly that. Everything else is
 individually verified. This cycle sharpens the beats that sitting will feel.
+
+# Cycle 5 (2026-09-03) — escalation is visible
+
+Inputs: SPARK-2.md, BALLAST-2.md. Ballast confirmed the star-tiered rule
+escalation + MAILBOX bulletins are ALREADY built and firing; the only real gap
+is the moment-of-change signal, which the sim key budget (9/9) blocks.
+
+## Picked
+- **"New procedure" notice** (Spark ★, Ballast's cheap host-only version):
+  a host-side HUD notice on `hotel.starsChanged` (tier up → blacklist rule
+  activates) and `mail.bulletinDelivered`, deferred until the player leaves
+  the terminal. Same event-stream pattern as the cycle-4 desk stamp — zero
+  goldens, no sim change. render/hud.ts + main.ts only.
+
+## Cut (logged)
+- The in-RESERVA "NEW" tag on freshly-active rows, archetype-flavoured
+  violation text, streak/buzz bonus, crossRef/loyaltyTier/billingCode:
+  all need sim state / a new ScreenViewData key (moves all goldens) or are
+  post-alpha roadmap. Not this cycle.

@@ -229,6 +229,14 @@ const hud = createHud();
 // Desk feedback stamp (render/desk-stamp.ts): a host-side flash on the
 // focused terminal when a check-in resolves, driven by the sim event stream.
 const deskStamp = createDeskStamp();
+// Escalation-visibility notices (creative-org cycle 5): a rising star tier
+// activates new desk procedures (rules.ts, blacklist row at 2 stars) and
+// MAILBOX bulletins arrive -- but that change is invisible to a player
+// mid-shift. Watch the sim event stream (host-side, zero goldens, same
+// pattern as the desk stamp) and surface a readable notice. Deferred until
+// the player leaves the terminal, since the change usually fires at the
+// midnight audit while the screen is focused (the HUD is hidden then).
+let pendingNotice: string | undefined;
 let lastStampFrameMs = performance.now();
 let thirdPersonMirror = false;
 /** The controller's own notion of "locked" (real pointer lock OR the
@@ -721,6 +729,19 @@ const host = createThreeHost(sim, {
     const stampDtMs = Math.min(100, nowStampMs - lastStampFrameMs);
     lastStampFrameMs = nowStampMs;
     deskStamp.update(newEvents, focusedScreen?.group, stampDtMs);
+    for (const e of newEvents) {
+      if (e.type === "hotel.starsChanged") {
+        const to = (e.payload as { to?: number } | undefined)?.to ?? 0;
+        const from = (e.payload as { from?: number } | undefined)?.from ?? 0;
+        if (to > from) pendingNotice = "New procedure in effect — check MAILBOX";
+      } else if (e.type === "mail.bulletinDelivered" && pendingNotice === undefined) {
+        pendingNotice = "New bulletin in your MAILBOX";
+      }
+    }
+    if (pendingNotice !== undefined && !focusedScreen) {
+      hud.notice(pendingNotice);
+      pendingNotice = undefined;
+    }
     const hotelNow = readHotel(world);
     walkthrough.advance({
       tick: sim.tick,

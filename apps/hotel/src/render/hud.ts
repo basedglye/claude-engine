@@ -23,6 +23,10 @@ export interface HudState {
 
 export interface Hud {
   update(state: HudState): void;
+  /** Show a brief centred notice (e.g. "NEW PROCEDURE IN EFFECT"). Auto-hides
+   *  after ~4.5s. Hidden entirely while a terminal screen is focused (the whole
+   *  HUD is display:none then), so the readability gate never sees it. */
+  notice(text: string): void;
   destroy(): void;
 }
 
@@ -207,6 +211,30 @@ const STYLE = `
   color: #f2e9d8;
 }
 
+#hud .hud-notice {
+  position: absolute;
+  top: 18%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  padding: 10px 22px;
+  background: rgba(10, 8, 6, 0.82);
+  border: 1px solid #d4af37;
+  border-radius: 4px;
+  color: #f2e9d8;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 17px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: center;
+  box-shadow: 0 0 22px rgba(212, 175, 55, 0.28);
+  opacity: 0;
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+#hud .hud-notice[data-visible="1"] {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
 @media (prefers-reduced-motion: reduce) {
   #hud, #hud * {
     transition: none !important;
@@ -245,6 +273,7 @@ export function createHud(root: HTMLElement = document.body): Hud {
       <div class="hud-endcard-title"></div>
       <div class="hud-endcard-body"></div>
     </div>
+    <div class="hud-notice" data-visible="0"></div>
   `;
   root.appendChild(el);
 
@@ -256,6 +285,16 @@ export function createHud(root: HTMLElement = document.body): Hud {
   const endCardEl = el.querySelector<HTMLDivElement>(".hud-endcard")!;
   const endCardTitle = el.querySelector<HTMLDivElement>(".hud-endcard-title")!;
   const endCardBody = el.querySelector<HTMLDivElement>(".hud-endcard-body")!;
+  const noticeEl = el.querySelector<HTMLDivElement>(".hud-notice")!;
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  function notice(text: string): void {
+    noticeEl.textContent = text;
+    noticeEl.dataset.visible = "1";
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      noticeEl.dataset.visible = "0";
+    }, 4500);
+  }
 
   function update(state: HudState): void {
     // NOTE: deliberately does not diff against a stored `last` state object
@@ -322,7 +361,8 @@ export function createHud(root: HTMLElement = document.body): Hud {
     el.remove();
   }
 
-  return { update, destroy };
+  return { update,
+    notice, destroy };
 }
 
 /** Same format as sim/ledger-app.ts's formatMinor: "$" + major + "." +

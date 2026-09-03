@@ -43,7 +43,7 @@ import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from
 import { buildArchitecture } from "./render/architecture.js";
 import { buildExterior } from "./render/exterior.js";
 import { createDoorLeaf } from "./render/door-leaf.js";
-import { configureRenderer, buildLighting, type LightingRig } from "./render/lighting.js";
+import { configureRenderer, buildLighting, setFlickerEnabled, isFlickerEnabled, type LightingRig } from "./render/lighting.js";
 import { buildFixtures } from "./render/fixtures.js";
 import { buildDecor } from "./render/decor.js";
 import { createHud, type HudState } from "./render/hud.js";
@@ -252,6 +252,22 @@ window.addEventListener("keyup", (e: KeyboardEvent) => {
 });
 window.addEventListener("blur", () => {
   fastForwardHeld = false;
+});
+
+// -- Quality toggle (Q): reload with the opposite worldforceQuality. A true
+//    in-place swap would rebuild every scene group and the light rig; a
+//    reload is instant, honest, and keeps the pose via the seed. --
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyQ" && !e.repeat && !focusedScreen) {
+    const url = new URL(window.location.href);
+    const cur = url.searchParams.get("worldforgeQuality");
+    url.searchParams.set("worldforgeQuality", cur === "low" ? "high" : "low");
+    window.location.href = url.toString();
+  }
+  // Flicker toggle (L): the tier-0 fluorescent/lamp flicker on or off.
+  if (e.code === "KeyL" && !e.repeat && !focusedScreen) {
+    setFlickerEnabled(!isFlickerEnabled());
+  }
 });
 
 // Opt-in start barrier (phase-H0 round-2 review, blocking item 1): only

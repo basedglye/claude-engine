@@ -63,6 +63,16 @@ export function configureRenderer(renderer: THREE.WebGLRenderer): void {
 
 /** Deterministic pseudo-random unit float from an integer seed (xorshift-
  *  style mix, no trig, no Math.random). */
+/** Host-only toggle: when false, no fixture flickers (the tier-0 fluorescent
+ *  and any broken-lamp flicker hold steady). Presentation-only, never hashed. */
+let flickerEnabled = true;
+export function setFlickerEnabled(on: boolean): void {
+  flickerEnabled = on;
+}
+export function isFlickerEnabled(): boolean {
+  return flickerEnabled;
+}
+
 function hash01(n: number): number {
   let x = n | 0;
   x ^= x << 13;
@@ -293,7 +303,7 @@ export function buildLighting(
     // second flicker system, per the brief.
     if (hotelTier === 0) brokenRooms.add(ROOM.LOBBY);
     for (const [roomId, lights] of lightsByRoomId) {
-      const flickering = brokenRooms.has(roomId);
+      const flickering = flickerEnabled && brokenRooms.has(roomId);
       for (const light of lights) {
         if (!flickering) {
           if (light.userData.baseIntensity !== undefined) {

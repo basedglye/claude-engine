@@ -347,8 +347,11 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     let strafeMilli = 0;
     if (heldKeys.has("KeyW")) forwardMilli += 1000;
     if (heldKeys.has("KeyS")) forwardMilli -= 1000;
-    if (heldKeys.has("KeyD")) strafeMilli += 1000;
-    if (heldKeys.has("KeyA")) strafeMilli -= 1000;
+    // Screen-right handedness: at yaw 0 the camera looks +Z, and screen-right
+    // is -X, so D must send negative strafe. (The companion of the negated
+    // mouse-X fix; measured live 2026-09-03 — D was moving screen-left.)
+    if (heldKeys.has("KeyD")) strafeMilli -= 1000;
+    if (heldKeys.has("KeyA")) strafeMilli += 1000;
     if (forwardMilli !== 0 || strafeMilli !== 0) {
       submit(opts.makeMove(world.tick + 1, forwardMilli, strafeMilli));
     }

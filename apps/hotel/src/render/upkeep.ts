@@ -28,9 +28,12 @@
 import * as THREE from "three";
 import type { EntityId, IWorld } from "@claude-engine/core";
 import type { SceneContext } from "@claude-engine/renderer-three";
+import type { GroundFloor } from "@claude-engine/interiors";
 import type { Candidate, DocumentComp, Mess, Pos, Prop, Yaw } from "../sim/components.js";
 import { syncCharacter } from "./characters.js";
 import { loadModel, fitToFootprint } from "./assets.js";
+import { roomRects, roomAt, CELL_M } from "./floorplan.js";
+import { snapToNearestWall } from "./placement.js";
 
 /** Same host-only hash render/characters.ts uses, for the same reason:
  *  deterministic visual variety derived from component data. */
@@ -331,9 +334,16 @@ export function syncUpkeepObjects(
   world: IWorld,
   alpha: number,
   registerInteractable: (entity: EntityId, object: THREE.Object3D) => void,
-  registered: Set<EntityId>
+  registered: Set<EntityId>,
+  /** Optional: when given, tv/radiator/lamp/icebox props are visually
+   *  snapped to the nearest wall point within 0.9m of their sim `pos`
+   *  (interaction truth stays `pos`; only the displayed transform moves).
+   *  Callers that don't have a floor handy (or don't pass one) keep the
+   *  prior behaviour of drawing the prop exactly at `pos`. */
+  floor?: GroundFloor
 ): UpkeepSyncResult {
   const live = new Set<EntityId>();
+  const rects = floor ? roomRects(floor) : undefined;
 
   for (const entity of world.entities()) {
     const pos = world.getComponent<Pos>(entity, "pos");
@@ -357,7 +367,18 @@ export function syncUpkeepObjects(
         propRigs.set(entity, rig);
         return obj;
       });
-      object.position.set(pos.xMm / 1000, 0, pos.zMm / 1000);
+      const posM = { x: pos.xMm / 1000, z: pos.zMm / 1000 };
+      let drawPos = posM;
+      if (floor && rects) {
+        const roomId = roomAt(floor, Math.floor(posM.x / CELL_M), Math.floor(posM.z / CELL_M));
+        const room = rects.get(roomId);
+        if (room) {
+          const snapped = snapToNearestWall(room, posM, 0.9);
+          drawPos = { x: snapped.x, z: snapped.z };
+          object.rotation.y = snapped.yawRad;
+        }
+      }
+      object.position.set(drawPos.x, 0, drawPos.z);
       // "Visible dirt-reveal progress" applied to repair, in its cheapest
       // honest form: a broken prop leans, and each repair press stands it
       // back up. The player can read progress off the object rather than

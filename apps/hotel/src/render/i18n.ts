@@ -7,7 +7,7 @@
 const TABLE: Record<string, string> = {
   "wordmark": "GRAND FOYER",
   "entry.cta": "Click to enter the hotel",
-  "entry.controls": "W A S D move · Mouse look · Click interact · V third person · H hints · Esc release mouse",
+  "entry.controls": "W A S D move · Mouse look · Click interact · Hold T to fast-forward · V third person · H hints · Esc release mouse",
   "entry.assetsMissing": "CC0 asset pack not installed — run npm run assets:fetch -w apps/hotel",
   "loading.pending": "Loading assets… {n} pending",
   "loading.ready": "Ready",

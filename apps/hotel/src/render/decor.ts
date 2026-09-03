@@ -15,9 +15,10 @@
  */
 import * as THREE from "three";
 import type { GroundFloor } from "@claude-engine/interiors";
-import { roomRects, deskRect, hasClearance, cellCenterM, doorRects, WALL_HEIGHT_M, ROOM, type RoomRect } from "./floorplan.js";
+import { roomRects, deskRect, cellCenterM, doorRects, WALL_HEIGHT_M, ROOM, type RoomRect } from "./floorplan.js";
 import { loadModel, fitToFootprint, makePbrMaterial } from "./assets.js";
 import { neonSignTexture, type HotelTier } from "./procedural.js";
+import { buildOccupancy, placeAgainstWall, placeOnWallSurface, placeCorner, wallPoint, WALL_SIDES, type WallSide } from "./placement.js";
 
 export type { HotelTier };
 
@@ -549,10 +550,18 @@ function buildCurtains(widthM: number): THREE.Group {
 
 function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): void {
   const desk = deskRect(floor);
-  // Seating cluster in the east half, clear of the desk/queue lane and the
-  // entrance->corridor walking lane (centred x-band near the room middle).
-  const seatX = room.xM1 - Math.min(2.6, room.widthM * 0.4);
-  const seatZ = room.centerZM + room.depthM * 0.15;
+  const occ = buildOccupancy(floor, room, { deskRect: desk, lobbyDoorLane: true });
+
+  // Seating cluster in the east half against north or south wall, clear of
+  // the desk/queue lane and the entrance->corridor walking lane (both
+  // baked into `occ` above).
+  const eastSides: WallSide[] = ["north", "south"];
+  const seatPose =
+    placeAgainstWall(occ, { w: 2.6, d: 1.2 }, { sides: eastSides, minRunM: 2.0 }) ??
+    placeAgainstWall(occ, { w: 2.6, d: 1.2 }, { minRunM: 1.6 });
+  const seatX = seatPose ? seatPose.x : room.xM1 - Math.min(2.6, room.widthM * 0.4);
+  const seatZ = seatPose ? seatPose.z : room.centerZM + room.depthM * 0.15;
+  const seatFacingRy = seatPose ? seatPose.yawRad + Math.PI : 0; // sofa back to wall => group faces into room
 
   const seating = new THREE.Group();
   if (activeTier === 0) {
@@ -592,45 +601,41 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
     seating.add(table);
   }
   seating.position.set(seatX, 0, seatZ);
+  seating.rotation.y = seatFacingRy;
   group.add(seating);
 
-  // Potted plants in the lobby corners (tier 0: cheap plastic ficus).
-  const corners: [number, number][] = [
-    [room.xM0 + 0.4, room.zM0 + 0.4],
-    [room.xM1 - 0.4, room.zM0 + 0.4],
-  ];
-  for (const [x, z] of corners) {
+  // Potted plants in the two free corners farthest from any door (tier 0:
+  // cheap plastic ficus). `placeCorner` marks its own occupancy so the
+  // second call cannot land on the same corner as the first.
+  for (let i = 0; i < 2; i++) {
+    const pose = placeCorner(floor, occ, { w: 0.55, d: 0.55 });
+    if (!pose) break;
     const plant = activeTier === 0 ? buildPlasticFicus() : buildPlant();
-    plant.position.set(x, 0, z);
+    plant.position.set(pose.x, 0, pose.z);
     group.add(plant);
   }
 
-  // Paintings on the long walls at 1.5m.
-  // Both lobby doors (entrance, corridor) sit in the centred x-band, so
-  // hang the paintings well off centre and skip any spot inside a door
-  // span (plus a margin) -- a painting over a doorway was a real bug.
-  const lobbyDoors = doorRects(floor).filter((d) => d.roomA === room.roomId || d.roomB === room.roomId);
-  const clearOfDoors = (x: number): boolean => lobbyDoors.every((d) => x < d.xM0 - 0.6 || x > d.xM1 + 0.6);
-  const paintSpots: [number, number, number][] = [];
-  for (const dx of [-3.2, 3.2, -1.6, 1.6]) {
-    const x = room.centerXM + dx;
-    if (x < room.xM0 + 0.6 || x > room.xM1 - 0.6 || !clearOfDoors(x)) continue;
-    paintSpots.push([x, room.zM0 + 0.03, 0]);
-    paintSpots.push([x, room.zM1 - 0.03, Math.PI]);
-    if (paintSpots.length >= 4) break;
-  }
+  // Paintings centred on the two longest remaining free wall runs.
   let paintSeed = room.roomId * 97;
-  for (const [x, z, ry] of paintSpots) {
+  for (let i = 0; i < 2; i++) {
+    const pose = placeOnWallSurface(occ, 0.7, 0.5);
+    if (!pose) break;
     const painting = buildPainting(paintSeed++);
-    painting.position.set(x, 1.5, z);
-    painting.rotation.y = ry;
+    painting.position.set(pose.x, 1.5, pose.z);
+    painting.rotation.y = pose.yawRad;
     group.add(painting);
   }
 
   if (desk) {
-    // Luggage cart near the desk.
+    // Luggage cart flush to the wall beside the desk, on the clerk side.
+    const cartPose = placeAgainstWall(occ, { w: 0.6, d: 0.4 }, { minRunM: 0.6 });
     const cart = buildLuggageCart();
-    cart.position.set(desk.xM0 - 0.5, 0, desk.centerZM + 0.6);
+    if (cartPose) {
+      cart.position.set(cartPose.x, 0, cartPose.z);
+      cart.rotation.y = cartPose.yawRad;
+    } else {
+      cart.position.set(desk.xM0 - 0.5, 0, desk.centerZM + 0.6);
+    }
     group.add(cart);
 
     // Reception counter top accessories: bell, phone, key rack.
@@ -654,184 +659,209 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
     const offsetX = entrance.axis === "row" ? 0.6 : 0;
     const offsetZ = entrance.axis === "col" ? 0.6 : 0.6;
     stand.position.set(entrance.centerXM + offsetX, 0, entrance.centerZM + offsetZ);
-    if (hasClearance(floor, Math.floor((entrance.centerXM + offsetX) / (room.widthM > 0 ? 1 : 1)), 0, 0)) {
-      // clearance check is best-effort; geometry stays regardless
-    }
     group.add(stand);
   }
 }
 
 function buildCorridor(group: THREE.Group, floor: GroundFloor, room: RoomRect): void {
-  // Console table + plant at the far (max-Z) end.
+  const occ = buildOccupancy(floor, room);
+
+  // Console table + plant centred on the end wall (south, the far end from
+  // the lobby door which sits at the north end of the corridor).
+  const consolePose = placeAgainstWall(occ, { w: 0.9, d: 0.35 }, { sides: ["south", "north"], minRunM: 0.9 });
   const console_ = buildConsoleTable();
-  console_.position.set(room.centerXM, 0, room.zM1 - 0.3);
-  console_.rotation.y = Math.PI;
+  if (consolePose) {
+    console_.position.set(consolePose.x, 0, consolePose.z);
+    console_.rotation.y = consolePose.yawRad;
+  } else {
+    console_.position.set(room.centerXM, 0, room.zM1 - 0.3);
+    console_.rotation.y = Math.PI;
+  }
   group.add(console_);
+  const plantPose = placeCorner(floor, occ, { w: 0.55, d: 0.55 });
   const plant = buildPlant();
-  plant.position.set(room.centerXM + 0.6, 0.75, room.zM1 - 0.3);
+  if (plantPose) plant.position.set(plantPose.x, 0, plantPose.z);
+  else plant.position.set(room.centerXM + 0.6, 0, room.zM1 - 0.3);
   group.add(plant);
 
-  // Paintings every few metres along one long wall.
-  const step = 2.5;
-  let x = room.xM0 + 1.2;
+  // Paintings centred on each wall run between doors (both long walls).
   let seed = room.roomId * 31;
-  while (x < room.xM1 - 0.5) {
+  for (let i = 0; i < 4; i++) {
+    const pose = placeOnWallSurface(occ, 0.7, 0.5, ["west", "east"]);
+    if (!pose) break;
     const painting = buildPainting(seed++);
-    painting.position.set(x, 1.5, room.zM0 + 0.03);
+    painting.position.set(pose.x, 1.5, pose.z);
+    painting.rotation.y = pose.yawRad;
     group.add(painting);
-    x += step;
   }
 
-  // Housekeeping cart against one wall, clear of the centred walking lane.
+  // Housekeeping cart flush to a wall segment between two bedroom doors.
+  const cartPose = placeAgainstWall(occ, { w: 0.7, d: 0.45 }, { sides: ["west", "east"], minRunM: 0.7 });
   const cart = buildHousekeepingCart();
-  cart.position.set(room.xM0 + 0.4, 0, room.zM0 + 0.6);
+  if (cartPose) {
+    cart.position.set(cartPose.x, 0, cartPose.z);
+    cart.rotation.y = cartPose.yawRad;
+  } else {
+    cart.position.set(room.xM0 + 0.4, 0, room.zM0 + 0.6);
+  }
   group.add(cart);
 }
 
-const WALL_SIDES = ["north", "south", "east", "west"] as const;
-type WallSide = (typeof WALL_SIDES)[number];
-
-function pickWall(roomId: number): WallSide {
-  return WALL_SIDES[hashInt(roomId) % WALL_SIDES.length]!;
+/** True when `side` is on the building's outer perimeter (grid boundary),
+ *  used as the exterior-wall proxy for curtains: architecture.ts derives
+ *  fake-window spans with its own ~3m sampling pass over exterior runs
+ *  (see architecture.ts step 8) but does not export that span list, so
+ *  this reuses its "exterior wall" predicate rather than its exact
+ *  window spacing -- curtains land on an exterior wall, just not
+ *  necessarily centred on a specific window. */
+function isExteriorSide(floor: GroundFloor, room: RoomRect, side: WallSide): boolean {
+  const { width, height } = floor.grid;
+  switch (side) {
+    case "north":
+      return room.cz0 === 0;
+    case "south":
+      return room.cz1 >= height;
+    case "west":
+      return room.cx0 === 0;
+    case "east":
+    default:
+      return room.cx1 >= width;
+  }
 }
 
 function buildBedroom(group: THREE.Group, floor: GroundFloor, room: RoomRect, bedroom: GroundFloor["bedrooms"][number]): void {
-  const wall = pickWall(bedroom.roomId);
-  const margin = 0.6;
   const goal = cellCenterM(bedroom.goalCx, bedroom.goalCz);
+  const occ = buildOccupancy(floor, room, { bedroomGoals: [goal] });
 
   const rug = buildRug(Math.min(room.widthM - 0.6, 2.4), Math.min(room.depthM - 0.6, 2.4));
   rug.position.set(room.centerXM, 0, room.centerZM);
   group.add(rug);
 
-  // Bed against the chosen wall, headboard flush to that wall.
-  const bed = activeTier === 0 ? buildMotelBed(bedroom.roomId) : buildBed();
-  let bedX = room.centerXM;
-  let bedZ = room.centerZM;
-  let bedYaw = 0;
-  let nsOffsets: [number, number][] = [];
-  let curtainWall: WallSide | undefined;
-  switch (wall) {
-    case "north":
-      bedZ = room.zM0 + margin + 1.0;
-      bedYaw = Math.PI; // headboard faces -Z (against the north wall)
-      nsOffsets = [
-        [-1.1, 0],
-        [1.1, 0],
-      ];
-      break;
-    case "south":
-      bedZ = room.zM1 - margin - 1.0;
-      bedYaw = 0;
-      nsOffsets = [
-        [-1.1, 0],
-        [1.1, 0],
-      ];
-      break;
-    case "east":
-      bedX = room.xM1 - margin - 1.0;
-      bedYaw = -Math.PI / 2;
-      nsOffsets = [
-        [0, -1.1],
-        [0, 1.1],
-      ];
-      break;
-    case "west":
-    default:
-      bedX = room.xM0 + margin + 1.0;
-      bedYaw = Math.PI / 2;
-      nsOffsets = [
-        [0, -1.1],
-        [0, 1.1],
-      ];
-      curtainWall = "west";
-      break;
+  // Bed headboard flush to the longest wall run that is NOT a door wall
+  // (door spans are already blocked in `occ`, so a run touching a door
+  // wall is either absent or short there).
+  const bedFootprint = { w: 1.7, d: 2.0 };
+  const bedPose = placeAgainstWall(occ, bedFootprint, { minRunM: 1.4 });
+  let bedScale = 1;
+  let bedWall: WallSide = "north";
+  let bedX: number;
+  let bedZ: number;
+  let bedYaw: number;
+  if (bedPose) {
+    bedX = bedPose.x;
+    bedZ = bedPose.z;
+    bedYaw = bedPose.yawRad;
+    // Recover which side this pose sits against for the nightstand offsets.
+    if (Math.abs(bedX - room.xM0) < 0.15) bedWall = "west";
+    else if (Math.abs(bedX - room.xM1) < 0.15) bedWall = "east";
+    else if (Math.abs(bedZ - room.zM0) < 0.15) bedWall = "north";
+    else bedWall = "south";
+    const runLenAvailable = bedWall === "north" || bedWall === "south" ? room.widthM : room.depthM;
+    bedScale = Math.min(1, Math.max(0.55, (runLenAvailable - 0.4) / bedFootprint.w));
+  } else {
+    // Degenerate room (e.g. room 3, 3.75x2.0m): fall back to centred on
+    // the longest wall, scaled down, rather than dropping the bed.
+    const bedWallIsNorth = room.widthM >= room.depthM;
+    bedWall = bedWallIsNorth ? "north" : "west";
+    bedScale = 0.55;
+    const p = wallPoint(room, bedWall, (bedWallIsNorth ? room.widthM : room.depthM) / 2);
+    bedX = p.x;
+    bedZ = p.z;
+    bedYaw = p.yawRad;
+    occ.blockRect(bedX - 0.9, bedZ - 0.1, bedX + 0.9, bedZ + bedFootprint.d * bedScale + 0.1);
   }
-  // Small rooms (this tier's bedrooms can be as shallow as 2m) cannot fit a
-  // full 2m-deep bed with margin on both sides -- clamp the bed (and the
-  // nightstand offsets that ride along its headboard wall) down uniformly
-  // rather than let it overflow past the far wall.
-  const perpDimM = wall === "north" || wall === "south" ? room.depthM : room.widthM;
-  const bedScale = Math.min(1, Math.max(0.55, (perpDimM - margin * 1.2) / 2.2));
+  const bed = activeTier === 0 ? buildMotelBed(bedroom.roomId) : buildBed();
   bed.scale.setScalar(bedScale);
   bed.position.set(bedX, 0, bedZ);
   bed.rotation.y = bedYaw;
   group.add(bed);
 
-  // Two nightstands with lamps, flanking the bed along its headboard wall.
-  for (const [dx0, dz0] of nsOffsets) {
-    const dx = dx0 * bedScale;
-    const dz = dz0 * bedScale;
+  // Nightstands flush to the same wall either side of the bed, 0.1m gap.
+  // Room 3 is too narrow for both -- degrade to one nightstand.
+  const halfBedAlong = (bedFootprint.w * bedScale) / 2;
+  const nsOffset = halfBedAlong + 0.1 + 0.2; // + half nightstand width
+  const alongAxisIsX = bedWall === "north" || bedWall === "south";
+  const nsSides: [number, number][] = alongAxisIsX
+    ? [
+        [-nsOffset, 0],
+        [nsOffset, 0],
+      ]
+    : [
+        [0, -nsOffset],
+        [0, nsOffset],
+      ];
+  let nightstandsPlaced = 0;
+  for (const [dx, dz] of nsSides) {
+    const nx = bedX + dx;
+    const nz = bedZ + dz;
+    if (!occ.isRectFree(nx - 0.2, nz - 0.2, nx + 0.2, nz + 0.2)) continue;
     const nightstand = activeTier === 0 ? buildMotelNightstand(bedroom.roomId) : buildNightstand();
-    nightstand.position.set(bedX + dx, 0, bedZ + dz);
+    nightstand.position.set(nx, 0, nz);
     nightstand.rotation.y = bedYaw;
     group.add(nightstand);
     const lamp = buildTableLamp();
-    lamp.position.set(bedX + dx, 0.5, bedZ + dz);
+    lamp.position.set(nx, 0.5, nz);
     group.add(lamp);
+    occ.blockRect(nx - 0.25, nz - 0.25, nx + 0.25, nz + 0.25);
+    nightstandsPlaced++;
+    if (room.widthM < 3.9 && room.depthM < 2.2 && nightstandsPlaced >= 1) break; // room 3: one side only
   }
 
-  // Wardrobe, desk+chair, dresser+TV, painting -- placed on the remaining
-  // walls, staying off the door span and the goal cell.
-  const otherWalls = WALL_SIDES.filter((w) => w !== wall);
-  const wallPos = (w: WallSide, along: number): { x: number; z: number; ry: number } => {
-    switch (w) {
-      case "north":
-        return { x: room.xM0 + along, z: room.zM0 + margin * 0.6, ry: 0 };
-      case "south":
-        return { x: room.xM0 + along, z: room.zM1 - margin * 0.6, ry: Math.PI };
-      case "east":
-        return { x: room.xM1 - margin * 0.6, z: room.zM0 + along, ry: -Math.PI / 2 };
-      case "west":
-      default:
-        return { x: room.xM0 + margin * 0.6, z: room.zM0 + along, ry: Math.PI / 2 };
-    }
-  };
-  const near = (x: number, z: number): boolean => Math.hypot(x - goal.x, z - goal.z) < 0.9;
-
-  const wardrobeSpot = wallPos(otherWalls[0]!, room.widthM * 0.28);
-  if (!near(wardrobeSpot.x, wardrobeSpot.z)) {
+  // Wardrobe on a wall opposite/adjacent to the bed wall, not blocking the
+  // door lane (already excluded from wall runs via `occ`).
+  const remainingSides = WALL_SIDES.filter((w) => w !== bedWall);
+  const wardrobePose = placeAgainstWall(occ, { w: 1.0, d: 0.6 }, { sides: remainingSides, minRunM: 1.0 });
+  if (wardrobePose) {
     const wardrobe = activeTier === 0 ? buildMotelWardrobe(bedroom.roomId) : buildWardrobe();
-    wardrobe.position.set(wardrobeSpot.x, 0, wardrobeSpot.z);
-    wardrobe.rotation.y = wardrobeSpot.ry;
+    wardrobe.position.set(wardrobePose.x, 0, wardrobePose.z);
+    wardrobe.rotation.y = wardrobePose.yawRad;
     group.add(wardrobe);
   }
 
-  const deskSpot = wallPos(otherWalls[1] ?? otherWalls[0]!, room.widthM * 0.62);
-  if (!near(deskSpot.x, deskSpot.z)) {
+  // Desk on a remaining wall, chair tucked 0.45m in front, facing it.
+  const deskPose = placeAgainstWall(occ, { w: 0.9, d: 0.5 }, { minRunM: 0.9 });
+  if (deskPose) {
     const desk = buildDesk();
-    desk.position.set(deskSpot.x, 0, deskSpot.z);
-    desk.rotation.y = deskSpot.ry;
+    desk.position.set(deskPose.x, 0, deskPose.z);
+    desk.rotation.y = deskPose.yawRad;
     group.add(desk);
     const chair = buildChair();
-    const chairFwd = { x: Math.sin(deskSpot.ry) * 0.45, z: Math.cos(deskSpot.ry) * 0.45 };
-    chair.position.set(deskSpot.x + chairFwd.x, 0, deskSpot.z + chairFwd.z);
-    chair.rotation.y = deskSpot.ry + Math.PI;
+    const fwd = { x: Math.sin(deskPose.yawRad) * 0.45, z: Math.cos(deskPose.yawRad) * 0.45 };
+    chair.position.set(deskPose.x + fwd.x, 0, deskPose.z + fwd.z);
+    chair.rotation.y = deskPose.yawRad + Math.PI;
     group.add(chair);
+    occ.blockRect(chair.position.x - 0.25, chair.position.z - 0.25, chair.position.x + 0.25, chair.position.z + 0.25);
   }
 
-  const dresserSpot = wallPos(otherWalls[2] ?? otherWalls[0]!, room.widthM * 0.28);
-  if (!near(dresserSpot.x, dresserSpot.z)) {
+  // Dresser+TV on a remaining wall.
+  const dresserPose = placeAgainstWall(occ, { w: 0.9, d: 0.4 }, { minRunM: 0.9 });
+  if (dresserPose) {
     const dresser = buildDresserWithTv();
-    dresser.position.set(dresserSpot.x, 0, dresserSpot.z);
-    dresser.rotation.y = dresserSpot.ry;
+    dresser.position.set(dresserPose.x, 0, dresserPose.z);
+    dresser.rotation.y = dresserPose.yawRad;
     group.add(dresser);
   }
 
-  const paintSpot = wallPos(otherWalls[0]!, room.widthM * 0.72);
+  // Painting centred over the bed at 1.5m.
   const painting = buildPainting(bedroom.roomId * 13);
-  painting.position.set(paintSpot.x, 1.5, paintSpot.z);
-  painting.rotation.y = paintSpot.ry;
+  const paintOffsetIn = 0.05;
+  const paintX = bedWall === "west" ? room.xM0 + paintOffsetIn : bedWall === "east" ? room.xM1 - paintOffsetIn : bedX;
+  const paintZ = bedWall === "north" ? room.zM0 + paintOffsetIn : bedWall === "south" ? room.zM1 - paintOffsetIn : bedZ;
+  painting.position.set(paintX, 1.5, paintZ);
+  painting.rotation.y = bedYaw;
   group.add(painting);
 
-  // Curtains on an exterior-facing wall (best-effort: use the wall opposite
-  // the bed when the bed is not already flush there).
-  const drapeWall = curtainWall ?? otherWalls[otherWalls.length - 1]!;
-  const drapeSpot = wallPos(drapeWall, room.widthM * 0.5);
-  const curtains = buildCurtains(drapeWall === "north" || drapeWall === "south" ? room.widthM * 0.6 : room.depthM * 0.6);
-  curtains.position.set(drapeSpot.x, 1.2, drapeSpot.z);
-  curtains.rotation.y = drapeSpot.ry;
-  group.add(curtains);
+  // Curtains only on a wall that touches the building's exterior.
+  const exteriorSides = WALL_SIDES.filter((w) => isExteriorSide(floor, room, w));
+  if (exteriorSides.length > 0) {
+    const drapeWall = exteriorSides[0]!;
+    const along = (drapeWall === "north" || drapeWall === "south" ? room.widthM : room.depthM) / 2;
+    const p = wallPoint(room, drapeWall, along);
+    const curtains = buildCurtains(drapeWall === "north" || drapeWall === "south" ? room.widthM * 0.6 : room.depthM * 0.6);
+    curtains.position.set(p.x, 1.2, p.z);
+    curtains.rotation.y = p.yawRad;
+    group.add(curtains);
+  }
 }
 
 // ============================================================================

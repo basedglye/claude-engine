@@ -241,6 +241,19 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.code === "KeyV" && !e.repeat) thirdPersonMirror = !thirdPersonMirror;
 });
 
+/** Hold-to-fast-forward state (host-only; see tickSim). */
+const FAST_FORWARD_STEPS = 8;
+let fastForwardHeld = false;
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyT" && !e.repeat) fastForwardHeld = true;
+});
+window.addEventListener("keyup", (e: KeyboardEvent) => {
+  if (e.code === "KeyT") fastForwardHeld = false;
+});
+window.addEventListener("blur", () => {
+  fastForwardHeld = false;
+});
+
 // Opt-in start barrier (phase-H0 round-2 review, blocking item 1): only
 // present when the harness navigates here with ?worldforgeStartPaused=1,
 // which it only does for scenarios with tick-gated input steps
@@ -309,6 +322,18 @@ function tickSim(): void {
   sim.step();
   const elapsedMs = performance.now() - start;
   tickTimings.push(elapsedMs);
+  // Time compression (hold T): extra sim steps in the same host tick. The
+  // sim is a pure function of (seed, tick-stamped command log), so running
+  // more ticks per frame changes nothing about determinism or replay; it
+  // only shortens the real-time wait between the day's beats. Disabled
+  // while a screen is focused (typing on the terminal) and never in the
+  // harness (the start barrier / synthetic runs never hold the key).
+  if (fastForwardHeld && !focusedScreen) {
+    for (let i = 1; i < FAST_FORWARD_STEPS; i++) {
+      sim.step();
+      hook.notifyTick(sim.tick);
+    }
+  }
   // Let the harness dispatch any tick-gated input queued for this tick,
   // synchronously and in-page. Polling world.tick from out of process and
   // then dispatching over a round trip is bounded-late — it cost a move
@@ -762,7 +787,7 @@ const host = createThreeHost(sim, {
     //    without this the whole housekeeping/maintenance/hiring layer is
     //    invisible and unclickable in the actual game while every headless
     //    gate stays green.
-    const upkeep = syncUpkeepObjects(ctx, world, alpha, controller.registerInteractable, registeredUpkeepInteractables);
+    const upkeep = syncUpkeepObjects(ctx, world, alpha, controller.registerInteractable, registeredUpkeepInteractables, floor);
     for (const entity of upkeep.live) liveGuests.add(entity);
     pruneCharacters(liveGuests);
 

@@ -194,7 +194,7 @@ export function buildFixtures(floor: GroundFloor, hotelTier: HotelTier): THREE.G
 
       const alongX = corridor.widthM >= corridor.depthM;
       const spacingM = 3;
-      const sconceY = 1.9;
+      const sconceY = 2.15; // above the 1.5 m painting line (C2-W4 review P3)
       if (alongX) {
         const count = Math.max(1, Math.floor(corridor.widthM / spacingM));
         for (let i = 1; i <= count; i++) {

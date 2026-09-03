@@ -326,7 +326,13 @@ export interface ScenarioConfig {
 export const DEFAULTS: ScenarioConfig = {
   guestCount: 8,
   spawnTickMin: 100,
-  fraudRatePermille: 0,
+  // Cycle 3 lane 2 (CEO ruling, docs/alpha-loop/CYCLE-3.md "Lane 2"): the
+  // shipped app must actually spawn fraud. C2-W1's COO review found this at
+  // 0, so the desk beat never existed in the product; headless scenarios
+  // that care about a specific rate override it explicitly and are
+  // unaffected, but any scenario that spreads `...DEFAULTS` without its own
+  // `fraudRatePermille` (and spawns guests) now draws a real fraud stream.
+  fraudRatePermille: 200,
   fixture: "normal",
   upkeep: true,
   arrivals: "demand",

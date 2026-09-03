@@ -610,8 +610,15 @@ export function buildArchitecture(floor: GroundFloor, hotelTier: HotelTier): THR
       // South wall of lobby is internal (toward corridor gap); use east/west walls (long walls run along Z).
       for (const xWall of [lobby.xM0, lobby.xM1]) {
         const inward = xWall === lobby.xM0 ? 1 : -1;
+        // Skip any pilaster whose z would land on the desk run when the
+        // desk is flush against THIS wall (COO review P4: a pilaster was
+        // bisecting the front desk because pilaster generation never
+        // consulted decor's desk rect). 0.5m margin on both ends of the
+        // desk's z-span, same margin PLAN-ALPHA gives other desk clearance.
+        const deskOnThisWall = desk && (Math.abs(desk.xM0 - xWall) < 0.3 || Math.abs(desk.xM1 - xWall) < 0.3);
         for (let z = lobby.zM0 + pitch / 2; z < lobby.zM1; z += pitch) {
           if (nearDoorSpanM(xWall, z, 0.6)) continue;
+          if (deskOnThisWall && desk && z > desk.zM0 - 0.5 && z < desk.zM1 + 0.5) continue;
           const cx = xWall + (inward * pilD) / 2;
           pushBox(wallLobbyAcc, Math.min(xWall, cx) - pilW / 2 + pilW / 2 * 0, xWall + inward * pilD, 0, H - CORNICE_H, z - pilW / 2, z + pilW / 2);
           pushBox(trimAcc, Math.min(xWall, xWall + inward * pilD), Math.max(xWall, xWall + inward * pilD), 0, SKIRT_H + 0.05, z - pilW / 2, z + pilW / 2);

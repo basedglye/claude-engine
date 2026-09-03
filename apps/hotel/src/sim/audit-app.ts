@@ -34,11 +34,16 @@ export const auditApp: ScreenAppDef<AuditState> = {
     const nodes: PaintNode[] = [];
     nodes.push({ kind: "panel", rect: { x: 0, y: 0, w: 640, h: 456 }, fill: 0 });
     nodes.push({ kind: "text", x: 8, y: 4, text: "AUDIT - NIGHT LEDGER", color: 11 });
-    nodes.push({ kind: "text", x: 8, y: 24, text: `Day: ${ledger.day}`, color: 8 });
-    nodes.push({ kind: "text", x: 8, y: 36, text: `Revenue (rooms): ${ledger.revenueMinor}`, color: 9 });
-    nodes.push({ kind: "text", x: 8, y: 48, text: `Expenses: ${ledger.expenseMinor}`, color: 10 });
-    nodes.push({ kind: "hline", x: 8, y: 60, w: 200, color: 14 });
-    nodes.push({ kind: "text", x: 8, y: 68, text: `Closing cash: ${ledger.closingCashMinor}`, color: 8 });
+    // Cycle 3 lane 2 (CYCLE-3.md "Lane 2"): the one line this screen owed
+    // the walkthrough's "run the audit" step -- AUDIT has no button because
+    // the audit already ran itself (H1 ruling, this file's header); this
+    // says so on the screen instead of leaving that only in a doc comment.
+    nodes.push({ kind: "text", x: 8, y: 16, text: "The audit runs itself at midnight. This screen is the report.", color: 14 });
+    nodes.push({ kind: "text", x: 8, y: 36, text: `Day: ${ledger.day}`, color: 8 });
+    nodes.push({ kind: "text", x: 8, y: 48, text: `Revenue (rooms): ${ledger.revenueMinor}`, color: 9 });
+    nodes.push({ kind: "text", x: 8, y: 60, text: `Expenses: ${ledger.expenseMinor}`, color: 10 });
+    nodes.push({ kind: "hline", x: 8, y: 72, w: 200, color: 14 });
+    nodes.push({ kind: "text", x: 8, y: 80, text: `Closing cash: ${ledger.closingCashMinor}`, color: 8 });
 
     // The day's objectives. Added in the H2a review pass: they were sim-real
     // — posted, progressed, settled, carried in `econ.audit`'s payload and
@@ -47,12 +52,12 @@ export const auditApp: ScreenAppDef<AuditState> = {
     // is where every other day-granularity fact lands, so it is where these
     // belong. Targets and rewards are printed verbatim: the player is meant
     // to know exactly what earns what (DESIGN §6).
-    nodes.push({ kind: "text", x: 8, y: 92, text: "TODAY'S OBJECTIVES", color: 12 });
+    nodes.push({ kind: "text", x: 8, y: 104, text: "TODAY'S OBJECTIVES", color: 12 });
     if (data.objectives.length === 0) {
-      nodes.push({ kind: "text", x: 8, y: 108, text: "None posted.", color: 14 });
+      nodes.push({ kind: "text", x: 8, y: 120, text: "None posted.", color: 14 });
       return nodes;
     }
-    let y = 108;
+    let y = 120;
     for (const objective of data.objectives) {
       const mark = objective.done ? "[x]" : "[ ]";
       nodes.push({

@@ -51,11 +51,52 @@ export class RoomOccupancy {
   private readonly rows: number;
   private readonly blocked: Uint8Array;
 
+  /** Wall-mounted items (paintings, sconces) live on a SEPARATE channel
+   *  keyed by side, one flag per GRID_M step along that wall's own axis.
+   *  This is deliberately not the floor `blocked` grid: a painting above a
+   *  dresser is legal, but two wall-mounted items must never share a span
+   *  (COO review P1/P3 -- `placeOnWallSurface` was a pure query that never
+   *  marked anything, so every call in a loop returned the same spot). */
+  private readonly wallSpanBlocked: Record<WallSide, Uint8Array>;
+
   constructor(room: RoomRect) {
     this.room = room;
     this.cols = Math.max(1, Math.ceil(room.widthM / GRID_M));
     this.rows = Math.max(1, Math.ceil(room.depthM / GRID_M));
     this.blocked = new Uint8Array(this.cols * this.rows);
+    const wSteps = Math.ceil(room.widthM / GRID_M) + 2;
+    const dSteps = Math.ceil(room.depthM / GRID_M) + 2;
+    this.wallSpanBlocked = {
+      north: new Uint8Array(wSteps),
+      south: new Uint8Array(wSteps),
+      west: new Uint8Array(dSteps),
+      east: new Uint8Array(dSteps),
+    };
+  }
+
+  private wallSpanIdx(side: WallSide, along: number): number {
+    return Math.round(along / GRID_M);
+  }
+
+  /** Marks `[from, to]` (plus `marginM` on both ends) as occupied on
+   *  `side`'s wall-surface channel -- called by `placeOnWallSurface` once
+   *  it commits to a span, so the next call in the same loop cannot return
+   *  the identical pose. */
+  blockWallSpan(side: WallSide, from: number, to: number, marginM = 0): void {
+    const arr = this.wallSpanBlocked[side];
+    const i0 = Math.max(0, this.wallSpanIdx(side, from - marginM));
+    const i1 = Math.min(arr.length - 1, this.wallSpanIdx(side, to + marginM));
+    for (let i = i0; i <= i1; i++) arr[i] = 1;
+  }
+
+  isWallSpanFree(side: WallSide, from: number, to: number): boolean {
+    const arr = this.wallSpanBlocked[side];
+    const i0 = Math.max(0, this.wallSpanIdx(side, from));
+    const i1 = Math.min(arr.length - 1, this.wallSpanIdx(side, to));
+    for (let i = i0; i <= i1; i++) {
+      if (arr[i]) return false;
+    }
+    return true;
   }
 
   private idx(gx: number, gz: number): number {
@@ -103,9 +144,6 @@ export class RoomOccupancy {
     return true;
   }
 
-  /** Tallest free run length, in metres, along `side` -- used by
-   *  `placeAgainstWall`/`placeOnWallSurface` below to test candidate spans
-   *  without double-implementing the free-check. */
 }
 
 // -- door / desk / spawn / bedroom-goal blocking -------------------------
@@ -128,16 +166,11 @@ export function buildOccupancy(
   const occ = new RoomOccupancy(room);
 
   const doors = doorRects(floor).filter((d) => d.roomA === room.roomId || d.roomB === room.roomId);
-  // (A localStorage perturbation switch lived here during the lane's
-  // non-vacuity check; removed -- CLAUDE.md: no debug switches reachable
-  // from production builds. Re-run the check by editing this block.)
-  {
-    for (const d of doors) {
-      if (d.axis === "row") {
-        occ.blockRect(d.xM0 - 0.05, d.zM0 - DOOR_LANE_M, d.xM1 + 0.05, d.zM1 + DOOR_LANE_M);
-      } else {
-        occ.blockRect(d.xM0 - DOOR_LANE_M, d.zM0 - 0.05, d.xM1 + DOOR_LANE_M, d.zM1 + 0.05);
-      }
+  for (const d of doors) {
+    if (d.axis === "row") {
+      occ.blockRect(d.xM0 - 0.05, d.zM0 - DOOR_LANE_M, d.xM1 + 0.05, d.zM1 + DOOR_LANE_M);
+    } else {
+      occ.blockRect(d.xM0 - DOOR_LANE_M, d.zM0 - 0.05, d.xM1 + DOOR_LANE_M, d.zM1 + 0.05);
     }
   }
 
@@ -288,26 +321,64 @@ export function placeAgainstWall(occ: RoomOccupancy, footprint: Footprint, prefs
   return { x: cx, z: cz, yawRad: p.yawRad };
 }
 
-/** (4) Places a wall-mounted item (painting/mirror) centred on the
- *  longest remaining free run on `side` (or the best of `sides`), ignoring
- *  floor occupancy below 1.2m tall furniture -- callers pass `sides`
- *  narrowed to walls without tall furniture if that matters to them;
- *  this function itself just centres on the longest free floor-level run,
- *  which is a reasonable proxy since walls with furniture already marked
- *  their run as occupied. Does not mark occupancy (wall-mounted, no floor
- *  footprint). */
-export function placeOnWallSurface(occ: RoomOccupancy, w: number, _h: number, sides: WallSide[] = WALL_SIDES): PlacementResult | undefined {
-  let best: { side: WallSide; run: WallRun; len: number } | undefined;
+/** Splits a floor-level `WallRun` into the sub-spans that are ALSO free on
+ *  `occ`'s wall-surface channel (paintings/sconces already placed there),
+ *  by walking it in GRID_M steps and merging free samples -- same
+ *  merge-adjacent-free-samples shape as `wallRuns` itself, one level up. */
+function freeSubSpans(occ: RoomOccupancy, run: WallRun): WallRun[] {
+  const out: WallRun[] = [];
+  const steps = Math.ceil((run.to - run.from) / GRID_M);
+  let start: number | null = null;
+  for (let i = 0; i <= steps; i++) {
+    const t = Math.min(run.to, run.from + i * GRID_M);
+    const free = occ.isWallSpanFree(run.side, t - GRID_M / 2, t + GRID_M / 2);
+    if (free) {
+      if (start === null) start = t;
+    } else if (start !== null) {
+      out.push({ side: run.side, from: start, to: t });
+      start = null;
+    }
+  }
+  if (start !== null) out.push({ side: run.side, from: start, to: run.to });
+  return out.filter((r) => r.to - r.from > 0.02);
+}
+
+/** (4) Places a wall-mounted item (painting/mirror/sconce) centred on the
+ *  longest span that is free on BOTH the floor-level run (so it doesn't
+ *  hang over furniture taller than the probe depth) and the wall-surface
+ *  channel (so it doesn't land on a previously placed wall-mounted item).
+ *  Marks the span it uses (plus a margin) on the wall-surface channel
+ *  before returning, so the next call in the same loop gets a DIFFERENT
+ *  span or `undefined` -- COO review P1: this used to be a pure query and
+ *  every call in a `decor.ts` loop returned the identical pose. */
+export function placeOnWallSurface(
+  occ: RoomOccupancy,
+  w: number,
+  _h: number,
+  sides: WallSide[] = WALL_SIDES,
+  marginM = 0.15,
+  /** Extra clearance (metres) a candidate span must keep from any
+   *  ALREADY-PLACED wall item on this channel, beyond just not
+   *  overlapping it -- e.g. sconces called with 0.6 so a fixture never
+   *  lands within 0.6m of a painting's span (COO review P3). Paintings
+   *  themselves call with the default 0, i.e. just "don't overlap". */
+  clearanceM = 0
+): PlacementResult | undefined {
+  let best: { side: WallSide; span: WallRun; len: number } | undefined;
   for (const side of sides) {
     for (const run of wallRuns(occ, side, 0.15)) {
-      const len = run.to - run.from;
-      if (len < w) continue;
-      if (!best || len > best.len) best = { side, run, len };
+      for (const span of freeSubSpans(occ, run)) {
+        const len = span.to - span.from;
+        if (len < w) continue;
+        if (clearanceM > 0 && !occ.isWallSpanFree(side, span.from - clearanceM, span.to + clearanceM)) continue;
+        if (!best || len > best.len) best = { side, span, len };
+      }
     }
   }
   if (!best) return undefined;
-  const along = best.run.from + (best.run.to - best.run.from) / 2;
+  const along = best.span.from + (best.span.to - best.span.from) / 2;
   const p = wallPoint(occ.room, best.side, along);
+  occ.blockWallSpan(best.side, along - w / 2, along + w / 2, marginM);
   return { x: p.x, z: p.z, yawRad: p.yawRad };
 }
 

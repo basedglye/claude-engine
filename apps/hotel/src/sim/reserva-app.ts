@@ -23,8 +23,17 @@ export interface ReservaState {
   selectedRoomEntity: number;
 }
 
-const ACCEPT_RECT: Rect = { x: 8, y: 440, w: 96, h: 18 };
-const DENY_RECT: Rect = { x: 112, y: 440, w: 96, h: 18 };
+// C2-W1's COO review (docs/alpha-loop/reviews/C2-W1.md F2): at y=440 these
+// sat off the bottom of the 640x480 surface from the natural standing desk
+// pose. The left column's document panel is two FIXED doc types ("id" then
+// "resSlip" -- the only two ever written, game.ts's guest-spawn system) and
+// always ends by y=92 (header + 3 "id" fields + gap + header + 2 "resSlip"
+// fields, GLYPH_H=8); the room list does not start until ROOM_LIST_Y=220.
+// y=104 sits in that always-free gap, well inside the visible band the
+// review confirmed for the room list at y=220, and clear of the procedures
+// card (which starts at y=140, in the right column).
+const ACCEPT_RECT: Rect = { x: 8, y: 104, w: 96, h: 18 };
+const DENY_RECT: Rect = { x: 112, y: 104, w: 96, h: 18 };
 const ROOM_LIST_X = 8;
 const ROOM_LIST_Y = 220;
 const ROOM_ROW_H = 18;

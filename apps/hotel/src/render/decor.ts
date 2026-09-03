@@ -559,11 +559,10 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
   const seatPose =
     placeAgainstWall(occ, { w: 2.6, d: 1.2 }, { sides: eastSides, minRunM: 2.0 }) ??
     placeAgainstWall(occ, { w: 2.6, d: 1.2 }, { minRunM: 1.6 });
-  const seatX = seatPose ? seatPose.x : room.xM1 - Math.min(2.6, room.widthM * 0.4);
-  const seatZ = seatPose ? seatPose.z : room.centerZM + room.depthM * 0.15;
-  const seatFacingRy = seatPose ? seatPose.yawRad + Math.PI : 0; // sofa back to wall => group faces into room
-
-  const seating = new THREE.Group();
+  // No hard-coded fallback (COO review P2): if nothing fits, the seating
+  // cluster is omitted rather than dropped at an unvalidated spot.
+  const seating = seatPose ? new THREE.Group() : undefined;
+  if (seatPose && seating) {
   if (activeTier === 0) {
     // Motel lobby: a vending machine plus a few mismatched folding chairs
     // instead of the sofa/armchair cluster -- no rug, no coffee table.
@@ -600,9 +599,10 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
     table.position.set(0, 0, -0.05);
     seating.add(table);
   }
-  seating.position.set(seatX, 0, seatZ);
-  seating.rotation.y = seatFacingRy;
-  group.add(seating);
+    seating.position.set(seatPose.x, 0, seatPose.z);
+    seating.rotation.y = seatPose.yawRad + Math.PI; // sofa back to wall => group faces into room
+    group.add(seating);
+  }
 
   // Potted plants in the two free corners farthest from any door (tier 0:
   // cheap plastic ficus). `placeCorner` marks its own occupancy so the
@@ -628,15 +628,14 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
 
   if (desk) {
     // Luggage cart flush to the wall beside the desk, on the clerk side.
+    // No fallback (COO review P2): if nothing fits, the cart is omitted.
     const cartPose = placeAgainstWall(occ, { w: 0.6, d: 0.4 }, { minRunM: 0.6 });
-    const cart = buildLuggageCart();
     if (cartPose) {
+      const cart = buildLuggageCart();
       cart.position.set(cartPose.x, 0, cartPose.z);
       cart.rotation.y = cartPose.yawRad;
-    } else {
-      cart.position.set(desk.xM0 - 0.5, 0, desk.centerZM + 0.6);
+      group.add(cart);
     }
-    group.add(cart);
 
     // Reception counter top accessories: bell, phone, key rack.
     const counterTopY = 1.1;
@@ -668,21 +667,20 @@ function buildCorridor(group: THREE.Group, floor: GroundFloor, room: RoomRect): 
 
   // Console table + plant centred on the end wall (south, the far end from
   // the lobby door which sits at the north end of the corridor).
+  // No fallback (COO review P2): omit console table / plant if nothing fits.
   const consolePose = placeAgainstWall(occ, { w: 0.9, d: 0.35 }, { sides: ["south", "north"], minRunM: 0.9 });
-  const console_ = buildConsoleTable();
   if (consolePose) {
+    const console_ = buildConsoleTable();
     console_.position.set(consolePose.x, 0, consolePose.z);
     console_.rotation.y = consolePose.yawRad;
-  } else {
-    console_.position.set(room.centerXM, 0, room.zM1 - 0.3);
-    console_.rotation.y = Math.PI;
+    group.add(console_);
   }
-  group.add(console_);
   const plantPose = placeCorner(floor, occ, { w: 0.55, d: 0.55 });
-  const plant = buildPlant();
-  if (plantPose) plant.position.set(plantPose.x, 0, plantPose.z);
-  else plant.position.set(room.centerXM + 0.6, 0, room.zM1 - 0.3);
-  group.add(plant);
+  if (plantPose) {
+    const plant = buildPlant();
+    plant.position.set(plantPose.x, 0, plantPose.z);
+    group.add(plant);
+  }
 
   // Paintings centred on each wall run between doors (both long walls).
   let seed = room.roomId * 31;
@@ -696,15 +694,14 @@ function buildCorridor(group: THREE.Group, floor: GroundFloor, room: RoomRect): 
   }
 
   // Housekeeping cart flush to a wall segment between two bedroom doors.
+  // No fallback (COO review P2): if nothing fits, the cart is omitted.
   const cartPose = placeAgainstWall(occ, { w: 0.7, d: 0.45 }, { sides: ["west", "east"], minRunM: 0.7 });
-  const cart = buildHousekeepingCart();
   if (cartPose) {
+    const cart = buildHousekeepingCart();
     cart.position.set(cartPose.x, 0, cartPose.z);
     cart.rotation.y = cartPose.yawRad;
-  } else {
-    cart.position.set(room.xM0 + 0.4, 0, room.zM0 + 0.6);
+    group.add(cart);
   }
-  group.add(cart);
 }
 
 /** True when `side` is on the building's outer perimeter (grid boundary),

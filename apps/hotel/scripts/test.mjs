@@ -19,6 +19,7 @@ import { reservaApp } from "../dist-game/sim/reserva-app.js";
 import { auditApp } from "../dist-game/sim/audit-app.js";
 import {
   setupWithConfig,
+  DEFAULTS,
   PLAYER_ENTITY,
   interactCommand,
   deskDecisionCommand,
@@ -757,6 +758,55 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
   const a4 = jitter(12345, 3, 7, 64);
   check("jitter: interleaving calls with other inputs does not perturb prior results", a4 === a1);
   void b;
+}
+
+// --- default fraudRatePermille is non-zero (C3-W2, CYCLE-3.md "Lane 2") -----
+// C2-W1's COO review found the app's *default* setup config wired
+// `fraudRatePermille: 0`, so the shipped game never spawned a fraudulent
+// guest even though every headless gate that cared about fraud passed its
+// own explicit rate. The CEO ruling moved the default to 200 (game.ts's
+// `DEFAULTS`). This is the non-vacuity pair for that ruling: run a
+// 200-guest headless stream at the DEFAULT rate and confirm at least one
+// guest actually gets a planted violation, then run the same stream with
+// the rate forced back to 0 and confirm none do — so a future regression
+// back to 0 (or a broken plant path) fails loudly either direction.
+{
+  const spawnAllGuests = (config) => {
+    const sim = new Sim("hotel-c3w2-fraud-nonvacuity-1");
+    setupWithConfig(sim, config);
+    runUntil(sim, 50_000, (s) => {
+      const hotelEntity = [...s.withComponent("hotel")][0]?.[0];
+      const hotel = hotelEntity !== undefined ? s.getComponent(hotelEntity, "hotel") : undefined;
+      return hotel !== undefined && hotel.guestsSpawned >= config.guestCount;
+    });
+    let plantedCount = 0;
+    for (const [, r] of sim.withComponent("reservation")) {
+      if (r.plantedViolations.length > 0) plantedCount++;
+    }
+    return plantedCount;
+  };
+
+  const defaultRateConfig = {
+    ...DEFAULTS,
+    guestCount: 200,
+    spawnTickMin: 1,
+    spawnIntervalMinTicks: 1,
+    spawnIntervalMaxTicks: 1,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+  };
+  const plantedAtDefault = spawnAllGuests(defaultRateConfig);
+  check(
+    `fraud non-vacuity: default fraudRatePermille (${DEFAULTS.fraudRatePermille}) plants at least one violation across 200 guests (got ${plantedAtDefault})`,
+    plantedAtDefault > 0,
+  );
+
+  const plantedAtZero = spawnAllGuests({ ...defaultRateConfig, fraudRatePermille: 0 });
+  check(
+    `fraud non-vacuity: fraudRatePermille 0 plants no violations across 200 guests (got ${plantedAtZero})`,
+    plantedAtZero === 0,
+  );
 }
 
 // --- despawn clears departed guests and their documents ----------------------

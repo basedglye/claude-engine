@@ -32,3 +32,33 @@ CLAUDE.md invariant 3 and it moves every pinned hash. The lane must:
 No other lane runs while lane 1 is on the tree. Cycle 3 lanes 2+ (fraud
 legibility fix if C2-W1's review demands one; turned-away reviews; `MAX_STARS`
 question) are briefed after lane 1 merges.
+
+## Lane 2 (after lane 1): the desk beat must exist in the product
+
+COO review of C2-W1 found `apps/hotel/src/sim/game.ts` sets `fraudRatePermille: 0`
+in the app's default setup, so the shipped game never spawns a fraudulent guest;
+the scenarios pass because they set their own rate. CEO ruling: **the default is
+200‰ (one guest in five) at tier 0**, unchanged across tiers for the alpha (the
+escalation rows already make catching harder as stars rise). This moves the
+browser gates' hashes (they run the app's setup) but not the headless ones; the
+lane re-runs the five browser gates and records the new hashes. Also in this lane:
+RESERVA paints ACCEPT/DENY at y=440, off the surface from the standing pose — move
+them inside the visible surface and prove it with the readability gate's
+screenshot; add the one `t()` line the audit screen owes ("The audit runs itself
+at midnight; this screen is the report") so the walkthrough's "run the audit" step
+is honest; the entry overlay's controls line already mentions T.
+
+## Lane 3 (after lane 1, parallel with lane 2): placement fix-list
+
+C2-W4's COO review (reviews/C2-W4.md) has four blockers: `placeOnWallSurface`
+marks no occupancy so paintings stack; both cart call sites bypass the solver's
+omit-on-undefined contract; sconces are placed outside the solver; a pilaster
+bisects the front desk. Fix all four against the NEW lobby geometry, re-shoot the
+C2-W4 pose set at tiers 0 and 2, and LOOK.
+
+## Lane 4 (after lanes 2–3): playtest re-run
+
+C2-W1 re-runs its 11 beats on the integrated build with hold-T time compression,
+a corrected driver (read every document, compare by procedure rule, not by
+same-named keys), and the fraud rate live; reaches tier 2 and the end card in one
+session; rewrites WALKTHROUGH.md with real tier-2 frames.

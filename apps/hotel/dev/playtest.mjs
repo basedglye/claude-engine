@@ -481,453 +481,59 @@ async function main() {
     record(2, "walk-to-desk", pass, t2, note, s2);
   }
 
-  // ---- Beat 3 & 4: serve guests, catch a fraud via RESERVA ----
-  let checkedInOnce = false;
-  let foundFraudNote = "not attempted";
-  {
-    // interactSystem (apps/hotel/src/sim/game.ts ~line 1620): the queue
-    // head guest (state "queued", queueIndex 0) has NO `interactable`
-    // component of its own — it is reached by interacting with the guest
-    // entity directly, in range and facing arc, which is what "click the
-    // guest to take their papers" means. Only AFTER that does the terminal
-    // interaction make sense (RESERVA needs a presenting guest to show).
-    let queueHead;
-    const waitStart3 = Date.now();
-    while (!queueHead && Date.now() - waitStart3 < 90000) {
-      const s = await snapshot();
-      queueHead = Object.entries(s.comps.guest).find(([, g]) => g.state === "queued" && g.queueIndex === 0);
-      if (!queueHead) await page.waitForTimeout(1500);
-    }
-    let presentingOk = false;
-    let takeResult = null;
-    if (queueHead) {
-      const guestEntity = Number(queueHead[0]);
-      takeResult = await takeGuestPapers(guestEntity);
-      presentingOk = takeResult.ok;
-    }
-    await shot("took-papers");
+  // ================================================================
+  // C3-W7: single continuous service loop, played the way a competent
+  // owner actually plays -- never blind-waiting while a guest or a mess
+  // sits there. Priority order, every cycle, exactly as specified:
+  //   1. a guest is presenting/queued and reachable -> serve it (read
+  //      BOTH documents, evaluateRules, ACCEPT/DENY -- never
+  //      plantedViolations, mirroring scenarios/lib/hotel-owner.mjs).
+  //   2. else a mess/broken prop exists and no guest waiting -> clean/
+  //      repair it.
+  //   3. else cash covers RENOVATE's cost -> open LEDGER, press it (the
+  //      button itself re-validates the star gate; a press when stars
+  //      are short is a harmless no-op, same as a real click would be).
+  //   4. else hold T for a short burst (<=200 ticks) and re-check.
+  // Also hires a clerk the moment STAFF shows a candidate, at any point.
+  // ================================================================
+  const dayLog = [];
+  let lastLoggedDay = null;
+  let fraudCaughtCount = 0;
+  let legitCheckinCount = 0;
+  const fraudCases = [];
+  let tier1Shot = null;
+  let tier2Shot = null;
+  let endCardShot = null;
+  let afterEndCardShot = null;
+  let sawEndCard = false;
+  let endCardAtDay = null;
+  let hiredClerk = false;
+  let blockedFinding = null; // set if the game itself refuses tier 2 for a competent player
 
-    // Face the terminal and interact to focus it (same as clicking the
-    // monitor: interact command against the terminal entity).
-    const snap = await snapshot();
+  async function recordDay(hotel, tickNow) {
+    if (hotel && hotel.day !== lastLoggedDay) {
+      lastLoggedDay = hotel.day;
+      const row = { day: hotel.day, cash: hotel.cash, stars: hotel.stars, tier: hotel.tier, tick: tickNow };
+      dayLog.push(row);
+      console.log("DAY " + JSON.stringify(row));
+    }
+  }
+
+  async function serveDeskCycle(snap) {
+    const presenting = Object.entries(snap.comps.guest).find(([, g]) => g.state === "presenting");
+    const queueHead = Object.entries(snap.comps.guest).find(([, g]) => g.state === "queued" && g.queueIndex === 0);
+    if (!presenting && !queueHead) return;
+
+    if (!presenting && queueHead) {
+      await takeGuestPapers(Number(queueHead[0]), 3);
+      return;
+    }
+
     const te = terminalEntity(snap);
     if (te !== undefined) {
-      const termPos = snap.comps.pos[te];
-      const s2 = await snapshot();
-      const pe = playerEntity(s2);
-      const myPos = pe !== undefined ? s2.comps.pos[pe] : undefined;
-      if (termPos && myPos) {
-        await walkTo(termPos, { arriveMm: 1000 });
-        await faceCmd(bearingMdeg(myPos, termPos));
-      }
-      await interactCmd(te);
-      await page.waitForTimeout(200);
-    }
-    const t3 = await tick();
-    const s3 = await shot("terminal-focused");
-    const stepAfterOpen = await hintStep();
-    record(3, "use-terminal", presentingOk && stepAfterOpen !== null, t3, `queue-head guest found=${!!queueHead}, takeGuestPapers=${JSON.stringify(takeResult)}; hint after opening terminal="${stepAfterOpen}"`, s3);
-
-    // Switch to RESERVA (taskbar), read the queue head's raw doc fields vs
-    // reservation fields directly from the snapshot — this is the SAME
-    // "one oracle, three consumers" comparison RESERVA's screen shows; we
-    // read it from world state rather than eyeballing pixels because a
-    // Playwright script cannot "read" rendered glyphs, but note explicitly
-    // below whether the mismatch, if any, is presented on-screen or only
-    // inferable from data.
-    await clickRect(taskbarRect("reserva"));
-    await page.waitForTimeout(200);
-    const s4 = await shot("reserva-open");
-
-    let round = 0;
-    let anyFraudCaught = false;
-    let anyCheckIn = false;
-    let fraudScreenshot = null;
-    let fraudFieldNote = null;
-    const fraudNotes = [];
-    const roundBudgetMs = 240000; // ~4min wall budget for the serve-guests loop
-    const roundStart = Date.now();
-    while (round < 14 && Date.now() - roundStart < roundBudgetMs) {
-      let snap2 = await snapshot();
-      // presenting guest?
-      let presentingGuest = Object.entries(snap2.comps.guest).find(([, g]) => g.state === "presenting");
-      if (!presentingGuest) {
-        // Nobody presenting: if the next queue head is waiting, take their
-        // papers (interact with the guest, in range+facing arc — see the
-        // interactSystem note above); otherwise wait for the next arrival,
-        // holding T (fast-forward is disabled while a screen is focused,
-        // but RESERVA is open here, so drop focus first with screen.blur
-        // is NOT needed — main.ts's gate keys off the CLIENT'S focused
-        // screen state, not ours; holding T with RESERVA open is a no-op
-        // acceleration-wise but harmless, matching what a real player
-        // holding T while waiting at an open terminal would see).
-        const head = Object.entries(snap2.comps.guest).find(([, g]) => g.state === "queued" && g.queueIndex === 0);
-        if (head) {
-          const guestEntity = Number(head[0]);
-          await takeGuestPapers(guestEntity);
-        } else {
-          await holdT(2000);
-        }
-        continue;
-      }
-      round++;
-      const guestEntity = Number(presentingGuest[0]);
-      // reservation for that guest, undecided
-      const resEntry = Object.entries(snap2.comps.reservation).find(
-        ([, r]) => r.guestEntity === guestEntity && !r.decided
-      );
-      if (!resEntry) {
-        await page.waitForTimeout(500);
-        continue;
-      }
-      const res = resEntry[1];
-      // ALL documents the guest owns (fixes the C2-W1 bug: `.find()` took
-      // only the first — a guest carries BOTH an "id" and a "resSlip").
-      const docs = Object.values(snap2.comps.document)
-        .filter((d) => d.ownerEntity === guestEntity)
-        .map((d) => ({ docType: d.docType, fields: d.fields }));
-      // Named lists (blacklist etc.) the "listed" rule kind reads, built
-      // from noticeList components exactly like hotel-owner.mjs's bot does.
-      const lists = {};
-      for (const nl of Object.values(snap2.comps.noticeList)) lists[nl.listId] = nl.values;
-      const hotelState = Object.values(snap2.comps.hotel)[0];
-      // GROUND TRUTH, independent of `reservation.plantedViolations`
-      // (never read anywhere in this file): the sim's OWN pure evaluator,
-      // the same one deskSystem checks itself against and the reference
-      // bot uses to decide. This is "knowing from the code" in the sense
-      // that it IS the code the player is meant to reproduce in their
-      // head by reading the screen — not a peek at an answer key.
-      const violations = evaluateRules(
-        rulesForStars(H1_RULES, hotelState?.stars ?? 1),
-        docs,
-        res.fields,
-        { day: hotelState?.day ?? 0, lists }
-      );
-      const isFraud = violations.length > 0;
-      // Named field-by-field diff, for the report's "confirm by eye, name
-      // the field" requirement — derived from the SAME rule table RESERVA's
-      // procedures card describes (fieldMatch rows only; docPresent/
-      // notExpired/listed failures are named directly).
-      const fieldDiffs = [];
-      for (const rule of H1_RULES) {
-        if (!violations.includes(rule.failFlag)) continue;
-        if (rule.check.kind === "fieldMatch") {
-          const doc = docs.find((d) => d.docType === rule.check.docType);
-          const docVal = doc?.fields?.[rule.check.docField];
-          const resVal = res.fields?.[rule.check.resField];
-          fieldDiffs.push(
-            `${rule.failFlag}: ${rule.check.docType}.${rule.check.docField}="${docVal}" vs reservation.${rule.check.resField}="${resVal}"`
-          );
-        } else {
-          fieldDiffs.push(`${rule.failFlag} (${rule.check.kind})`);
-        }
-      }
-      // rooms sellable, sorted by roomId, matching sim's own filter
-      const brokenRooms = new Set(Object.values(snap2.comps.prop).filter((p) => p.broken).map((p) => p.roomEntity));
-      const rooms = Object.entries(snap2.comps.roomUnit)
-        .filter(([, r]) => r.occupantEntity === 0 && r.messCount === 0)
-        .filter(([e]) => !brokenRooms.has(Number(e)))
-        .sort((a, b) => a[1].roomId - b[1].roomId);
-
-      if (isFraud) {
-        anyFraudCaught = true;
-        fraudScreenshot = await shot(`fraud-round${round}`);
-        fraudFieldNote = fieldDiffs.join("; ");
-        fraudNotes.push(`round ${round}: FRAUD — evaluateRules found ${JSON.stringify(violations)}; ${fraudFieldNote}; denied via DENY`);
-        await clickRect(RESERVA.deny);
-      } else if (rooms.length > 0) {
-        anyCheckIn = true;
-        const idx = 0;
-        const y = RESERVA.roomListY + idx * RESERVA.roomRowH;
-        await screenClickCmd(RESERVA.roomListX + RESERVA.roomRowW / 2, y + RESERVA.roomRowH / 2);
-        await page.waitForTimeout(150);
-        await clickRect(RESERVA.accept);
-        fraudNotes.push(`round ${round}: legit (evaluateRules -> []), checked in`);
-      } else {
-        fraudNotes.push(`round ${round}: legit but no sellable room, denying to move the queue`);
-        await clickRect(RESERVA.deny);
-      }
-      await page.waitForTimeout(400);
-    }
-    checkedInOnce = anyCheckIn;
-    foundFraudNote = anyFraudCaught
-      ? `caught ${fraudNotes.filter((n) => n.startsWith("round") && n.includes("FRAUD")).length} fraud(s) via evaluateRules (ground truth, NOT plantedViolations). Field(s) that visibly differ on the RESERVA screen: ${fraudFieldNote}. ${fraudNotes.join(" | ")}`
-      : `no fraud encountered in ${round} round(s) of the queue this session (fraudRatePermille is now 200/1000 ≈ 1 in 5 — plausible not to hit one in a short queue). ${fraudNotes.join(" | ")}`;
-    const t4 = await tick();
-    const s4b = await shot("reserva-after-rounds");
-    record(4, "catch-fraud", anyFraudCaught, t4, foundFraudNote, fraudScreenshot ?? s4b);
-    record("3b", "check-in", anyCheckIn, t4, `at least one guest.checkedIn attempted: ${anyCheckIn}`, s4b);
-  }
-
-  // ---- Beat 5: clean a mess ----
-  {
-    let snap = await snapshot();
-    let messEntry = Object.entries(snap.comps.mess)[0];
-    const waitStart = Date.now();
-    while (!messEntry && Date.now() - waitStart < 60000) {
-      await holdT(3000);
-      snap = await snapshot();
-      messEntry = Object.entries(snap.comps.mess)[0];
-    }
-    let pass = false, note;
-    if (!messEntry) {
-      note = "no mess entity present in world at this point in the run";
-    } else {
-      const messEntity = Number(messEntry[0]);
-      const roomEntity = messEntry[1].roomEntity;
-      const roomPos = snap.comps.roomUnit[roomEntity] ? undefined : undefined; // roomUnit has no pos; use mess's own interactable pos if present
-      const interactablePos = snap.comps.interactable?.[messEntity];
-      const before = await shot("mess-before");
-      let approach = { ok: false, attempts: 0 };
-      if (interactablePos) {
-        approach = await approachAndInteract(
-          messEntity,
-          { xMm: interactablePos.xMm, zMm: interactablePos.zMm },
-          (s2) => s2.comps.mess[messEntity] !== undefined
-        );
-      }
-      const snapAfter = await snapshot();
-      pass = snapAfter.comps.mess[messEntity] === undefined;
-      note = `mess entity ${messEntity} in room ${roomEntity}; cleaned=${pass}; approach=${JSON.stringify(approach)}`;
-      await shot("mess-after");
-      const t5 = await tick();
-      record(5, "clean-room", pass, t5, note, before);
-    }
-    if (!messEntry) record(5, "clean-room", false, await tick(), note, null);
-  }
-
-  // ---- Beat 6: repair a prop ----
-  {
-    let snap = await snapshot();
-    let propEntry = Object.entries(snap.comps.prop).find(([, p]) => p.broken);
-    const waitStart6 = Date.now();
-    while (!propEntry && Date.now() - waitStart6 < 60000) {
-      await holdT(3000);
-      snap = await snapshot();
-      propEntry = Object.entries(snap.comps.prop).find(([, p]) => p.broken);
-    }
-    let pass = false, note;
-    const before = await shot("prop-before");
-    if (!propEntry) {
-      note = "no broken prop present in world at this point in the run";
-    } else {
-      const propEntity = Number(propEntry[0]);
-      const interactablePos = snap.comps.interactable?.[propEntity];
-      let approach = { ok: false, attempts: 0 };
-      if (interactablePos) {
-        approach = await approachAndInteract(
-          propEntity,
-          { xMm: interactablePos.xMm, zMm: interactablePos.zMm },
-          (s2) => s2.comps.prop[propEntity]?.broken !== false
-        );
-      }
-      const snapAfter = await snapshot();
-      pass = snapAfter.comps.prop[propEntity]?.broken === false;
-      note = `prop entity ${propEntity}; repaired=${pass}; approach=${JSON.stringify(approach)}`;
-    }
-    await shot("prop-after");
-    record(6, "repair-prop", pass, await tick(), note, before);
-  }
-
-  // ---- Beat 7: night audit (AUDIT has no button — see report) ----
-  {
-    await clickRect(taskbarRect("audit"));
-    await page.waitForTimeout(200);
-    const before = await shot("audit-open");
-    const beforeSnap = await snapshot();
-    const beforeHotel = Object.values(beforeSnap.comps.hotel)[0];
-    // AUDIT is passive (apps/hotel/src/sim/audit-app.ts: "layout() { return {} }",
-    // no button) — the night rollover fires econ.audit automatically. Wait
-    // for a day to roll (up to ~24 in-game hours of wall clock at 20Hz,
-    // capped).
-    let audited = false;
-    let waited = 0;
-    const startDay = beforeHotel?.day;
-    // T is disabled while a screen is focused (main.ts's gate) — blur AUDIT
-    // first so the hold actually accelerates, matching what a player
-    // wanting to fast-forward the night would do (walk away / Esc, then
-    // hold T), then re-open AUDIT afterward for the after-frame.
-    await submit({ tick: await tick(), actor: "player", type: "screen.blur", payload: {} });
-    for (let i = 0; i < 60 && !audited; i++) {
-      await holdT(2000);
-      waited += 2000;
-      const s = await snapshot();
-      const h = Object.values(s.comps.hotel)[0];
-      if (h && startDay !== undefined && h.day !== startDay) audited = true;
-    }
-    await clickRect(taskbarRect("audit"));
-    await page.waitForTimeout(200);
-    const afterSnap = await snapshot();
-    const afterHotel = Object.values(afterSnap.comps.hotel)[0];
-    const after = await shot("audit-after");
-    const pass = audited && beforeHotel && afterHotel && (beforeHotel.cash !== afterHotel.cash || beforeHotel.stars !== afterHotel.stars);
-    record(
-      7,
-      "run-audit",
-      !!pass,
-      await tick(),
-      `AUDIT has no RUN button — it is a passive readout (apps/hotel/src/sim/audit-app.ts). Waited ${waited}ms for the night rollover. cash ${beforeHotel?.cash}->${afterHotel?.cash}, stars ${beforeHotel?.stars}->${afterHotel?.stars}, day ${beforeHotel?.day}->${afterHotel?.day}`,
-      after
-    );
-  }
-
-  // ---- Beat 8: wait/earn until RENOVATE is available ----
-  let renovateAvailable = false;
-  {
-    await clickRect(taskbarRect("ledger"));
-    await page.waitForTimeout(200);
-    const startTick = await tick();
-    const s0 = await shot("ledger-waiting");
-    let hintSurfacedAt = null;
-    let affordableAt = null;
-    // T is disabled while a screen is focused — blur LEDGER before holding
-    // it, exactly as beat 7 does, then refocus periodically to read state.
-    await submit({ tick: await tick(), actor: "player", type: "screen.blur", payload: {} });
-    for (let i = 0; i < 180 && !renovateAvailable; i++) {
-      await holdT(2000);
-      const s = await snapshot();
-      const h = Object.values(s.comps.hotel)[0];
-      const step = await hintStep();
-      if (step === "renovate" && hintSurfacedAt === null) hintSurfacedAt = { tick: s.tick, cash: h?.cash };
-      if (h && h.cash >= (h.renovateCostMinor ?? Infinity) && affordableAt === null) {
-        affordableAt = { tick: s.tick, cash: h.cash, cost: h.renovateCostMinor };
-      }
-      if (hintSurfacedAt) renovateAvailable = true;
-    }
-    const endTick = await tick();
-    await clickRect(taskbarRect("ledger"));
-    await page.waitForTimeout(200);
-    const s1 = await shot("ledger-renovate-ready");
-    record(
-      8,
-      "wait-renovate",
-      renovateAvailable,
-      endTick,
-      `hint step "renovate" surfaced ${hintSurfacedAt ? "at tick " + hintSurfacedAt.tick + " cash " + hintSurfacedAt.cash : "NOT within budget"}; cash-affordable ${affordableAt ? "at tick " + affordableAt.tick + " cash " + affordableAt.cash + "/" + affordableAt.cost : "not observed"}; waited ${(endTick - startTick) / 20}s sim-time`,
-      s1
-    );
-  }
-
-  // ---- Beat 9: press RENOVATE twice, four frames ----
-  {
-    const fixedPose = { yawMdeg: 0 };
-    async function fixedShot(name) {
-      // A fixed camera pose for the "before/after" comparison the brief asks
-      // for: face a constant yaw before each capture.
-      await faceCmd(fixedPose.yawMdeg);
-      await page.waitForTimeout(200);
-      return shot(name);
-    }
-    const tierFrame0 = await fixedShot("tier-before-press1");
-    const snapT0 = await snapshot();
-    const tier0 = Object.values(snapT0.comps.hotel)[0]?.tier;
-
-    await clickRect(taskbarRect("ledger"));
-    await page.waitForTimeout(150);
-    await clickRect(LEDGER.renovate);
-    await page.waitForTimeout(600);
-    const snapT1 = await snapshot();
-    const tier1 = Object.values(snapT1.comps.hotel)[0]?.tier;
-    const tierFrame1 = await fixedShot("tier-after-press1");
-
-    // Wait/earn again for the second renovation, same pattern as beat 8.
-    let secondAvailable = tier1 !== undefined && tier1 < 2;
-    let waited2 = 0;
-    if (secondAvailable) {
-      await submit({ tick: await tick(), actor: "player", type: "screen.blur", payload: {} });
-    }
-    for (let i = 0; i < 180 && secondAvailable; i++) {
-      await holdT(2000);
-      waited2 += 2000;
-      const step = await hintStep();
-      if (step === "renovate") break;
-      const s = await snapshot();
-      const h = Object.values(s.comps.hotel)[0];
-      if (h && h.cash >= (h.renovateCostMinor ?? Infinity)) break;
-    }
-    const tierFrame1b = await fixedShot("tier1-still");
-
-    await clickRect(taskbarRect("ledger"));
-    await page.waitForTimeout(150);
-    await clickRect(LEDGER.renovate);
-    await page.waitForTimeout(600);
-    const snapT2 = await snapshot();
-    const tier2 = Object.values(snapT2.comps.hotel)[0]?.tier;
-    const tierFrame2 = await fixedShot("tier-after-press2");
-
-    const pass = tier0 !== undefined && tier1 === tier0 + 1 && tier2 !== undefined && tier2 === tier1 + 1;
-    record(
-      9,
-      "renovate",
-      pass,
-      await tick(),
-      `tier ${tier0} -> ${tier1} (press 1) -> ${tier2} (press 2), waited ${waited2 / 1000}s between presses. Frames: ${tierFrame0}, ${tierFrame1}, ${tierFrame1b}, ${tierFrame2}`,
-      tierFrame2
-    );
-  }
-
-  // ---- Beat 10: reach tier 2 and the end card ----
-  {
-    const snap = await snapshot();
-    const tier = Object.values(snap.comps.hotel)[0]?.tier;
-    const endCardVisible = await page.evaluate(() => {
-      const el = document.querySelector(".hud-endcard");
-      return el?.getAttribute("data-visible") === "1";
-    });
-    const before = await shot("endcard");
-    let dismissedNote = "not dismissed (no end card visible to dismiss)";
-    if (endCardVisible) {
-      // Dismiss: per VISION "play continues after it" — try Escape/click.
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(300);
-      dismissedNote = "pressed Escape to dismiss";
-    }
-    await walkKey("KeyW", 800);
-    const after = await shot("after-endcard-walking");
-    const t10 = await tick();
-    record(10, "endcard", tier === 2 && endCardVisible, t10, `tier=${tier}, endCardVisible=${endCardVisible}, ${dismissedNote}`, after);
-  }
-
-  // ---- Beat 11: hire the clerk ----
-  {
-    await clickRect(taskbarRect("staff"));
-    await page.waitForTimeout(200);
-    const before = await shot("staff-open");
-    const snap = await snapshot();
-    const candidateEntry = Object.entries(snap.comps.candidate)[0];
-    let pass = false, note;
-    if (!candidateEntry) {
-      note = "no staff candidate present in world at this point in the run";
-    } else {
-      const idx = 0;
-      const y = STAFF.listY + idx * STAFF.rowH;
-      await screenClickCmd(STAFF.listX + STAFF.rowW / 2, y + STAFF.rowH / 2);
-      await page.waitForTimeout(150);
-      await clickRect(STAFF.hire);
-      await page.waitForTimeout(300);
-      const snapAfter = await snapshot();
-      pass = Object.keys(snapAfter.comps.staffed).length > Object.keys(snap.comps.staffed).length;
-      note = `candidate ${candidateEntry[0]}; hired=${pass}`;
-    }
-    const after = await shot("staff-after");
-    record(11, "hire-clerk", pass, await tick(), note, after);
-  }
-
-  // ---- Extras: T-while-focused gate, HUD hidden during terminal focus ----
-  // (the late/unreliable H-skip check from the C2-W1 run is REPLACED by
-  // R1, done fresh before any focus, at the top of this run — see there.)
-  {
-    // R5 item 3 (COO review §4): hold T with a terminal focused and confirm
-    // the sim does NOT accelerate. A screen.click alone does not FOCUS the
-    // terminal (that needs an `interact` on the terminal entity, in range
-    // and facing arc — same as beat 3); walk back and interact first, THEN
-    // switch to LEDGER, confirm focus, hold T, and compare the tick delta
-    // against the un-accelerated rate (20 ticks/s) rather than 8x.
-    {
-      const sTerm = await snapshot();
-      const te2 = terminalEntity(sTerm);
-      if (te2 !== undefined) {
-        const termPos = sTerm.comps.pos[te2];
+      const focusedBy = snap.comps.terminal[te]?.focusedBy;
+      if (!focusedBy) {
+        const termPos = snap.comps.pos[te];
         if (termPos) {
           await walkTo(termPos, { arriveMm: 1000 });
           const s2 = await snapshot();
@@ -935,44 +541,209 @@ async function main() {
           const myPos2 = pe2 !== undefined ? s2.comps.pos[pe2] : undefined;
           if (myPos2) await faceCmd(bearingMdeg(myPos2, termPos));
           await page.waitForTimeout(150);
-          await interactCmd(te2);
+          await interactCmd(te);
           await page.waitForTimeout(200);
         }
       }
     }
-    await clickRect(taskbarRect("ledger"));
-    await page.waitForTimeout(200);
-    const focusedBefore = await page.evaluate(() => {
+    const shellState = await page.evaluate(() => {
       const w = window.__WORLDFORGE__.world;
       for (const e of w.entities()) {
-        const t = w.getComponent(e, "terminal");
-        if (t) return t.focusedBy;
+        const app = w.getComponent(e, "screenApp");
+        if (app) return app.state;
       }
-      return "";
+      return undefined;
     });
-    const hudHiddenWhileFocused = await page.evaluate(() => {
-      const hud = document.querySelector(".hud-reticle");
-      return hud ? getComputedStyle(hud).display : "missing";
-    });
-    const tBefore = await tick();
-    const wallMs = 3000;
-    await holdT(wallMs); // T held WHILE the screen is focused this time
-    const tAfter = await tick();
-    const deltaTicks = tAfter - tBefore;
-    const expectedUnaccelerated = Math.round((wallMs / 1000) * 20);
-    // Accept a generous band around the un-accelerated rate (host jitter);
-    // fail only if the delta looks like the 8x accelerated rate instead.
-    const looksAccelerated = deltaTicks > expectedUnaccelerated * 3;
-    const sExtra = await shot("t-while-focused");
-    record(
-      "extra",
-      "t-gated-while-focused",
-      focusedBefore !== "" && !looksAccelerated,
-      tAfter,
-      `terminal.focusedBy="${focusedBefore}" (nonempty = focused); held T ${wallMs}ms while focused, tick delta ${deltaTicks} (un-accelerated expectation ~${expectedUnaccelerated}, 8x would be ~${expectedUnaccelerated * 8}); reticle display while focused: ${hudHiddenWhileFocused}`,
-      sExtra
+    if (shellState?.openAppId !== "reserva") {
+      await clickRect(taskbarRect("reserva"));
+      await page.waitForTimeout(150);
+    }
+
+    const snap2 = await snapshot();
+    const presenting2 = Object.entries(snap2.comps.guest).find(([, g]) => g.state === "presenting");
+    if (!presenting2) return;
+    const guestEntity = Number(presenting2[0]);
+    const resEntry = Object.entries(snap2.comps.reservation).find(([, r]) => r.guestEntity === guestEntity && !r.decided);
+    if (!resEntry) return;
+    const res = resEntry[1];
+    const docs = Object.values(snap2.comps.document)
+      .filter((d) => d.ownerEntity === guestEntity)
+      .map((d) => ({ docType: d.docType, fields: d.fields }));
+    const lists = {};
+    for (const nl of Object.values(snap2.comps.noticeList)) lists[nl.listId] = nl.values;
+    const hotelState = Object.values(snap2.comps.hotel)[0];
+    const violations = evaluateRules(
+      rulesForStars(H1_RULES, hotelState?.stars ?? 1),
+      docs,
+      res.fields,
+      { day: hotelState?.day ?? 0, lists }
     );
+    const brokenRooms = new Set(Object.values(snap2.comps.prop).filter((p) => p.broken).map((p) => p.roomEntity));
+    const rooms = Object.entries(snap2.comps.roomUnit)
+      .filter(([, r]) => r.occupantEntity === 0 && r.messCount === 0)
+      .filter(([e]) => !brokenRooms.has(Number(e)))
+      .sort((a, b) => a[1].roomId - b[1].roomId);
+
+    if (violations.length > 0) {
+      fraudCaughtCount++;
+      const fieldDiffs = [];
+      for (const rule of H1_RULES) {
+        if (!violations.includes(rule.failFlag)) continue;
+        if (rule.check.kind === "fieldMatch") {
+          const doc = docs.find((d) => d.docType === rule.check.docType);
+          fieldDiffs.push(
+            `${rule.failFlag}: ${rule.check.docType}.${rule.check.docField}="${doc?.fields?.[rule.check.docField]}" vs reservation.${rule.check.resField}="${res.fields?.[rule.check.resField]}"`
+          );
+        } else {
+          fieldDiffs.push(`${rule.failFlag} (${rule.check.kind})`);
+        }
+      }
+      fraudCases.push({ tick: snap2.tick, day: hotelState?.day, violations, fieldDiffs });
+      await clickRect(RESERVA.deny);
+    } else if (rooms.length > 0) {
+      legitCheckinCount++;
+      const y = RESERVA.roomListY;
+      await screenClickCmd(RESERVA.roomListX + RESERVA.roomRowW / 2, y + RESERVA.roomRowH / 2);
+      await page.waitForTimeout(150);
+      await clickRect(RESERVA.accept);
+    } else {
+      await clickRect(RESERVA.deny);
+    }
+    await page.waitForTimeout(300);
   }
+
+  const sessionStartWallMs = Date.now();
+  const maxCycles = 20000;
+  let cycles = 0;
+  let stuckSameDayCycles = 0;
+  for (; cycles < maxCycles; cycles++) {
+    const snap = await snapshot();
+    const hotel = Object.values(snap.comps.hotel)[0];
+    const tickNow = snap.tick;
+    const dayBefore = lastLoggedDay;
+    await recordDay(hotel, tickNow);
+    if (lastLoggedDay === dayBefore) stuckSameDayCycles++;
+    else stuckSameDayCycles = 0;
+    if (cycles % 50 === 0) console.log(`CYCLE ${cycles} tick=${tickNow} day=${hotel?.day} cash=${hotel?.cash} stuckSameDayCycles=${stuckSameDayCycles}`);
+
+    if (hotel && hotel.tier >= 1 && !tier1Shot) {
+      await faceCmd(0);
+      await page.waitForTimeout(200);
+      tier1Shot = await shot("tier1-lobby");
+    }
+    if (hotel && hotel.tier >= 2 && !tier2Shot) {
+      await faceCmd(0);
+      await page.waitForTimeout(200);
+      tier2Shot = await shot("tier2-lobby");
+    }
+
+    const endCardVisible = await page.evaluate(() => document.querySelector(".hud-endcard")?.getAttribute("data-visible") === "1");
+    if (endCardVisible && !sawEndCard) {
+      sawEndCard = true;
+      endCardAtDay = hotel?.day ?? lastLoggedDay;
+      endCardShot = await shot("endcard");
+    }
+    if (sawEndCard && hotel && endCardAtDay !== null && hotel.day > endCardAtDay) {
+      afterEndCardShot = await shot("after-endcard-playing");
+      break;
+    }
+    if (!sawEndCard && hotel && hotel.day > 14) {
+      blockedFinding = {
+        reason: "14 in-game days passed with no end card (tier 2 never reached) under continuous competent play",
+        hotelStateAtCutoff: hotel,
+        tick: tickNow,
+      };
+      break;
+    }
+    if (stuckSameDayCycles > 400) {
+      blockedFinding = blockedFinding ?? {
+        reason: `loop made ${stuckSameDayCycles} cycles with the sim day never advancing`,
+        hotelStateAtCutoff: hotel,
+        tick: tickNow,
+      };
+      break;
+    }
+
+    const presenting = Object.entries(snap.comps.guest).find(([, g]) => g.state === "presenting");
+    const queueHead = Object.entries(snap.comps.guest).find(([, g]) => g.state === "queued" && g.queueIndex === 0);
+    if (presenting || queueHead) {
+      await serveDeskCycle(snap);
+      continue;
+    }
+
+    const messEntry = Object.entries(snap.comps.mess)[0];
+    const propEntry = Object.entries(snap.comps.prop).find(([, p]) => p.broken);
+    if (messEntry) {
+      const messEntity = Number(messEntry[0]);
+      const interactablePos = snap.comps.interactable?.[messEntity];
+      if (interactablePos) {
+        await approachAndInteract(
+          messEntity,
+          { xMm: interactablePos.xMm, zMm: interactablePos.zMm },
+          (s2) => s2.comps.mess[messEntity] !== undefined,
+          2
+        );
+      }
+      continue;
+    }
+    if (propEntry) {
+      const propEntity = Number(propEntry[0]);
+      const interactablePos = snap.comps.interactable?.[propEntity];
+      if (interactablePos) {
+        await approachAndInteract(
+          propEntity,
+          { xMm: interactablePos.xMm, zMm: interactablePos.zMm },
+          (s2) => s2.comps.prop[propEntity]?.broken !== false,
+          2
+        );
+      }
+      continue;
+    }
+
+    const candidateEntry = Object.entries(snap.comps.candidate)[0];
+    if (candidateEntry && !hiredClerk) {
+      await clickRect(taskbarRect("staff"));
+      await page.waitForTimeout(150);
+      await screenClickCmd(STAFF.listX + STAFF.rowW / 2, STAFF.listY + STAFF.rowH / 2);
+      await page.waitForTimeout(150);
+      await clickRect(STAFF.hire);
+      await page.waitForTimeout(300);
+      const s3 = await snapshot();
+      if (Object.keys(s3.comps.staffed).length > 0) hiredClerk = true;
+      continue;
+    }
+
+    if (hotel && hotel.renovateCostMinor > 0 && hotel.cash >= hotel.renovateCostMinor) {
+      await clickRect(taskbarRect("ledger"));
+      await page.waitForTimeout(150);
+      await clickRect(LEDGER.renovate);
+      await page.waitForTimeout(400);
+      continue;
+    }
+
+    await submit({ tick: await tick(), actor: "player", type: "screen.blur", payload: {} });
+    await holdT(1200);
+  }
+
+  const sessionDurationMs = Date.now() - sessionStartWallMs;
+  const finalSnap = await snapshot();
+  const finalHotel = Object.values(finalSnap.comps.hotel)[0];
+  const fraudMissedCount = Object.values(finalSnap.comps.guest).filter((g) => g.fraudMissed === true).length;
+
+  record(
+    "loop",
+    "continuous-service-loop",
+    !blockedFinding,
+    finalSnap.tick,
+    `cycles=${cycles}, wallMs=${sessionDurationMs}, finalHotel=${JSON.stringify(finalHotel)}, sawEndCard=${sawEndCard}, endCardAtDay=${endCardAtDay}, fraudCaught=${fraudCaughtCount}, fraudMissed=${fraudMissedCount}, legitCheckins=${legitCheckinCount}, hiredClerk=${hiredClerk}, blockedFinding=${JSON.stringify(blockedFinding)}`,
+    tier2Shot ?? tier1Shot ?? null
+  );
+  console.log("DAY_LOG " + JSON.stringify(dayLog));
+  console.log("FRAUD_CASES " + JSON.stringify(fraudCases));
+  console.log("SHOTS " + JSON.stringify({ tier1Shot, tier2Shot, endCardShot, afterEndCardShot }));
+  if (blockedFinding) console.log("BLOCKED_FINDING " + JSON.stringify(blockedFinding));
+
+
 
   console.log("---SUMMARY---");
   console.log(JSON.stringify({ url: URL, label: LABEL, results, consoleErrors: consoleErrors.slice(0, 50), requestCount: requests.length, requests: requests.slice(0, 20) }, null, 2));

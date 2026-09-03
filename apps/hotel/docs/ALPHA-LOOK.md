@@ -75,7 +75,9 @@ posable camera — the fastest way to look at anything.
 
 ## Known limitations / follow-ups
 
-- **The lobby is 2.25 m deep** (`lobbyDepth` 9–12 cells in `packages/interiors/src/layout.ts`). It cannot look grand at that depth; fixing it moves every golden and belongs to the H3a `generateHotel(spec)` work, not this track.
+- **The lobby was 2.25 m deep** until cycle 3 (2026-09-03) made it 20–24 cells
+  (5–6 m) in `packages/interiors/src/layout.ts` and re-pinned every golden; the
+  browser walks are re-derived by `apps/hotel/scripts/derive-walk.mjs`.
 - Guests are Kenney's blocky characters (CC0, civilian, idle/walk). No CC0 realistic rigged humans with a direct download URL were found; the mannequin/soldier fallbacks were removed from the pick pool.
 - No `monitor-crt` or `radiator` models exist in the pack; both use procedural fallbacks.
 - `hotel-phase-2b` (the PS1 track) also edits `main.ts`, `three-host.ts` and `player-fps`; expect a merge to need a hand-resolved `main.ts`.

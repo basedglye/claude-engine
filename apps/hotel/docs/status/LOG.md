@@ -479,3 +479,70 @@ arc.
 **Images**
 - apps/hotel/docs/walkthrough/07-fraud-name.png
 - apps/hotel/docs/walkthrough/tier2-lobby-east.png
+
+## 2026-09-03 (day) — Live play fixes + cycle 4: the desk gets feel
+
+**Shipped**
+- Live-play fixes found by actually sitting at the keyboard:
+  - Strafe handedness fixed — D was walking screen-left instead of right
+    (`packages/player-fps/src/index.ts`, `cbc8fa4`).
+  - Q quality toggle and L flicker toggle added (`apps/hotel/src/render/lighting.ts`,
+    `apps/hotel/src/main.ts`, `cbc8fa4`).
+  - Terminal exit fixed: click off the screen to leave and re-lock pointer,
+    because Esc alone stranded the player — the browser refuses to re-lock
+    the pointer for roughly 1.3s after an Escape-driven unlock, so Esc-only
+    exit left the player stuck looking at the terminal with no way back in
+    (`apps/hotel/src/main.ts`, `50cef98`).
+- Cycle 4 (Spark/Ballast picks, `DECISIONS.md`): desk feedback + night-audit
+  ritual, and the tier-2 empty-painting-canvas fix.
+  - W1: night-audit reveal cadence — `audit-app.ts` gates each reveal line
+    off `view.tick - state.opened` against fixed integer tick constants
+    (20/40/60/80/100), replay-safe and screenshot-stable by construction;
+    `opened` re-stamps on every open so reopening restarts the ritual
+    (`e6bcef9`).
+  - W1: host-side desk stamp — a CHECKED IN / FRAUD CAUGHT / DENIED flash on
+    the terminal, driven by reading `sim.eventsSince`'s event stream in
+    `desk-stamp.ts`/`main.ts`, presentation-only (no `setComponent`, no sim
+    field), so it moves zero goldens (`3ab8e4b`).
+  - W2: painting canvases at tier 2 — root cause was the canvas mesh pinned
+    to a fixed `z = 0.025` while the loaded glTF frame's own front face
+    could land past that plane; fix derives the canvas z from the same
+    `footprint.d` used for the frame's own fit call so the two numbers
+    can't drift apart (`decor.ts`, `befa4c4`).
+  - `docs/CORE-LOOP.md` added.
+
+**Verified**
+- `docs/alpha-loop/reviews/C4.md`: **PASS**, no fix-list items. Confirms:
+  sim purity/determinism/write-through untouched by the host-side stamp;
+  `fraud-catch`, `fraud-catch-b`, `alpha-loop`, `reserva-readability`
+  reported unmodified/still green (new open-input path only touches
+  `AuditState.opened` plus existing view-key fields, no new top-level
+  `ScreenViewData` key); W2 diff verified visually against
+  `tier2-painting-broken.png` vs `tier2-painting-fixed.png` (diff bbox
+  isolated to the painting region only).
+- Two items explicitly logged as honest deferrals, not defects: the AUDIT
+  star-tier line prints live `stars`, not a delta (no `previousStars` field
+  exists yet); the desk stamp was deliberately kept host-side rather than
+  sim-side to avoid re-pinning every golden for a decaying visual effect
+  with no gameplay state.
+
+**Next**
+- The human end-to-end sitting (door to end-card, one real sitting) is
+  still owed — noted again in `C4.md` item 3, not a blocker for this
+  review but not yet done either.
+- Star-tier night-over-night delta in AUDIT needs a `Hotel.previousStars`
+  field before it can be added honestly.
+
+**Known issues**
+- Carried forward unchanged from the prior entry: driver can't keep the
+  desk served continuously through long `holdT()` waits (`C2-W1-blockers.md`
+  B9); tier-2 pilaster can partially occlude the desk terminal from some
+  standing poses (`C3-W3.md` W3-2); no broken prop or staff candidate
+  guaranteed early in a short session.
+- This entry's own scope: the alpha loop is ongoing/responsive to live
+  play, not closed — this cycle's fixes came directly from sitting down and
+  playing it, and cycle 4's own honest gap (no human door-to-end-card
+  sitting yet) is still open.
+
+**Images**
+- apps/hotel/docs/alpha-loop/C4-W1-shots/desk-stamp-checked-in.png

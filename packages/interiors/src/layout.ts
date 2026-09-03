@@ -114,9 +114,12 @@ export function generateLayout(seed: string): Layout {
   // holds for every possible draw -- no seed can produce an invalid floor.
   const FW = 40 + layoutRng.int(0, 6); // 40..46
   // Base raised by +11 (lobbyDepth's own base grew 9->20, delta 11) so
-  // restH (corridor + flanking-room depth below the lobby) keeps the same
-  // 17..26 range it always had -- the lobby got deeper, not the building
-  // shorter. Same single RNG draw, same order, only the base shifted.
+  // restH (corridor + flanking-room depth below the lobby) stays close to
+  // the 17..26 range it always had -- the lobby got deeper, not the
+  // building shorter. Not exact: lobbyDepth's own draw widened (int(0,3)
+  // -> int(0,4)), so restH = FH - lobbyDepth - 1 is now 16..26 (16 is
+  // still >= the clamp's minRoomDepth-derived floor of 15, so nothing
+  // breaks). Same single RNG draw, same order, only the base shifted.
   const FH = 41 + layoutRng.int(0, 6); // 41..47
   const lobbyDepth = 20 + layoutRng.int(0, 4); // 20..24
   // Corridor width must leave room for a DOOR_WIDTH_CELLS-wide lobby<->

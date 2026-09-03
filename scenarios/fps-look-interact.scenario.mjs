@@ -22,27 +22,32 @@
 //     dx1Px = round(angleDeltaMdeg(351_500, 0)/220) = -39
 //   KeyW held (moveCommand forwardMilli=1000) at camYaw=351_420 (0 + -39*220,
 //   wrapped): the script probes hold durations 1..20 ticks through the real
-//   compiled sim and takes the first whose rest position is inside door0's
-//   interact range (radiusMm=1500) AND arc (+/-30_000 mdeg) after a
-//   corrective look -- that is N=6 ticks, landing at (5201, 5557), 1333mm
-//   from door0.
-//     bearing2 = atan2Mdeg(door0.x-5201, door0.z-5557) = 351_400 mdeg
-//     dx2Px = round(angleDeltaMdeg(351_400, 351_420)/220) = 0 (already
-//     aimed correctly after look1 -- the corrective look step is kept in
-//     the script, as 0px, because the spec's shape always issues it)
-//   PROOF: replaying face(351_420)+move(1000,0) for ticks 1..6, then
-//   face(351_420) again and interact(doorEntity) at tick 7, into a FRESH
-//   Sim produced event {tick:7, type:"door", payload:{doorIndex:0,
+//   compiled sim.
+//
+// --- C3-W1b re-derivation (selection rule change, not a geometry change) --
+// The C3-W1 pick above (N=6, 1333mm from a 1500mm radius -- 167mm of
+// margin) was reviewed in docs/alpha-loop/reviews/C3-W1.md item W1-2: it is
+// the FIRST hold that clears the interact radius, which is by construction
+// the marginal one, and 167mm is under this lane's 200mm floor. derive-walk.mjs
+// was changed to select from the contiguous band of accepted holds (here
+// N=6..20) the one closest to the band's middle among candidates with
+// >=200mm of margin, rather than the first. Re-running the SAME command
+// above under the new rule:
+//   band N=[6..20], mid=13 -> chose N=13, landing at (4998, 6345), 530mm
+//   from door0 (970mm margin, comfortably clear of the 1500mm radius).
+//     bearing2 = atan2Mdeg(door0.x-4998, door0.z-6345) = 200 mdeg
+//     dx2Px = round(angleDeltaMdeg(200, 351_420)/220) = 40 -> camYaw 220
+//   PROOF: replaying face(351_420)+move(1000,0) for ticks 1..13, then
+//   face(220) and interact(doorEntity) at tick 14, into a FRESH Sim
+//   produced event {tick:14, type:"door", payload:{doorIndex:0,
 //   open:true}} -- the click's raycast/interact resolves onto door0 and
 //   the sim accepts it (in-arc, in-range), exactly like the pointer-lock
 //   version below is expected to when the harness replays its own capture.
 //
-// KeyW is held for exactly ticks 1..9 walltime->tick-gated (downAtTick:0,
-// upAtTick:6, matching the derived N=6 above -- shorter than H1a's N=9
-// because the deeper lobby puts the player's rest position closer to
-// door0's interact range sooner along the same +Z-ish walk). Everything
-// else about the tick-gating rationale (docs/PHASE-H0.md risk 4, the
-// "Determinism fix" note) is unchanged and not repeated here.
+// KeyW is held for exactly ticks 1..13 walltime->tick-gated (downAtTick:0,
+// upAtTick:13, matching the derived N=13 above). Everything else about the
+// tick-gating rationale (docs/PHASE-H0.md risk 4, the "Determinism fix"
+// note) is unchanged and not repeated here.
 import { setup } from "../apps/hotel/dist-game/sim/game.js";
 
 // NOTE on "player ended up through the doorway" (docs/PHASE-H0.md exit
@@ -100,13 +105,13 @@ export default {
     // Tick-gated input (see "Determinism fix" above): each step waits for
     // window.__WORLDFORGE__.world.tick to reach the declared tick, in this
     // declaration order, instead of a wall-clock atMs offset. This makes
-    // the KeyW hold span exactly ticks 1..9 on every run.
+    // the KeyW hold span exactly ticks 1..13 on every run.
     input: [
       { pointer: "lock", atTick: 0 },
       { pointer: "look", atTick: 0, dx: -39, dy: 0 }, // turn toward the lobby door (derive-walk.mjs, see header)
-      { key: "KeyW", downAtTick: 0, upAtTick: 6 }, // exactly 6 move ticks: derived rest position is inside interact range/arc
-      { pointer: "look", atTick: 6, dx: 0, dy: 0 }, // corrective look: already aimed after look1 (derivation above)
-      { pointer: "click", atTick: 6 },
+      { key: "KeyW", downAtTick: 0, upAtTick: 13 }, // exactly 13 move ticks: derived rest position is 970mm inside interact range/arc
+      { pointer: "look", atTick: 13, dx: 40, dy: 0 }, // corrective look (derivation above)
+      { pointer: "click", atTick: 13 },
     ],
     screenshotAtTicks: [5, 50],
     probes: [{ probe: "fps" }, { probe: "sim-tick-ms" }],

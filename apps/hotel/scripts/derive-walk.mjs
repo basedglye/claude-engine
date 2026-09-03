@@ -60,6 +60,7 @@ function parseArgs(argv) {
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === "--forward-ticks") opts.forwardTicks = Number(rest[++i]);
     if (rest[i] === "--hold-ms") opts.holdMs = Number(rest[++i]);
+    if (rest[i] === "--old-rule") opts.oldRule = true; // non-vacuity: reproduce the pre-C3-W1b "first hold that works" pick
   }
   if (!seed || !target) {
     console.error("usage: node derive-walk.mjs <seed> <target> [--forward-ticks N]");
@@ -111,7 +112,7 @@ function pxForDelta(camYaw, bearing) {
 }
 
 function main() {
-  const { seed, target: targetName, forwardTicks } = parseArgs(process.argv.slice(2));
+  const { seed, target: targetName, forwardTicks, oldRule } = parseArgs(process.argv.slice(2));
   const floor = generateGroundFloor(seed);
   const target = resolveTarget(floor, targetName);
 
@@ -151,7 +152,50 @@ function main() {
     const distOk = distMm <= INTERACTABLE_RADIUS_MM;
     candidates.push({ n, pose, bearing2, look2Px, finalYaw, distMm, angleOk, distOk });
   }
-  const chosen = candidates.find((c) => c.distOk && c.angleOk) ?? candidates[candidates.length - 1];
+  // Selection rule (C3-W1b, replacing "first hold that works"): the first
+  // accepted hold is, by construction, the marginal one -- it is whichever
+  // N first crosses into range, so it can sit a handful of millimetres
+  // inside the radius (reserva-readability's old N=14 landed 1489mm from a
+  // 1500mm radius, 11mm of margin -- one float ulp of cross-engine trig
+  // drift from flaking). Instead: find the contiguous run ("band") of N
+  // values that are accepted (distOk && angleOk), require at least 200mm
+  // of margin (radiusMm - distMm >= MIN_MARGIN_MM), and within that pick
+  // the candidate closest to the middle of the accepted band -- not the
+  // deepest possible margin, which would just trade a marginal distance
+  // for a marginal angle. Falls back to the deepest-margin accepted
+  // candidate if nothing clears MIN_MARGIN_MM (never silently accepts an
+  // unaccepted candidate).
+  const MIN_MARGIN_MM = 200;
+  const accepted = candidates.filter((c) => c.distOk && c.angleOk);
+  let band = [];
+  for (const c of accepted) {
+    if (band.length === 0 || c.n === band[band.length - 1].n + 1) {
+      band.push(c);
+    } else {
+      break; // stop at the first gap: keep only the first contiguous run
+    }
+  }
+  const bandMidN = band.length ? (band[0].n + band[band.length - 1].n) / 2 : undefined;
+  const inMargin = band.filter((c) => INTERACTABLE_RADIUS_MM - c.distMm >= MIN_MARGIN_MM);
+  let chosen;
+  let selectionNote;
+  if (oldRule) {
+    // --old-rule: the PRE-C3-W1b behaviour this flag exists to reproduce
+    // for the record -- take the first accepted hold, full stop.
+    chosen = accepted[0] ?? candidates[candidates.length - 1];
+    selectionNote = `--old-rule: first accepted hold, N=${chosen.n} (${chosen.distOk && chosen.angleOk ? `${INTERACTABLE_RADIUS_MM - chosen.distMm}mm margin` : "not accepted -- fell back to last probed tick"})`;
+  } else if (inMargin.length) {
+    chosen = inMargin.reduce((best, c) =>
+      Math.abs(c.n - bandMidN) < Math.abs(best.n - bandMidN) ? c : best,
+    );
+    selectionNote = `band N=[${band[0].n}..${band[band.length - 1].n}], mid=${bandMidN}, chose N=${chosen.n} (closest to mid among candidates with >=${MIN_MARGIN_MM}mm margin)`;
+  } else if (band.length) {
+    chosen = band.reduce((best, c) => (c.distMm < best.distMm ? c : best));
+    selectionNote = `band N=[${band[0].n}..${band[band.length - 1].n}] has NO candidate with >=${MIN_MARGIN_MM}mm margin; fell back to deepest margin, N=${chosen.n} (${INTERACTABLE_RADIUS_MM - chosen.distMm}mm margin)`;
+  } else {
+    chosen = candidates[candidates.length - 1];
+    selectionNote = `no candidate in [1,20] satisfied distOk && angleOk; fell back to the last probed tick, N=${chosen.n}`;
+  }
 
   // Step 6: PROOF -- replay the derived script into a fresh Sim, using
   // faceCommand to stand in for the two pointer "look" steps (both apply
@@ -188,7 +232,16 @@ function main() {
     target: targetName,
     spawnPose,
     look1: { bearingMdeg: bearing1, dxPx: look1Px, camYawAfter: (spawnPose.yawMdeg + look1Px * SENS + 360_000) % 360_000 },
+    candidatesConsidered: candidates.map((c) => ({
+      n: c.n,
+      distMm: c.distMm,
+      marginMm: INTERACTABLE_RADIUS_MM - c.distMm,
+      distOk: c.distOk,
+      angleOk: c.angleOk,
+    })),
+    selectionNote,
     holdTicks: chosen.n,
+    marginMm: INTERACTABLE_RADIUS_MM - chosen.distMm,
     poseAfterHold: chosen.pose,
     look2: { bearingMdeg: chosen.bearing2, dxPx: chosen.look2Px, camYawAfter: chosen.finalYaw },
     distMmAfterHold: chosen.distMm,

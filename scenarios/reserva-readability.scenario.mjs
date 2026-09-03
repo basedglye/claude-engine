@@ -32,14 +32,22 @@
 // player-fps turns at 220 mdeg per look-px:
 //   dx1Px = round(angleDeltaMdeg(276700, 0)/220) = -379 -> camYaw 276620
 // The script probes hold durations 1..20 ticks (moveCommand forwardMilli
-// =1000 each tick) through the REAL compiled sim and takes the first whose
-// rest position is inside the terminal's interact range AND arc after a
-// corrective look: N=14, landing at (2853, 4697), 1489mm from the
-// terminal (just inside the 1500mm radius).
-//   bearing2 = 276800 mdeg -> dx2Px = round(angleDeltaMdeg(276800,
-//   276620)/220) = 1 -> camYaw 276840
-// PROOF: replaying face(276620)+move(1000,0) ticks 1..14, then
-// face(276840) and interact(terminalEntity) at tick 15 into a fresh Sim
+// =1000 each tick) through the REAL compiled sim.
+//
+// --- C3-W1b re-derivation (selection rule change, not a geometry change) --
+// The C3-W1 pick above (N=14, 1489mm from a 1500mm radius -- 11mm of
+// margin) was reviewed in docs/alpha-loop/reviews/C3-W1.md item W1-2:
+// derive-walk.mjs took the FIRST hold that cleared the terminal's interact
+// radius, which is by construction the marginal one. The script was
+// changed to select, from the contiguous band of accepted holds, the one
+// closest to the band's middle among candidates with at least 200mm of
+// margin. Re-running the SAME command above under the new rule:
+//   band N=[14..20], mid=17 -> chose N=17, landing at (2457, 4766), 1087mm
+//   from the terminal (413mm margin, comfortably inside the 1500mm radius).
+//   bearing2 = 275700 mdeg -> dx2Px = round(angleDeltaMdeg(275700,
+//   276620)/220) = -4 -> camYaw 275740
+// PROOF: replaying face(276620)+move(1000,0) ticks 1..17, then
+// face(275740) and interact(terminalEntity) at tick 18 into a fresh Sim
 // left the terminal's component as {station:"frontdesk",
 // focusedBy:"player"} -- the click resolves and the sim accepts focus.
 //
@@ -68,7 +76,7 @@
 import { setup } from "../apps/hotel/dist-game/sim/game.js";
 
 const SEED = "hotel-h1-look-1";
-const WALK_TICKS = 14;
+const WALK_TICKS = 17;
 const LOOK_DX = -379;
 const LOOK_DY = 70;
 const RESERVA_UV = { u: 0.0688, v: 0.025 };

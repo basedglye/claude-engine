@@ -23,7 +23,7 @@ of this document or of the conversation that produced it.
   and closes solvent inside 14 in-game days), and all **5 browser gates**
   green (`fps-look-interact` on Chromium and Firefox, `reserva-readability`,
   `save-restore`, `demo-visual`) at their pinned command counts
-  8 / 18 / 69 / 18 (re-pinned by C3-W1 for the deep lobby; were 12 / 20 / 69 / 18).
+  16 / 21 / 69 / 18 (re-pinned by C3-W1b with ≥200 mm interact margins on the deep lobby; were 12 / 20 / 69 / 18).
 - `main.ts` is fully wired: `readHotelTier` → per-tier scenery groups and
   light-rig rebuild, the walkthrough + end card, and
   `installHoverLookFallback`.
@@ -245,7 +245,7 @@ these, and nothing less.
 | 6 | RENOVATE becomes available, is pressed once, and **the hotel visibly changes around the player** — tier 0 → 1 and 1 → 2 | C2-W1 | Four frames from one fixed camera pose: t0, t1 after the first press, t1 again, t2 after the second; plus `hotel.renovated` `{from,to}` for both |
 | 7 | The end card appears at tier 2 with a day count and cash, and **play continues after it** | C2-W1 | Frame of the end card, then a frame after dismissal showing the player still walking |
 | 8 | All of 1–7 hold in **the single-file artifact served alone**, with **zero** external requests | C2-W1, re-run by COO from `file://` offline | Request log from the isolated 5203 server (total = 1, the document) **and** the COO's own `file://` open with the network panel empty |
-| 9 | 13 headless gates + 5 browser gates green at pinned counts on the merged tree, and tier 2 has not regressed | COO only, re-running every command itself | Verdict JSONs under `artifacts/verdicts/`, command counts 8 / 18 / 69 / 18 (re-pinned by C3-W1 for the deep lobby; were 12 / 20 / 69 / 18), and the tier-2 poses compared by eye against `docs/evidence/alpha-look-*.jpg` |
+| 9 | 13 headless gates + 5 browser gates green at pinned counts on the merged tree, and tier 2 has not regressed | COO only, re-running every command itself | Verdict JSONs under `artifacts/verdicts/`, command counts 16 / 21 / 69 / 18 (re-pinned by C3-W1b with ≥200 mm interact margins on the deep lobby; were 12 / 20 / 69 / 18), and the tier-2 poses compared by eye against `docs/evidence/alpha-look-*.jpg` |
 
 **The bar for "with no outside help" is the walkthrough, not the tester.**
 C2-W1 plays the loop **with the walkthrough on and its own knowledge of
@@ -280,7 +280,7 @@ are the cycle-2 deltas.
    After C2-W2, the hashes are expected to MOVE (carry 3 is a stream
    change) — a moved hash with `passed: true` and incremental/slow
    agreement is a re-pin; a *divergence* is not.
-5. **Browser gates** at exactly 8 / 18 / 69 / 18 (re-pinned by C3-W1 for the deep lobby; were 12 / 20 / 69 / 18).
+5. **Browser gates** at exactly 16 / 21 / 69 / 18 (re-pinned by C3-W1b with ≥200 mm interact margins on the deep lobby; were 12 / 20 / 69 / 18).
 6. **Non-vacuity is evidenced, not asserted** — the exact edit, the exact
    assertion string that went red, four exit codes.
 7. **Rebuild discipline** — `tsbuildinfo` + `dist-game` removed, or the

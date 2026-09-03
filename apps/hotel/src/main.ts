@@ -521,7 +521,16 @@ canvas.addEventListener("click", (e: MouseEvent) => {
   if (!focusedScreen) return;
   e.stopImmediatePropagation();
   const hit = raycastFocusedScreen(e.clientX, e.clientY);
-  if (!hit) return;
+  if (!hit) {
+    // Clicked OFF the screen while focused: leave the terminal and resume
+    // play. This is a real user gesture, so requestPointerLock() is
+    // honoured immediately -- unlike the Esc path, which the browser
+    // refuses for ~1.3s after Escape, leaving the player unlocked and
+    // feeling stuck at the desk (reported in live play 2026-09-03).
+    hook.submit(screenBlurCommand(sim.tick + 1));
+    canvas.requestPointerLock();
+    return;
+  }
   // THE seam: hand the raw uv to player-fps's applyScreenClick, the exact
   // function `syntheticPointer.screenClick(u, v)` calls too -- everything
   // downstream (uvToPixel, command construction, submit cadence) is now
@@ -547,8 +556,11 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   }
   if (!focusedScreen) return;
   if (e.code === "Escape") {
+    // Blur only. Do NOT auto re-lock: the browser refuses requestPointerLock
+    // for ~1.3s after Escape, so the call would silently fail and strand the
+    // player unlocked. Clicking the canvas (a fresh gesture) re-locks; the
+    // HUD prompt says so, and clicking off the screen also exits directly.
     hook.submit(screenBlurCommand(sim.tick + 1));
-    requestLockQuietly();
     return;
   }
   hook.submit(screenKeyCommand(sim.tick + 1, e.code));

@@ -2039,9 +2039,24 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       const view = buildScreenWorldView(s);
       const result = hotelShell.reduce(screenApp.state, input, view);
       const isTagged = result !== null && typeof result === "object" && "state" in result;
-      const nextState = isTagged ? (result as { state: typeof screenApp.state }).state : (result as typeof screenApp.state);
+      let nextState = isTagged ? (result as { state: typeof screenApp.state }).state : (result as typeof screenApp.state);
       const effect: ScreenEffect | undefined = isTagged ? (result as { effect?: ScreenEffect }).effect : undefined;
       const openAppChanged = nextState.openAppId !== screenApp.state.openAppId;
+      // C4-W1: `packages/surface-ui`'s `ScreenInput` union has always had a
+      // `{ kind: "open" }` case (types.ts), but the shell (also read-only
+      // for this lane) never sends it -- switching apps only ever changes
+      // `openAppId`, the child app's `reduce` never sees the switch. AUDIT's
+      // reveal-cadence ritual needs to know the tick it was opened at, so
+      // when a click just switched the open app, deliver ONE follow-up
+      // `{ kind: "open" }` reduce to the (now-focused) app via the SAME
+      // `hotelShell.reduce` entry point -- it routes purely off
+      // `nextState.openAppId`, so this reaches exactly the app that was
+      // just switched to, with no shell.ts change and no second command.
+      if (openAppChanged) {
+        const openResult = hotelShell.reduce(nextState, { kind: "open" }, view);
+        const openIsTagged = openResult !== null && typeof openResult === "object" && "state" in openResult;
+        nextState = openIsTagged ? (openResult as { state: typeof nextState }).state : (openResult as typeof nextState);
+      }
       const changed = nextState !== screenApp.state;
 
       s.setComponent<ScreenApp>(terminal, "screenApp", {

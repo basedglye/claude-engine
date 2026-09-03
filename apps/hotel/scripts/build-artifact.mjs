@@ -20,13 +20,24 @@
  * the emitted output. Re-running against an identical `dist/` produces a
  * byte-identical file.
  *
- * Usage: node apps/hotel/scripts/build-artifact.mjs [--out <path>]
- *   --out <path>   Write the artifact to <path> instead of
- *                   apps/hotel/dist-artifact/grand-foyer.html (e.g. so
- *                   the orchestrator can publish the same file
- *                   elsewhere). Parent directories are created as needed.
+ * Usage: node apps/hotel/scripts/build-artifact.mjs [--out <path>] [--copy-to-dist]
+ *   --out <path>     Write the artifact to <path> instead of
+ *                     apps/hotel/dist-artifact/grand-foyer.html (e.g. so
+ *                     the orchestrator can publish the same file
+ *                     elsewhere). Parent directories are created as needed.
+ *   --copy-to-dist    After the artifact is successfully written (and only
+ *                     then), also copy it byte-for-byte to
+ *                     apps/hotel/dist/play.html so the Vite output directory
+ *                     serves both products. Off by default: a plain artifact
+ *                     build must never silently write into dist/, which is
+ *                     Vite's output. Runs in the same process, after the
+ *                     freshness check above, so a stale dist/ that would
+ *                     produce a stale artifact fails before any copy is
+ *                     attempted. If the copy itself fails, the script exits
+ *                     non-zero naming both paths and does not leave a
+ *                     partial file at the destination.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, copyFileSync, unlinkSync } from "node:fs";
 import { readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,21 +47,25 @@ const HOTEL_ROOT = path.resolve(__dirname, "..");
 const DIST_DIR = path.join(HOTEL_ROOT, "dist");
 const SRC_DIR = path.join(HOTEL_ROOT, "src");
 const DEFAULT_OUT_FILE = path.join(HOTEL_ROOT, "dist-artifact", "grand-foyer.html");
+const DIST_PLAY_FILE = path.join(DIST_DIR, "play.html");
 
 function parseArgs(argv) {
   let out = DEFAULT_OUT_FILE;
+  let copyToDist = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--out") {
       const val = argv[i + 1];
       if (!val) fail("--out requires a path argument");
       out = path.resolve(val);
       i++;
+    } else if (argv[i] === "--copy-to-dist") {
+      copyToDist = true;
     }
   }
-  return { out };
+  return { out, copyToDist };
 }
 
-const { out: OUT_FILE } = parseArgs(process.argv.slice(2));
+const { out: OUT_FILE, copyToDist: COPY_TO_DIST } = parseArgs(process.argv.slice(2));
 const OUT_DIR = path.dirname(OUT_FILE);
 
 // Perturbable for the non-vacuity check (§6.2 of the W4 brief).
@@ -336,3 +351,33 @@ console.log(`build-artifact: wrote ${OUT_FILE}`);
 console.log(`build-artifact: size = ${(finalSize / (1024 * 1024)).toFixed(2)} MB (${finalSize} bytes)`);
 console.log(`build-artifact: embedded assets = ${embeddedCount} (${(embeddedBytes / (1024 * 1024)).toFixed(2)} MB raw)`);
 console.log(`build-artifact: inlined script/style tags = ${inlinedAssetCount}`);
+
+// -- 5. Optional: copy the artifact into dist/play.html ----------------------
+
+if (COPY_TO_DIST) {
+  try {
+    if (!existsSync(DIST_DIR)) {
+      fail(`--copy-to-dist: apps/hotel/dist/ does not exist (${DIST_DIR}); cannot copy into it.`);
+    }
+    copyFileSync(OUT_FILE, DIST_PLAY_FILE);
+    const copiedSize = statSync(DIST_PLAY_FILE).size;
+    if (copiedSize !== finalSize) {
+      // Refuse rather than half-succeed: remove the partial/incorrect copy.
+      try {
+        unlinkSync(DIST_PLAY_FILE);
+      } catch {
+        /* best effort */
+      }
+      fail(
+        `--copy-to-dist: copy size mismatch: ${OUT_FILE} is ${finalSize} bytes but ` +
+          `${DIST_PLAY_FILE} is ${copiedSize} bytes after copy. Removed the partial copy.`
+      );
+    }
+    console.log(`build-artifact: copied to apps/hotel/dist/play.html (${copiedSize} bytes)`);
+  } catch (err) {
+    if (err && err.__buildArtifactFailAlreadyReported) throw err;
+    fail(
+      `--copy-to-dist: failed to copy ${OUT_FILE} to ${DIST_PLAY_FILE}: ${err && err.message ? err.message : err}`
+    );
+  }
+}

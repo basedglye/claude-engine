@@ -64,10 +64,19 @@ const ARRIVE_BY_TICK = 200;
 /** The four fixture agents and their committed goal cells -- all derived,
  *  see the header. */
 const AGENTS = [
-  { entity: 15, pair: 1, goalCx: 9, goalCz: 10 },
-  { entity: 16, pair: 1, goalCx: 2, goalCz: 10 },
-  { entity: 17, pair: 2, goalCx: 24, goalCz: 9 },
-  { entity: 18, pair: 2, goalCx: 24, goalCz: 15 },
+  // Re-derived for cycle 3's deeper lobby (packages/interiors/scripts/
+  // test.mjs's re-pinned golden): apps/hotel/scripts/print-headon-fixture.mjs
+  // printed generateGroundFloor("hotel-h1-headon-1").desk.queueCells and
+  // .spawn for the CURRENT layout.ts — queueCells are still cx 2..9 but
+  // now cz=16 (was 10), and the lobby-spawn cell is (24,18) (was (24,12)).
+  // Pair 1 (X axis, queue row) and pair 2 (Z axis through spawn,
+  // HEADON_Z_HALF_SPAN=3, both in game.ts, unedited) shift accordingly;
+  // pair 3's fixture cells are hardcoded in game.ts at cz=14, which is
+  // still open lobby floor (well inside the new depth) and unaffected.
+  { entity: 15, pair: 1, goalCx: 9, goalCz: 16 },
+  { entity: 16, pair: 1, goalCx: 2, goalCz: 16 },
+  { entity: 17, pair: 2, goalCx: 24, goalCz: 15 },
+  { entity: 18, pair: 2, goalCx: 24, goalCz: 21 },
   // Pair 3 (H2a, H1b review deferral 4b) -- the SIDESTEP fixture, not a
   // head-on: 19 walks east along row 14, 20 is PARKED on 19's first step
   // (its goal is its own cell). See the header note below.

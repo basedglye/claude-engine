@@ -230,7 +230,9 @@ export function buildExterior(floor: GroundFloor, hotelTier: HotelTier): THREE.G
     ]);
     const ropeGeo = new THREE.TubeGeometry(ropeCurve, 16, 0.02, 6, false);
     const rope = new THREE.Mesh(ropeGeo, ropeMat);
-    rope.castShadow = true;
+    // Carried from C2-W2: the thin rope tube's shadow bled a hard line
+    // across the entrance floor at low sun angles; it reads fine unshadowed.
+    rope.castShadow = false;
     group.add(rope);
 
     // Planters flanking the entrance, clear of the door span.
@@ -300,6 +302,10 @@ export function buildExterior(floor: GroundFloor, hotelTier: HotelTier): THREE.G
       const fence = new THREE.Mesh(new THREE.PlaneGeometry(3, fenceH), fenceMat);
       fence.position.set(fenceX, fenceH / 2, doorZ - 1.2);
       fence.rotation.y = Math.PI / 2;
+      // Carried from C2-W2: a thin chain-link plane casting a shadow reads
+      // as a solid grey slab across the entrance floor once the sun angle
+      // catches it -- the fence should be see-through, not shadow-casting.
+      fence.castShadow = false;
       group.add(fence);
       for (const dz of [-1.2 - 1.5, -1.2 + 1.5]) {
         const post = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, fenceH, 8), postMat);

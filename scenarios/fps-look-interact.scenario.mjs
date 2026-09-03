@@ -7,109 +7,42 @@
 // -- the exact compiled module the browser bundles (docs/PHASE-H0.md, "The
 // synthetic-input contract").
 //
-// --- Determinism fix (phase-H0 review item 1, BLOCKING) -------------------
-// The original version of this scenario scheduled every input step on
-// wall-clock atMs offsets, including the KeyW hold (downMs:400, upMs:850).
-// Real scheduling jitter (page.waitForTimeout, event-loop scheduling, CI
-// machine speed) meant that window landed on 8 OR 9 sim ticks depending on
-// timing, but the corrective look below was derived for the 9-tick rest
-// position only -- on an 8-tick run the reticle ends up off the door panel
-// and the click's raycast resolves nothing (reviewer repro: 1 of 6 runs,
-// zero interact commands captured). Per docs/PHASE-H0.md risk 4's own
-// stated mitigation ("if flake persists, gate the click step on world.tick
-// instead of wall clock"), every input step below now uses the harness's
-// tick-gated InputStep form (packages/harness/src/browser.ts) instead of
-// atMs: each step waits for window.__WORLDFORGE__.world.tick to reach a
-// declared tick (the same pollUntilTick polling the harness already uses
-// for screenshot capture) before firing. The KeyW hold itself is also
-// tick-gated (downAtTick/upAtTick) rather than wall-clock timed, which
-// removes the 8-vs-9-tick variance at its source instead of merely coping
-// with whichever count wall-clock scheduling happens to produce: the hold
-// now spans deterministically exactly ticks 1..9 on every run, on every
-// engine. Because that is exactly the N=9 rest position the corrective
-// look below was already derived for, the derived deltas themselves did
-// not need to change -- only how the hold is scheduled.
+// --- Cycle 3 re-derivation (lobby deepened 9-12 -> 20-24 cells) -----------
+// The interiors golden was re-pinned (packages/interiors/scripts/test.mjs)
+// after packages/interiors/src/layout.ts's lobbyDepth changed; this is NOT
+// a pure translation this time (lobbyDepth's own range moved, and spawn/
+// door0 sit at different fractions of a much deeper room), so the old
+// pointer-delta literals below were re-derived from scratch, not reused.
+// apps/hotel/scripts/derive-walk.mjs (new this cycle) computed and PROVED
+// this by replaying the exact script into a fresh Sim built from the
+// CURRENT compiled setup()/generateGroundFloor:
+//   node apps/hotel/scripts/derive-walk.mjs hotel-h0-look-1 corridor-door
+//   spawn pose: (5375, 4375, yaw 0); door0 (doorIndex 0, lobby<->corridor):
+//     bearing1 = atan2Mdeg(door0.x-5375, door0.z-4375) = 351_500 mdeg
+//     dx1Px = round(angleDeltaMdeg(351_500, 0)/220) = -39
+//   KeyW held (moveCommand forwardMilli=1000) at camYaw=351_420 (0 + -39*220,
+//   wrapped): the script probes hold durations 1..20 ticks through the real
+//   compiled sim and takes the first whose rest position is inside door0's
+//   interact range (radiusMm=1500) AND arc (+/-30_000 mdeg) after a
+//   corrective look -- that is N=6 ticks, landing at (5201, 5557), 1333mm
+//   from door0.
+//     bearing2 = atan2Mdeg(door0.x-5201, door0.z-5557) = 351_400 mdeg
+//     dx2Px = round(angleDeltaMdeg(351_400, 351_420)/220) = 0 (already
+//     aimed correctly after look1 -- the corrective look step is kept in
+//     the script, as 0px, because the spec's shape always issues it)
+//   PROOF: replaying face(351_420)+move(1000,0) for ticks 1..6, then
+//   face(351_420) again and interact(doorEntity) at tick 7, into a FRESH
+//   Sim produced event {tick:7, type:"door", payload:{doorIndex:0,
+//   open:true}} -- the click's raycast/interact resolves onto door0 and
+//   the sim accepts it (in-arc, in-range), exactly like the pointer-lock
+//   version below is expected to when the harness replays its own capture.
 //
-// --- Pointer-delta derivation (committed as literals, not guessed) --------
-// RE-DERIVED for Phase H1a (docs/PHASE-H1.md): the interiors generator now
-// adds a street strip north of the lobby (desk/queue/entrance-door), which
-// shifts every lobby/corridor coordinate south by a constant offset -- the
-// comment below previously cited the PRE-H1 numbers and had gone stale
-// even though (by luck: the shift is a pure Z-translation, so bearings and
-// the resulting look-deltas are unchanged) the scenario still passed. A
-// throwaway node script (apps/hotel, importing the built
-// @claude-engine/interiors + @claude-engine/space + the compiled
-// dist-game/sim/game.js) printed generateGroundFloor("hotel-h0-look-1")'s
-// CURRENT spawn and doors[0] (the lobby<->corridor doorway; still
-// doorIndex 0 -- door generation order is unchanged, the entrance door is
-// appended last -- roomA=1=lobby):
-//   spawn = { xMm: 5375, zMm: 2875, yawMdeg: 0 }
-//   door0 = { xMm: 5000, zMm: 4125, roomA: 1 (lobby), roomB: 2 (corridor) }
-//
-// createFpsController (packages/player-fps/src/index.ts) initializes its
-// free-look camYawMdeg to the sim's spawn yaw (0) on the first onTick, then
-// applyLook adds `dxPx * mouseSensitivityMdegPerPx` (default 220 mdeg/px)
-// to camYawMdeg per look step -- the exact function real mousemove and
-// synthetic `pointer:"look"` steps both call (the synthetic-input contract).
-// At yaw 0 the sim's forward direction is +Z, and bearing is computed the
-// same way the sim's interactSystem computes it: atan2Mdeg(dx, dz) where
-// dx/dz are (target - player). So, with the RE-DERIVED (current) spawn/door0:
-//   bearing1 = atan2Mdeg(door0.xMm - spawn.xMm, door0.zMm - spawn.zMm)
-//            = atan2Mdeg(-375, 1250) = 343_400 mdeg
-//   signed delta from camYaw=0 (wrap to (-180_000,180_000]): -16_600 mdeg
-//   dx1Px = round(-16_600 / 220) = -75  (-> camYaw becomes 343_500 mdeg,
-//     100 mdeg of quantization error off the exact bearing -- comfortably
-//     inside the interactable's +/-30_000 mdeg arc half-width)
-// The street strip's addition shifted spawn and door0 by an IDENTICAL
-// (dx=0, dz=+1500) offset -- lobby geometry translated wholesale, not
-// reshaped -- so this bearing, and every delta derived from it below, come
-// out byte-identical to the pre-H1 numbers. That is a property of this
-// particular seed/generator change, not something to assume holds for a
-// future layout change; re-derive again if the generator moves the lobby
-// relative to itself (not just translates the whole floor).
-// The corrective look re-derives the bearing from the player's ACTUAL
-// resting position after the KeyW hold, not the straight spawn->door line
-// -- walking at a ~16.5deg angle for N=9 ticks against a still-closed door
-// (see the KeyW-duration derivation below) leaves the player short of and
-// off to the side of the door, at (4871, 3639) (found the same way as the
-// duration below: replaying the real compiled setup()/moveCircle):
-//   bearing2 = atan2Mdeg(door0.xMm - 4871, door0.zMm - 3639)
-//            = atan2Mdeg(129, 486) = 14_800 mdeg
-//   signed delta from camYaw=343_500 (after look1): +31_300 mdeg -- already
-//   OUTSIDE the interactable's +/-30_000 mdeg arc half-width, confirmed by
-//   an actual run: the interact command WAS submitted (proving the reticle
-//   raycast/click plumbing works) but the sim rejected it with
-//   interact-denied{reason:"out-of-arc"} at this delta. This is *why* the
-//   spec calls for a corrective look at all -- walking closes most of the
-//   distance but changes the required facing enough to need re-aiming:
-//   dx2Px = round(31_300 / 220) = 142  (-> camYaw becomes 14_740 mdeg, 60
-//     mdeg off the exact bearing, comfortably inside the arc)
-//
-// Distance spawn->door0 is ~1305mm, already inside the door's
-// interactable.radiusMm=1500mm from a dead stop, so the KeyW hold is not
-// load-bearing for reaching interact range -- it is included because the
-// spec's script always walks up to the door.
-//
-// KeyW hold duration was ALSO derived, not copied from the spec's example
-// verbatim, because a naive 1000ms hold overshoots badly here: moveSystem
-// resolves X and Z axis-separated per tick (space.moveCircle, X first), so
-// while the door is still closed the player's Z progress stops dead at the
-// wall (~7 ticks in) but X keeps drifting every tick for as long as KeyW is
-// held (the open lobby never blocks X alone) -- a throwaway script that
-// replayed faceCommand(343_500) + N ticks of moveCommand(1000,0) through
-// the real compiled setup()/moveCircle for N=2..20 found:
-//   N=9  -> pos (4871, 2139)   -- inside the doorway's x-span [4500,5500]
-//   N=20 -> pos (4255, 2139)   -- OUTSIDE the x-span (west of 4500):
-//     this is exactly what an unmodified 1000ms hold produces, and exactly
-//     why the first working version of this scenario had the click's
-//     reticle raycast miss the door entirely (recorded 0 interact
-//     commands) even though the player was well within the interactable's
-//     radiusMm=1500 the whole time -- proximity was never the problem,
-//     aim was. N=9 leaves comfortable margin on both sides of the span, so
-//     KeyW is held for exactly 9 sim ticks here, gated on tick number
-//     (downAtTick:0, upAtTick:9, not wall-clock) so the count is exact on
-//     every run rather than landing on 8 or 9 depending on scheduling --
-//     see "Determinism fix" above.
+// KeyW is held for exactly ticks 1..9 walltime->tick-gated (downAtTick:0,
+// upAtTick:6, matching the derived N=6 above -- shorter than H1a's N=9
+// because the deeper lobby puts the player's rest position closer to
+// door0's interact range sooner along the same +Z-ish walk). Everything
+// else about the tick-gating rationale (docs/PHASE-H0.md risk 4, the
+// "Determinism fix" note) is unchanged and not repeated here.
 import { setup } from "../apps/hotel/dist-game/sim/game.js";
 
 // NOTE on "player ended up through the doorway" (docs/PHASE-H0.md exit
@@ -170,10 +103,10 @@ export default {
     // the KeyW hold span exactly ticks 1..9 on every run.
     input: [
       { pointer: "lock", atTick: 0 },
-      { pointer: "look", atTick: 0, dx: -75, dy: 0 }, // turn toward the lobby door (see derivation above)
-      { key: "KeyW", downAtTick: 0, upAtTick: 9 }, // exactly 9 move ticks: stops inside the doorway's x-span
-      { pointer: "look", atTick: 9, dx: 142, dy: 0 }, // corrective look, re-aims onto the door (derivation above)
-      { pointer: "click", atTick: 9 },
+      { pointer: "look", atTick: 0, dx: -39, dy: 0 }, // turn toward the lobby door (derive-walk.mjs, see header)
+      { key: "KeyW", downAtTick: 0, upAtTick: 6 }, // exactly 6 move ticks: derived rest position is inside interact range/arc
+      { pointer: "look", atTick: 6, dx: 0, dy: 0 }, // corrective look: already aimed after look1 (derivation above)
+      { pointer: "click", atTick: 6 },
     ],
     screenshotAtTicks: [5, 50],
     probes: [{ probe: "fps" }, { probe: "sim-tick-ms" }],

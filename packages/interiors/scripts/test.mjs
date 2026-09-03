@@ -72,7 +72,7 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // row north and one column east so a 300mm-radius guest can actually
 // stand on a slot. No grid cell, portal, door or mesh vertex changed --
 // only the serialized `desk` block, which this hash covers.
-const GOLDEN_HASH = 0x752bc750;
+const GOLDEN_HASH = 0x43fd1d2e;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {

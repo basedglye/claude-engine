@@ -22,21 +22,26 @@
 // did not reproduce. The bar is a CONSTANT command count per engine.
 //
 // DERIVATION OF THE COMMITTED LITERALS (seed hotel-h1-look-1)
-// Run headlessly against the real compiled setup() (see derive notes below):
-//   player spawn      (5625, 2875), yaw 0
-//   terminal anchor   (1375, 3125), radiusMm 1500, arcMdeg 60000
-//   bearing to it     273366 mdeg, distance 4257 mm
-// player-fps turns at 220 mdeg per look-px, so the yaw needed is
-//   round(-86634 / 220) = -394 px  ->  yaw 273320 mdeg (46 mdeg off exact)
-// Walking N ticks at 200 mm/tick and re-measuring against the real
-// moveCircle gives:
-//   N=14 -> (2839,3029) dist 1504  OUT of the 1500mm interact radius
-//   N=15 -> (2640,3040) dist 1309  in range
-//   N=16 -> (2640,3051) dist 1306  in range, and X is already desk-blocked
-//   N=18 -> (2640,3073) dist 1301  identical X -- the player has stopped
-// N=16 is chosen because the player is against the desk by then, so ticks
-// 15..18 all land on the same X: the pose is insensitive to a tick either
-// side rather than balanced on one.
+// Cycle 3 re-derivation (lobby deepened -- see fps-look-interact's header
+// for why this is not a pure translation): apps/hotel/scripts/derive-walk.mjs
+//   node apps/hotel/scripts/derive-walk.mjs hotel-h1-look-1 desk-terminal
+//   player spawn      (5625, 4375), yaw 0
+//   terminal anchor   (2732, 4611) [floor.desk.xMm/zMm], radiusMm 1500,
+//                      arcMdeg 60000
+//   bearing to it      276700 mdeg
+// player-fps turns at 220 mdeg per look-px:
+//   dx1Px = round(angleDeltaMdeg(276700, 0)/220) = -379 -> camYaw 276620
+// The script probes hold durations 1..20 ticks (moveCommand forwardMilli
+// =1000 each tick) through the REAL compiled sim and takes the first whose
+// rest position is inside the terminal's interact range AND arc after a
+// corrective look: N=14, landing at (2853, 4697), 1489mm from the
+// terminal (just inside the 1500mm radius).
+//   bearing2 = 276800 mdeg -> dx2Px = round(angleDeltaMdeg(276800,
+//   276620)/220) = 1 -> camYaw 276840
+// PROOF: replaying face(276620)+move(1000,0) ticks 1..14, then
+// face(276840) and interact(terminalEntity) at tick 15 into a fresh Sim
+// left the terminal's component as {station:"frontdesk",
+// focusedBy:"player"} -- the click resolves and the sim accepts focus.
 //
 // PITCH IS REQUIRED, AND ITS SIGN WAS MEASURED
 // The monitor sits at 1.15m and the eye at 1.6m, so at ~1.3m range the
@@ -63,8 +68,8 @@
 import { setup } from "../apps/hotel/dist-game/sim/game.js";
 
 const SEED = "hotel-h1-look-1";
-const WALK_TICKS = 16;
-const LOOK_DX = -394;
+const WALK_TICKS = 14;
+const LOOK_DX = -379;
 const LOOK_DY = 70;
 const RESERVA_UV = { u: 0.0688, v: 0.025 };
 const AUDIT_UV = { u: 0.2, v: 0.025 };

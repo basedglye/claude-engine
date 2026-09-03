@@ -373,6 +373,14 @@ let focusedScreen: TerminalScreen | undefined;
 let terminalScreens: Map<EntityId, TerminalScreen> = new Map();
 let focusEase = 0; // 0 = normal FPS pose, 1 = fully eased toward the screen
 const FOCUS_EASE_STEP = 0.12;
+/** Sim ticks after focus at which the ease is forced to 1 (the camera
+ *  lands exactly on the target pose). The ease step is per FRAME, so under
+ *  a slow renderer (the harness's SwiftShader, or a weak GPU) too few frames
+ *  fit between focus and a screenshot tick and the camera is still moving
+ *  when the readability probe reads its rectangle later. Tick-gating the
+ *  end of the ease makes the settled pose frame-rate independent. */
+const FOCUS_SETTLE_TICKS = 8;
+let focusStartTick = -1;
 // How far back the focused camera sits from the monitor.
 //
 // This used to be a constant tuned by eye at one window size, which is a
@@ -580,8 +588,9 @@ const host = createThreeHost(sim, {
         // the browser cursor simply becomes visible again).
         document.exitPointerLock();
       }
+      if (!focusedScreen) focusStartTick = sim.tick;
       focusedScreen = screen;
-      focusEase = Math.min(1, focusEase + FOCUS_EASE_STEP);
+      focusEase = sim.tick - focusStartTick >= FOCUS_SETTLE_TICKS ? 1 : Math.min(1, focusEase + FOCUS_EASE_STEP);
       // screen.screenMesh.position is LOCAL to its parent group (a small
       // z-offset off the housing, see render/screens.ts) -- reading it as
       // if it were a world position was one real bug here: the ease
@@ -624,6 +633,7 @@ const host = createThreeHost(sim, {
     } else {
       focusedScreen = undefined;
       focusEase = 0;
+      focusStartTick = -1;
     }
 
     // HUD state, derived entirely from host-side facts already known here.

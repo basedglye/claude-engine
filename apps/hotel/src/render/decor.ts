@@ -256,6 +256,7 @@ function paintingCanvasTexture(seed: number): THREE.CanvasTexture {
 
 function buildPainting(seed: number): THREE.Group {
   const g = new THREE.Group();
+  const footprint = { w: 0.7, d: 0.05, h: 0.5 };
   const frame = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.04), mat("wood-trim", 0x5a3d24, 0.5));
   g.add(frame);
   shadowize(g);
@@ -265,11 +266,19 @@ function buildPainting(seed: number): THREE.Group {
   // glTF frame, so it stays visible either way. Needed because the
   // Poly Haven "painting" model is a bare frame with no artwork baked in
   // (COO review R1): without this, tier 2 renders an empty gilt rectangle.
-  upgrade(g, wrapChildren(g), "painting", { w: 0.7, d: 0.05, h: 0.5 });
+  upgrade(g, wrapChildren(g), "painting", footprint);
 
   const texture = paintingCanvasTexture(seed);
   const canvas = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.4), new THREE.MeshStandardMaterial({ map: texture, roughness: 0.9 }));
-  canvas.position.z = 0.025;
+  // `fitToFootprint` (assets.ts) centers the loaded glTF's bounding box at
+  // local origin along z, so its front face can land anywhere within
+  // roughly [-footprint.d/2, +footprint.d/2] of origin -- possibly at or
+  // past a fixed z=0.025, occluding/z-fighting the canvas (tier 2 "bare
+  // frame" bug, W3-3/R1). Placing the canvas just past the DECLARED
+  // footprint's far face guarantees it clears the glTF regardless of the
+  // model's actual depth, and reuses `footprint.d` so the two numbers
+  // can't drift apart silently.
+  canvas.position.z = footprint.d / 2 + 0.01;
   shadowize(canvas);
   g.add(canvas);
   return g;

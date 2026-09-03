@@ -313,3 +313,113 @@ arc.
 
 **Images**
 - apps/hotel/docs/alpha-loop/reviews/W2-shots/round2/t0-lobby-east.png
+
+## 2026-09-03 (small hours) — Cycle 2: playtest, polish, hosting, placement
+
+**Shipped**
+- Playtest QA lane played the shipped single-file artifact through 11
+  beats and found the blockers that mattered: there was no time
+  compression (hold-T fast-forward added so a day doesn't take real
+  minutes), the shipped game's `fraudRatePermille` defaulted to **0** so
+  no fraudulent guest ever spawned outside the scenarios' own configs,
+  and RESERVA's ACCEPT/DENY buttons painted off-screen at y=440 from the
+  standing pose.
+- Polish lane killed the sun-shadow streaks (shadow clamped to the
+  street + shadow layer, tier-0 tone pass), deduped the wait-pool, added
+  a broke-renovate probe.
+- Placement lane replaced ad hoc prop scatter with a real solver: wall
+  runs, lanes, and an occupancy grid so furniture stops overlapping.
+- Hosting lane produced `HOSTING.md`, a `build:hosted` script, and
+  `--copy-to-dist` for the single-file `play.html`.
+
+**Verified**
+- `docs/alpha-loop/reviews/C2-W2.md`: **PASS**, three carries recorded
+  (non-blocking).
+- `docs/alpha-loop/reviews/C2-W1.md` (playtest QA): **RE-RUN REQUIRED**
+  — the lane's own driver could not see the fraud-rate-0 bug because the
+  bug meant fraud literally never occurred in the build it was playing;
+  COO found the real defect (F1) and ruled two of the lane's three
+  blocker records wrong on the facts. Re-run deferred to Cycle 3 lane 4.
+- `docs/alpha-loop/reviews/C2-W4.md` (placement): **FIX-LIST** — four
+  blockers open (no wall-surface occupancy so paintings stack, both cart
+  call sites bypass the solver's omit-on-undefined contract, sconces
+  placed outside the solver, a pilaster bisects the front desk). Carried
+  into Cycle 3 lane 3.
+
+**Next**
+- Cycle 3: grow the lobby, close the placement fix-list, fix the fraud
+  rate and RESERVA buttons, re-run the playtest.
+
+**Known issues**
+- Fraud rate 0 in the shipped app default (fixed in cycle 3 lane 2).
+- Four placement blockers from C2-W4 (fixed in cycle 3 lane 3).
+- Playtest exit criteria rows 2-9 not closed (re-run pending, cycle 3
+  lane 4).
+
+## 2026-09-03 — Cycle 3: the lobby gets real depth [IN PROGRESS]
+
+**Shipped**
+- Lane 1: the lobby grows from 9-12 cells deep to **20-24 cells**
+  (`packages/interiors/src/layout.ts`), a contract change under
+  invariant 3 that moves every pinned hash. Every hand-authored browser
+  walk (`fps-look-interact`, `reserva-readability`, `save-restore`) was
+  re-derived by a new script, `apps/hotel/scripts/derive-walk.mjs`,
+  rather than by hand; a follow-up (`derive-walk` W1b) tightened it to
+  pick mid-band holds with a **>=200 mm interact margin**. Gate counts
+  landed at **16/21/69/18** (re-pinned twice as the derivation
+  tightened, 8/18/69/18 midway then final at 16/21/69/18). Fence and
+  rope props no longer cast shadows.
+- Lane 2: default `fraudRatePermille` set to **200** (one guest in five)
+  at tier 0, unchanged across tiers for the alpha; RESERVA's ACCEPT/DENY
+  moved on-screen from the standing pose; the audit screen gained its
+  owed `t()` line ("The audit runs itself at midnight; this screen is
+  the report").
+- Lane 3: all four C2-W4 placement blockers closed — wall-surface
+  occupancy now tracked so paintings stop stacking, both cart call
+  sites go through the solver's omit-on-undefined contract, sconces
+  placed through the shared room occupancy grid, the pilaster cleared
+  off the front desk. Painted canvases now sit in frames; windows clear
+  of the desk; decor builds before fixtures.
+- Lane 4 (playtest re-run): re-ran with hold-T time compression, a
+  corrected driver, and fraud live. Owner bot's rate-chase was found
+  locking the terminal (fixed to only step toward reachable tiers).
+  `alpha-loop` now runs **13/13** with live fraud and reaches **tier 2
+  by day 9**.
+- Lane 5 (ruling only, not yet implemented): a missed fraud will become
+  a checkout skip (chargeback ledger line, no guest review, a "fraud
+  loss" audit line, and a reputation hit in that guest's segment
+  equivalent to one 1-star review) — CEO ruling recorded in
+  `docs/alpha-loop/CYCLE-3.md`; the sim-side implementation is the open
+  item.
+
+**Verified**
+- `docs/alpha-loop/reviews/C3-W1.md`: **PASS with two numbered
+  follow-ups (neither blocking the merge)**.
+- `docs/alpha-loop/reviews/C3-W2.md`: **FIX-LIST (2 blockers, 2 rough
+  edges)** — folded into the W3-round-2 commit
+  (`08adff8`) per the commit log; re-verify against the review file
+  before calling it closed.
+- `docs/alpha-loop/reviews/C3-W3.md`: **FIX-LIST (2 blockers open, 2
+  blockers closed)** — same caveat as W2.
+- Browser gate counts re-pinned and re-confirmed: **16/21/69/18**
+  (`bc7d87b`, after an intermediate re-pin to 8/18/69/18 in `f6d2ffd`).
+- `alpha-loop` scenario (per commit `34afbd4`): **13/13**, live fraud,
+  tier 2 reached by day 9.
+
+**Next**
+- Close lane 5: implement the missed-fraud skip/chargeback/reputation
+  mechanic in sim files only, re-pin `fraud-catch` / `fraud-catch-b` /
+  `escalation-stars` hashes honestly, and confirm the alpha-loop
+  "accept everything" perturbation goes red on solvency or stars.
+- Re-verify the C3-W2 and C3-W3 FIX-LIST items are actually closed by
+  the follow-up commits rather than assuming from commit messages.
+
+**Known issues**
+- **Lane 5 is not implemented yet** — a missed fraud currently has no
+  in-game consequence; only the CEO ruling exists.
+- C3-W2 and C3-W3 were reviewed FIX-LIST; the fix commits landed after
+  but have not been re-reviewed to confirm PASS.
+
+**Images**
+- apps/hotel/docs/alpha-loop/C3-W1-shots/tier2-entrance.png
+- apps/hotel/docs/alpha-loop/C3-W1-shots/tier0-lobby-east.png

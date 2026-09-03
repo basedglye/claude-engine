@@ -90,3 +90,34 @@ the *upgraded* tier. Next step for this track: a host-side condition/tier
 input to `architecture`, `decor`, `lighting` and `fixtures`, read from sim
 state (stars / PURCHASE presets, never written by the renderer), so the
 hotel visibly earns its grandeur and every golden stays byte-identical.
+
+## Alpha loop, cycles 1–3 (2026-09-02/03) — verified state
+
+Everything below was run on the quiet tree at commit `4f1eefb`+ (see git log):
+`npm run build`, tsc, eslint, purity, workspace tests; 13 headless scenarios
+with `--verify-replay` (alpha-loop 4145888666, 14/14 assertions, tier 1 day 5,
+tier 2 day 9, 33/33 planted frauds caught, closes solvent); browser gates
+fps-look-interact (Chromium+Firefox, 16 commands), reserva-readability (21),
+save-restore (69), demo-visual (20, that app's own wall-clock flake); the
+single-file artifact builds (`npm run build:hosted -w apps/hotel`).
+
+What the alpha now has: `hotel.tier` 0→1→2 with RENOVATE in LEDGER (costs
+$800/$1,500, 2 stars), tier-scaled demand and rate ceilings, the motel tier
+(procedural stained carpet, drop ceiling, fluorescents, VACANCY neon, chain-link
+lot), the hotel tier, the Grand Foyer tier; the event-driven walkthrough and end
+card; hold-T fast-forward (8 steps/tick, off while a screen is focused); the
+20–24-cell lobby; the placement solver (wall runs, occupancy grid, door lanes,
+shared per-room occupancy for decor and sconces, procedural canvases in frames);
+fraud live at 1 in 5 guests, a missed fraud charging back and costing a star;
+RESERVA's ACCEPT/DENY on-screen; a memory GameStore when IndexedDB is denied;
+hover-look when pointer lock is refused. Deliverables: the artifact
+(https://claude.ai/code/artifact/0161c1c4-6a33-4307-8d77-9a6762999418),
+`apps/hotel/dist/play.html` for Netlify (HOSTING.md), `docs/WALKTHROUGH.md`.
+
+Known, honestly: the scripted playtest driver (`dev/playtest.mjs`) proved beats
+1–5 and 7 by eye on the built artifact (two frauds caught with the mismatching
+field named) but could not keep the desk served continuously, so the tier-1/2
+and end-card frames come from the tour page at those tiers; the human
+end-to-end sitting (H4b's gate) is still owed by a person. No broken prop was
+observed in a 60 s window (B4); no staff candidate appears while cash is
+negative (B5). The old artifact URL (96023cbe…) is pinned to the cycle-1 build.

@@ -722,6 +722,16 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
    *  cell (`doorIndexByCell`, seed-pure and already built above) —
    *  neither a doorway nor its threshold is ever a legal wait cell,
    *  regardless of which seed's floor this runs against. */
+  /** W2 carry 3 (reviews/W1.md §6 carry 1): `candidateWaitCells` is built
+   *  first (above), so its cells are known here — excluded by index, in
+   *  the same shape as `doorIndexByCell` and the `streetCell` clearance
+   *  immediately below. Without this a STAFF candidate and an overflow
+   *  guest can be hand the same cell as their goal ("two agents, one goal
+   *  cell", the family round 3 closed for other pairings). Seed-pure and
+   *  deterministic: built from `candidateWaitCells` alone, iterated in the
+   *  same sorted array order it was produced in, no bare object-key
+   *  iteration, no `Rng`, no float. */
+  const candidateWaitCellIdx = new Set<number>(candidateWaitCells.map((c) => c.cz * grid.width + c.cx));
   const overflowWaitCells: PathCell[] = (() => {
     const QUEUE_CLEARANCE_CELLS = 1;
     // Squared-distance clearance against the street door specifically:
@@ -739,6 +749,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         if (cx < 0 || cz < 0 || cx >= grid.width || cz >= grid.height) continue;
         const idx = cz * grid.width + cx;
         if (doorIndexByCell.has(idx)) continue; // never a doorway cell
+        if (candidateWaitCellIdx.has(idx)) continue; // never a candidate's wait cell
         if (!isOccupiableCell(grid, cx, cz, alwaysOpen)) continue;
         const sdx = cx - streetCell.cx;
         const sdz = cz - streetCell.cz;
@@ -759,6 +770,24 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     found.sort((a, b) => (a.distSq - b.distSq) || (a.idx - b.idx));
     return found.length > 0 ? found.map((f) => f.cell) : [spawnCell];
   })();
+  /** C2-W2 carry 3 non-vacuity check (reviews/W1.md §6 carry 1): a
+   *  deterministic, setup-time count of how many `overflowWaitCells`
+   *  survived without being excluded by `candidateWaitCellIdx` above --
+   *  computed straight from the two already-built pools (sorted array
+   *  order, no bare object-key iteration, no Rng, no float), so this is
+   *  exactly as seed-pure as the pools themselves. Emitted once, at tick
+   *  0, only when the count is nonzero -- alpha-loop.scenario.mjs asserts
+   *  zero `nav.sharedWaitCellPool` events, which is a direct structural
+   *  check of the fix rather than the indirect `nav.stuck` proxy. */
+  {
+    const sharedCount = overflowWaitCells.reduce(
+      (n, c) => (candidateWaitCellIdx.has(c.cz * grid.width + c.cx) ? n + 1 : n),
+      0
+    );
+    if (sharedCount > 0) {
+      sim.emit("nav.sharedWaitCellPool", { sharedCount });
+    }
+  }
   /** W1 round-4 fix, blocking 4.1: allocate by RANK among the currently-
    *  overflowing guests (the caller iterates `arriving` sorted ascending
    *  by id, so a per-call counter is a deterministic rank — no `Rng`

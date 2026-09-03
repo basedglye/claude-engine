@@ -26,8 +26,8 @@
 // 1 partway through the first week and to tier 2 (Grand Foyer) within the
 // 14-day run, business-segment arrivals begin only after the tier-2
 // renovation, and the hotel closes the run solvent.
-import { setupWithConfig, DEFAULTS, PLAYER_ENTITY } from "../apps/hotel/dist-game/sim/game.js";
-import { RENOVATE_COST_MINOR } from "../apps/hotel/dist-game/sim/economy.js";
+import { setupWithConfig, DEFAULTS, PLAYER_ENTITY, PLAYER_ACTOR, DESK_RADIUS_MM } from "../apps/hotel/dist-game/sim/game.js";
+import { RENOVATE_COST_MINOR, RENOVATE_STAR_REQ } from "../apps/hotel/dist-game/sim/economy.js";
 import { generateGroundFloor } from "../packages/interiors/dist/index.js";
 import { makeOwnerBot, scan } from "./lib/hotel-owner.mjs";
 
@@ -66,13 +66,65 @@ function eventsOfType(sim, type) {
   return sim.eventsSince(0).filter((e) => e.type === type);
 }
 
+// Carry 4 (reviews/W1.md §6 carry 3 / W1 round 4 §4.6): the unit half is
+// covered -- apps/hotel/scripts/test.mjs drives all four `renovateCommand`
+// refusal reasons directly. No *bot* beat presses RENOVATE while broke
+// through the real command path a player uses, so `insufficient-cash` is
+// untested there. This is a second, minimal BotDriver (not a hotel-owner.mjs
+// change -- that file is out of this lane's glob) that watches real sim
+// state and, the first tick the player is both within RENOVATE's own desk
+// radius and the hotel is provably too broke for tier 1, submits ONE bare
+// `hotel.renovate` intent -- the same command `renovateCommand()` builds,
+// through the actual actor the sim resolves to the player entity. Firing
+// off the observed state (rather than a hardcoded tick) means it fires
+// exactly when the range check is guaranteed to pass, so a red assertion
+// can only mean the refusal reason changed -- see perturbation B below.
+let renovateProbeTick = null;
+const renovateProbeBot = {
+  actor: PLAYER_ACTOR,
+  act(world, tick) {
+    if (renovateProbeTick !== null) return [];
+    const hotel = scan(world, "hotel")[0]?.[1];
+    if (!hotel || hotel.tier !== 0) return [];
+    // Validation order is range -> max-tier -> stars -> cash (game.ts applyRenovate):
+    // wait until the stars gate is ALREADY satisfied so cash is the first
+    // failing check -- otherwise this reds on "stars-too-low" instead, which
+    // is a different assertion (brief §3 warning, hit live on the first pass).
+    if (hotel.stars < (RENOVATE_STAR_REQ[1] ?? 0)) return [];
+    if (hotel.cash >= (RENOVATE_COST_MINOR[1] ?? 0)) return []; // no longer broke -- wait, don't probe
+    const pos = world.getComponent(PLAYER_ENTITY, "pos");
+    if (!pos) return [];
+    const dxMm = floor.desk.xMm - pos.xMm;
+    const dzMm = floor.desk.zMm - pos.zMm;
+    if (dxMm * dxMm + dzMm * dzMm > DESK_RADIUS_MM * DESK_RADIUS_MM) return [];
+    renovateProbeTick = tick;
+    return [{ type: "hotel.renovate", payload: {} }];
+  },
+};
+
 export default {
   name: "alpha-loop",
   seed: SEED,
   ticks: TICKS,
   setup: setupAlphaLoop,
-  bots: [ownerBot],
+  bots: [ownerBot, renovateProbeBot],
   assertions: [
+    {
+      description: "carry 4: the renovate-while-broke probe actually fired (otherwise every assertion below it is vacuous)",
+      check: () => renovateProbeTick !== null,
+    },
+    {
+      description: 'carry 4: the bare hotel.renovate submitted while broke was refused with reason "insufficient-cash", at the tick it was submitted',
+      check: (s) =>
+        renovateProbeTick !== null &&
+        s
+          .eventsSince(0)
+          .some((e) => e.tick === renovateProbeTick && e.type === "screen.denied" && e.payload?.reason === "insufficient-cash"),
+    },
+    {
+      description: "carry 4: the probe's refusal did not renovate the hotel (no hotel.renovated event at the probe tick)",
+      check: (s) => renovateProbeTick !== null && !s.eventsSince(0).some((e) => e.tick === renovateProbeTick && e.type === "hotel.renovated"),
+    },
     {
       description: `exactly ${DAYS} night audits closed`,
       check: (s) => eventsOfType(s, "econ.audit").length === DAYS,
@@ -144,6 +196,10 @@ export default {
     {
       description: "zero nav.stuck events across the whole run",
       check: (s) => eventsOfType(s, "nav.stuck").length === 0,
+    },
+    {
+      description: "carry 3: zero nav.sharedWaitCellPool events -- candidateWaitCells and overflowWaitCells never share a cell",
+      check: (s) => eventsOfType(s, "nav.sharedWaitCellPool").length === 0,
     },
     {
       description: "roomUnit.messCount agrees with a live mess scan for every room",

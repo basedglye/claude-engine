@@ -28,6 +28,18 @@ const WARM_COLOR = 0xffb877;
 const SUN_COLOR = 0xffceb0;
 /** Cooler, greener, dimmer key light for tier 0 (sickly fluorescent). */
 const MOTEL_COLOR = 0xcfe0c8;
+/** Carry 1 (option b, layer separation): a Three.js render layer used
+ *  ONLY to gate what the sun's shadow CAMERA samples. Every mesh in the
+ *  scene stays on the default layer 0 (so the player's own camera, which
+ *  only enables layer 0, keeps seeing everything normally) -- exterior.ts's
+ *  "exterior" group additionally ENABLES this layer, and the sun's
+ *  `shadow.camera.layers` is set to ONLY this layer. Interior architecture
+ *  and decor are never touched and never enable it, so they cannot appear
+ *  as casters in the sun's shadow map regardless of how the frustum is
+ *  sized -- the sun is an exterior light and now structurally cannot
+ *  sample interior geometry, rather than merely being sized to (hopefully)
+ *  miss it. */
+const SUN_SHADOW_LAYER = 1;
 
 export interface LightingRig {
   group: THREE.Group;
@@ -83,10 +95,14 @@ export function buildLighting(
   scene.add(group);
 
   const keyColor = hotelTier === 0 ? MOTEL_COLOR : WARM_COLOR;
-  // Pushed down further per COO review item 4: tier 0 read as "clean
-  // office", not "tired motel" -- the troughs/bare bulbs should be the
-  // only bright thing in frame.
-  const dim = hotelTier === 0 ? 0.45 : 1;
+  // Pushed down further per COO review item 4 (carried into cycle 2 as
+  // reviews/W2.md item 4, closed here): tier 0 read as "clean office", not
+  // "tired motel" -- the troughs/bare bulbs should be the only bright
+  // thing in frame. This is a small further step from cycle 1's 0.45, not
+  // a re-tune -- reserva-readability's calibration checkerboard is drawn
+  // on the terminal's own (unlit) screen texture, not scene-lit geometry,
+  // so it does not move with this.
+  const dim = hotelTier === 0 ? 0.38 : 1;
 
   const lightsByRoomId = new Map<number, THREE.Light[]>();
 
@@ -97,7 +113,8 @@ export function buildLighting(
   // is cooler and dimmer (a sickly fluorescent-lit motel, not a warm hotel
   // hemisphere) -- same budget, same low-quality collapse.
   const hemiSky = hotelTier === 0 ? 0x9aa892 : 0xfff1d8;
-  const hemi = new THREE.HemisphereLight(hemiSky, 0x33313a, (HIGH_QUALITY ? 0.55 : 1.4) * dim);
+  const hemiGround = hotelTier === 0 ? 0x28241c : 0x33313a;
+  const hemi = new THREE.HemisphereLight(hemiSky, hemiGround, (HIGH_QUALITY ? 0.55 : 1.4) * dim);
   const ambient = new THREE.AmbientLight(0xffffff, (HIGH_QUALITY ? 0.12 : 0.6) * dim);
   group.add(hemi, ambient);
 
@@ -186,16 +203,46 @@ export function buildLighting(
     sun.castShadow = HIGH_QUALITY;
     sun.shadow.mapSize.set(2048, 2048);
     const cam = sun.shadow.camera as THREE.OrthographicCamera;
-    const halfW = Math.max(street.widthM, street.depthM) / 2 + 4;
+    // Carry 1: the sun is an exterior light -- its shadow frustum has no
+    // business sampling interior architecture. The street strip is
+    // shallow (STREET_WALK_ROWS in packages/interiors/src/layout.ts is a
+    // few cells deep), so a tight box + a far plane clamped to the
+    // light-to-target distance plus that same footprint radius covers the
+    // street rect and its immediate apron only, and stops at the facade
+    // instead of reaching tens of metres into the building's interior
+    // volume the way the old fixed `far = 40` did.
+    const halfW = Math.max(street.widthM, street.depthM) / 2 + 1;
     cam.left = -halfW;
     cam.right = halfW;
     cam.top = halfW;
     cam.bottom = -halfW;
     cam.near = 0.5;
-    cam.far = 40;
+    const lightToTarget = sun.position.distanceTo(sun.target.position);
+    // The far plane must stop at the street's own DEPTH (how far the
+    // frustum reaches along the light's view direction), not at `halfW`
+    // -- halfW is sized off the street's WIDTH (needed for the box's
+    // lateral extent, to keep the fence and both door jambs inside it),
+    // which is several times the street's shallow depth. Using halfW for
+    // `far` too let the frustum coast straight through the doorway and a
+    // couple of metres into the corridor beyond it -- exactly far enough
+    // for the chain-link fence (exterior.ts, ~1.2m off the door) to still
+    // land its diagonal shadow on the first interior wall. Capping far at
+    // the street's own depth (+ a small apron) stops the frustum at the
+    // door instead.
+    const streetDepthMargin = Math.max(street.depthM / 2, 1) + 0.5;
+    cam.far = lightToTarget + streetDepthMargin;
     cam.updateProjectionMatrix();
     sun.shadow.bias = -0.0005;
     sun.shadow.normalBias = 0.03;
+    // Belt-and-suspenders half of carry 1: even with the tight frustum
+    // above, interior architecture immediately past the street door sits
+    // inside it (the street strip is shallow) and would still self-shadow
+    // as a caster. Restricting the shadow CAMERA to `SUN_SHADOW_LAYER`
+    // means only objects explicitly enabled on that layer (below, once
+    // `exterior`'s group exists) can appear in the sun's shadow map at
+    // all -- interior architecture and decor, left on the default layer
+    // only, structurally cannot cast into it regardless of frustum size.
+    cam.layers.set(SUN_SHADOW_LAYER);
     group.add(sun, sun.target);
   }
 
@@ -218,7 +265,27 @@ export function buildLighting(
     return broken;
   }
 
+  let exteriorLayered = false;
+  /** `exterior.ts`'s group is added to the scene by main.ts AFTER this
+   *  rig is built (buildLighting() runs before `g.add(buildExterior(...))`
+   *  in main.ts's setup), so it does not exist yet inside `buildLighting`
+   *  itself. `update()` runs every frame once the game loop starts, which
+   *  is always after that setup has finished, so the first call is a safe
+   *  place to enable `SUN_SHADOW_LAYER` on every exterior mesh once and
+   *  never again (the exterior geometry is static after setup). `enable`
+   *  ADDS the layer without removing layer 0, so the player's own camera
+   *  (which only has layer 0 on) still renders these objects normally --
+   *  only the sun's shadow camera additionally sees them. */
+  function layerExteriorForSunShadow(): void {
+    if (exteriorLayered) return;
+    const exterior = scene.getObjectByName("exterior");
+    if (!exterior) return; // not added yet; try again next frame
+    exterior.traverse((obj) => obj.layers.enable(SUN_SHADOW_LAYER));
+    exteriorLayered = true;
+  }
+
   function update(world: IWorld, nowMs: number): void {
+    layerExteriorForSunShadow();
     const brokenRooms = findBrokenLampRoom(world);
     // Tier 0: one fixture always flickers -- the lobby's, per the vision
     // table ("drop-ceiling tiles with fluorescent tubes (one flickers)").

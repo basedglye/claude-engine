@@ -148,6 +148,36 @@ export function scuffedPaintTexture(seedInt: number): THREE.Texture {
     ctx.fillStyle = `rgba(${c},${Math.floor(c * 0.97)},${Math.floor(c * 0.87)},0.5)`;
     ctx.fillRect(x, y, w, h);
   }
+  // Carry 2 (reviews/W2.md item 4): tier 0 reads "dated office", not
+  // "seedy motel". seedInt 1 is the tier-0 call (architecture.ts's
+  // `scuffedPaintTexture(hotelTier === 0 ? 1 : 2)`) -- tier 1's bedroom
+  // walls reuse this same generator with seedInt 2, so this whole pass is
+  // keyed off the tier-0 seed and never fires for tier 1 or tier 2, which
+  // do not call this generator with seedInt 1 or at all.
+  if (seedInt === 1) {
+    // Grime gradient banded around wainscot height (roughly the lower
+    // third of the wall, where a chair rail would sit and where hands and
+    // mop-water actually dirty a wall): darker, browner, and denser near
+    // the bottom edge.
+    const grimeTop = size * 0.55;
+    const grad = ctx.createLinearGradient(0, grimeTop, 0, size);
+    grad.addColorStop(0, "rgba(58,50,36,0)");
+    grad.addColorStop(0.4, "rgba(58,50,36,0.10)");
+    grad.addColorStop(1, "rgba(46,38,26,0.28)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, grimeTop, size, size - grimeTop);
+    // A scattering of darker hand/mop smudges concentrated right at the
+    // wainscot line itself, so it doesn't read as a flat gradient.
+    for (let i = 0; i < 22; i++) {
+      const x = hash2(seedInt + 6, i * 2) * size;
+      const y = grimeTop + hash2(seedInt + 6, i * 2 + 1) * (size - grimeTop);
+      const r = 4 + hash2(seedInt + 7, i) * 8;
+      ctx.fillStyle = `rgba(50,42,30,${0.08 + hash2(seedInt + 8, i) * 0.1})`;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
   // Scuffs: short dark diagonal smears clustered low in the tile.
   for (let i = 0; i < 18; i++) {
     const x = hash2(seedInt + 3, i * 2) * size;

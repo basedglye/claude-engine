@@ -20,7 +20,15 @@
  * the emitted output. Re-running against an identical `dist/` produces a
  * byte-identical file.
  *
- * Usage: node apps/hotel/scripts/build-artifact.mjs [--out <path>] [--copy-to-dist]
+ * Usage: node apps/hotel/scripts/build-artifact.mjs [--out <path>] [--copy-to-dist] [--fragment <path>]
+ *   --fragment <path> Also write the artifact as a wrapper-free fragment
+ *                    (<title> + head children + body children, no
+ *                    doctype/html/head/body/meta) for hosts that supply
+ *                    their own document skeleton -- the claude.ai Artifact
+ *                    tool. Only the two real <meta> tags are removed;
+ *                    script content is never touched (a regex over the
+ *                    whole head once ate every "<metalnessmap_pars_fragment>"
+ *                    shader include and left only the sky rendering).
  *   --out <path>     Write the artifact to <path> instead of
  *                     apps/hotel/dist-artifact/grand-foyer.html (e.g. so
  *                     the orchestrator can publish the same file
@@ -52,20 +60,41 @@ const DIST_PLAY_FILE = path.join(DIST_DIR, "play.html");
 function parseArgs(argv) {
   let out = DEFAULT_OUT_FILE;
   let copyToDist = false;
+  let fragment = null;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--out") {
       const val = argv[i + 1];
       if (!val) fail("--out requires a path argument");
       out = path.resolve(val);
       i++;
+    } else if (argv[i] === "--fragment") {
+      const val = argv[i + 1];
+      if (!val) fail("--fragment requires a path argument");
+      fragment = path.resolve(val);
+      i++;
     } else if (argv[i] === "--copy-to-dist") {
       copyToDist = true;
     }
   }
-  return { out, copyToDist };
+  return { out, copyToDist, fragment };
 }
 
-const { out: OUT_FILE, copyToDist: COPY_TO_DIST } = parseArgs(process.argv.slice(2));
+const { out: OUT_FILE, copyToDist: COPY_TO_DIST, fragment: FRAGMENT_FILE } = parseArgs(process.argv.slice(2));
+
+/** The wrapper-free fragment described under --fragment. */
+function toFragment(html) {
+  const head = /<head>([\s\S]*?)<\/head>/.exec(html);
+  const body = /<body[^>]*>([\s\S]*?)<\/body>/.exec(html);
+  if (!head || !body) fail("--fragment: could not find <head> and <body> in the built artifact");
+  let h = head[1];
+  for (const tag of h.match(/<meta (?:charset|name="viewport")[^>]*>/g) ?? []) h = h.replace(tag, "");
+  h = h.replace(/<title>[\s\S]*?<\/title>/, "");
+  const frag = "<title>GRAND FOYER</title>
+" + h + "
+" + body[1];
+  if (!frag.includes("<metalnessmap_pars_fragment>")) fail("--fragment: shader includes missing from the fragment (stripping damaged script content)");
+  return frag;
+}
 const OUT_DIR = path.dirname(OUT_FILE);
 
 // Perturbable for the non-vacuity check (§6.2 of the W4 brief).
@@ -353,6 +382,13 @@ console.log(`build-artifact: embedded assets = ${embeddedCount} (${(embeddedByte
 console.log(`build-artifact: inlined script/style tags = ${inlinedAssetCount}`);
 
 // -- 5. Optional: copy the artifact into dist/play.html ----------------------
+
+if (FRAGMENT_FILE) {
+  const frag = toFragment(readFileSync(OUT_FILE, "utf8"));
+  mkdirSync(path.dirname(FRAGMENT_FILE), { recursive: true });
+  writeFileSync(FRAGMENT_FILE, frag);
+  console.log(`build-artifact: wrote fragment ${FRAGMENT_FILE} (${Buffer.byteLength(frag)} bytes)`);
+}
 
 if (COPY_TO_DIST) {
   try {

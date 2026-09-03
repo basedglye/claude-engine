@@ -146,3 +146,60 @@ export function webStore(dbName = "claude-engine-save"): GameStore {
     },
   };
 }
+
+/**
+ * A GameStore that lives in memory only. For hosts that deny IndexedDB
+ * (a sandboxed iframe without allow-same-origin -- the claude.ai artifact
+ * viewer, for one): the write-ahead pump, quick-save and quick-load all
+ * keep working for the session and are simply forgotten on reload. Same
+ * ordering semantics as webStore (commands sorted by tick then insertion).
+ */
+export function memoryStore(): GameStore {
+  const games = new Map<string, GameRecord>();
+  const commands = new Map<string, Command[]>();
+  const snapshots = new Map<string, SimSnapshot[]>();
+  return {
+    async createGame(opts: { id?: string; name: string; seed: string }): Promise<GameRecord> {
+      const id = opts.id ?? crypto.randomUUID();
+      const record: GameRecord = { id, name: opts.name, seed: opts.seed, protoVersion: 1, createdAt: new Date().toISOString() };
+      games.set(id, record);
+      if (!commands.has(id)) commands.set(id, []);
+      return record;
+    },
+    async getGame(id: string): Promise<GameRecord | null> {
+      return games.get(id) ?? null;
+    },
+    async appendCommands(gameId: string, cmds: readonly Command[]): Promise<void> {
+      const list = commands.get(gameId) ?? [];
+      list.push(...cmds);
+      commands.set(gameId, list);
+    },
+    async commandsSince(gameId: string, afterTick: number): Promise<readonly Command[]> {
+      return (commands.get(gameId) ?? []).filter((c) => c.tick > afterTick);
+    },
+    async saveSnapshot(gameId: string, snapshot: SimSnapshot): Promise<void> {
+      const list = snapshots.get(gameId) ?? [];
+      list.push(snapshot);
+      snapshots.set(gameId, list);
+    },
+    async latestSnapshot(gameId: string): Promise<SimSnapshot | null> {
+      const list = snapshots.get(gameId) ?? [];
+      return list.length > 0 ? list[list.length - 1]! : null;
+    },
+    async close(): Promise<void> {
+      /* nothing to release */
+    },
+  };
+}
+
+/** True when this document can open IndexedDB at all. A denied context
+ *  throws synchronously from `indexedDB.open`, so the probe is cheap. */
+export function indexedDbAvailable(): boolean {
+  try {
+    if (typeof indexedDB === "undefined") return false;
+    indexedDB.open("claude-engine-probe");
+    return true;
+  } catch {
+    return false;
+  }
+}

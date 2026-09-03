@@ -202,7 +202,16 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     return document.pointerLockElement === canvas;
   }
   function onCanvasClick(): void {
-    canvas.requestPointerLock();
+    // A sandboxed host (an iframe without allow-pointer-lock) throws or
+    // rejects here. Swallow it: the game's own fallback (if any) listens
+    // for pointerlockerror / the absence of pointerlockchange, and an
+    // uncaught error would otherwise spam the console on every click.
+    try {
+      const r = (canvas.requestPointerLock as () => void | Promise<void>)();
+      if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+    } catch {
+      /* refused; fallback handles it */
+    }
   }
   function onMouseMove(e: MouseEvent): void {
     if (!isPointerLocked()) return;

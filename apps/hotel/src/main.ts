@@ -4,7 +4,7 @@ import { createThreeHost, installTestHook, type SceneContext, type ScreenRect } 
 import { SCREEN_W } from "@claude-engine/surface-ui";
 import type { GroundFloor, DoorSpec } from "@claude-engine/interiors";
 import { createFpsController } from "@claude-engine/player-fps";
-import { webStore, createSavePump, exportSave, importSave } from "@claude-engine/save-web";
+import { webStore, memoryStore, indexedDbAvailable, createSavePump, exportSave, importSave } from "@claude-engine/save-web";
 // Deep import, not the package barrel: @claude-engine/persistence's index.ts
 // also re-exports sqliteStore/postgresStore, which pull in better-sqlite3
 // and pg (Node natives + node:crypto) at the top of their modules. Vite
@@ -84,7 +84,12 @@ setup(sim);
 //    any command is submitted, so a quicksave's exportSave() always finds
 //    a record to hang commands off of. --
 const GAME_ID = "hotel-sp";
-const store = webStore();
+// A sandboxed host (the claude.ai artifact viewer) denies IndexedDB; fall
+// back to a session-only memory store so the write-ahead pump and F5/F9
+// keep working, and say so once in the console rather than throwing on
+// every command.
+const store = indexedDbAvailable() ? webStore() : memoryStore();
+if (!indexedDbAvailable()) console.info("GRAND FOYER: IndexedDB unavailable in this host; saves are session-only.");
 // Not top-level-awaited (vite's default build target predates it) --
 // quickSave() below awaits this promise before its first store access, so
 // the record is guaranteed to exist by the time exportSave() needs it.
@@ -502,7 +507,7 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   if (!focusedScreen) return;
   if (e.code === "Escape") {
     hook.submit(screenBlurCommand(sim.tick + 1));
-    canvas.requestPointerLock();
+    requestLockQuietly();
     return;
   }
   hook.submit(screenKeyCommand(sim.tick + 1, e.code));
@@ -555,8 +560,18 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
 //    follows the hovering cursor instead. Deltas go through the REAL mouse
 //    path so the handedness fix in player-fps applies; lock state goes
 //    through the same normalizer a real pointerlockchange would. --
+/** requestPointerLock that never throws or rejects uncaught (sandboxed
+ *  iframes refuse it); the hover-look fallback decides what to do next. */
+function requestLockQuietly(): void {
+  try {
+    const r = (canvas.requestPointerLock as () => void | Promise<void>)();
+    if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+  } catch {
+    /* refused */
+  }
+}
 installHoverLookFallback(canvas, {
-  requestLock: () => canvas.requestPointerLock(),
+  requestLock: () => requestLockQuietly(),
   isLocked: () => document.pointerLockElement === canvas,
   onLook: (dx, dy) => controller.pointerHandlers.onLook?.(dx, dy),
   setLocked: (locked) => controller.pointerHandlers.onPointerLockChange?.(locked),

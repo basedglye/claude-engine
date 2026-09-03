@@ -1,65 +1,189 @@
-# C2-W1 — Playtest blocker log
+# C2-W1 / C3-W6 — Playtest blocker log
 
 Driven with `apps/hotel/dev/playtest.mjs` against the built artifact
-(served alone on 5203), the dev app (5202), and the artifact opened
-directly via `file://`. Seed `hotel-alpha-loop-1` throughout (the seed
-BREAKDOWN names as reaching tier 2 when run headless for the full
-14-day arc). See the C2-W1 report for beat-by-beat pass/fail and the
-four perturbation exit codes.
+(served alone on 5203) and spot-checked in the dev app (5202). Seed
+`hotel-alpha-loop-1` throughout.
 
-### B1 — AUDIT has no button; "run the audit" is a passive wait, and the game never says so
+**This file was rewritten for the C3-W6 re-run** after the COO review
+(`apps/hotel/docs/alpha-loop/reviews/C2-W1.md`) refuted the original B3
+and found the real defect (F1: shipped `fraudRatePermille: 0`, now fixed
+upstream to 200/1000). Each record below carries its **original**
+severity/text plus a **Status (C3-W6)** line saying what changed. New
+findings from this re-run are appended at the end (B9-B11).
+
+---
+
+### B1 — AUDIT has no button; "run the audit" is a passive wait
 Severity: rough-edge
 Build: artifact-5203
-Expected: VISION-ALPHA's loop step 4 says "Run the night audit at the terminal and see cash and stars change" — this reads as an action with a button, like RESERVA's ACCEPT/DENY or LEDGER's RENOVATE.
-Actual: `apps/hotel/src/sim/audit-app.ts` — `layout() { return {}; }`, no click targets at all. The audit fires automatically at the night rollover regardless of whether AUDIT is even open. I only know this from reading the source; a first-time player who opens AUDIT and clicks around looking for a "RUN" button will not find one, and nothing on screen tells them the audit is passive and time-driven rather than something they trigger.
-Repro: open AUDIT (taskbar) at any point before the day rolls; note there is no clickable control anywhere on the screen; wait for the day to roll and see the ledger figures update on their own.
-Screenshot: apps/hotel/docs/walkthrough/07-audit.png
+Original text: AUDIT (`apps/hotel/src/sim/audit-app.ts`) has no click
+targets; the audit fires automatically at the night rollover. A player
+looking for a "RUN" button will not find one.
+**Status (C3-W6): NOT A DEFECT, per COO ruling.** The file header cites
+the H1 design ruling verbatim ("One screen, no interaction, is
+acceptable") — this is a decision on the record, not a regression. The
+discoverability point survives as fix-list item F3 (owned by the screen
+lane, optional): one `t()` line stating the audit is passive. Re-verified
+this session: cash and stars did change visibly across a rollover
+(`cash 500->-4000, stars 1->1, day 2->3`, tick 12072).
+Screenshot: apps/hotel/docs/walkthrough/11-audit.png
 
-### B2 — No in-game time acceleration; a full human playthrough exceeds "one sitting" by any normal reading of the phrase
+### B2 — No in-game time acceleration; a full human playthrough exceeds "one sitting"
 Severity: blocker
 Build: artifact-5203
-Expected: VISION-ALPHA: "A person can, in one sitting and with no outside help" complete enter -> tier 2 -> end card.
-Actual: the headless `alpha-loop` harness scenario reaches tier 2 in 84,000 sim ticks (verified this session, `npm run harness --silent -- alpha-loop --verify-replay`, exit 0). At the sim's fixed 20 Hz tick rate, a REAL, pointer-locked browser session runs those ticks in real wall-clock time — there is no fast-forward, no "skip to next day", nothing. 84,000 ticks is ~70 real minutes of continuous play with zero AFK time. My own run reached only tick 24,377 (~20 real minutes, ~29% of the arc) before I had to stop it, and RENOVATE had not yet become affordable. This is not a crash or a broken mechanic — the loop itself works (proven headless) — but "one sitting" for a first-time human, mouse-locked the whole time, reading documents and clicking a UI, is a materially different claim than "the sim can replay 84,000 ticks without desyncing." I did not find any UI, hotkey, or URL param that changes pacing (checked `main.ts` for a speed/time-scale param; none exists — only `worldforgeSeed` and `worldforgeStartPaused`, the latter a harness-only step-gate, not a player-facing accelerator).
-Repro: `http://localhost:5203/grand-foyer.html?worldforgeSeed=hotel-alpha-loop-1`, play beats 1-8 normally, then time from RENOVATE unavailable to available.
-Screenshot: apps/hotel/docs/walkthrough/08-ledger.png (LEDGER open, waiting; renovateAvailable still false after the ~20-minute session)
+Original text: the headless `alpha-loop` scenario needs 84,000 ticks
+(~70 real minutes at 20Hz with no acceleration); my C2-W1 session only
+covered ~29% of that in ~20 real minutes.
+**Status (C3-W6): RESOLVED AND VERIFIED LIVE.** Hold-T fast-forward (8 sim
+steps/host tick, disabled while a screen is focused) landed in `main.ts`.
+Confirmed twice this session, live, not just by reading source:
+(1) the beat-7 audit wait that previously took real minutes completed in
+34 real seconds; (2) a dedicated check held T for 3000ms with no screen
+focused and measured a tick delta of 480 (exactly the 8x rate) versus 61
+with a screen genuinely focused (exactly the un-accelerated 1x rate) —
+`apps/hotel/docs/walkthrough` §7 has the numbers. The pacing wall itself
+is gone. What is NOT yet verified: a full door-to-end-card session in one
+sitting under T (this session's own economy did not reach tier 1 — see B9
+below, a driver limitation, not a re-confirmation of B2).
+Screenshot: apps/hotel/docs/walkthrough/12-ledger.png
 
-### B3 — Fraud is only findable "by knowing", not confirmed findable by reading the RESERVA screen
-Severity: blocker
-Build: artifact-5203
-Expected: VISION/DESIGN's "one oracle, three consumers" ruling — RESERVA shows the raw document fields beside the raw reservation fields so a player can catch a mismatch by eye.
-Actual: my driver used the reservation component's own `plantedViolations` array (ground truth the sim keeps but never renders) to decide accept/deny. During my session's only fraud case, the raw field-name diff between `document.fields` and `reservation.fields` that I computed programmatically did not surface an obviously different KEY (see the raw note captured in the beat-4 driver output). I did not independently verify, by reading the rendered on-screen text as a human would, that a player would spot the same mismatch — I am flagging this as "found by knowing" rather than "found by looking" per the brief's explicit ask, and marking it a blocker rather than a note because that distinction is exactly what this beat is supposed to prove and I cannot currently prove the screen-legible half of it.
-Repro: `hotel-alpha-loop-1`, serve first guest, compare RESERVA's raw document panel against its raw reservation panel and the procedures card.
-Screenshot: apps/hotel/docs/walkthrough/04-reserva.png
+### B3 — WITHDRAWN, per COO ruling
+Severity: (was) blocker — REFUTED
+Original text: "fraud is only findable by knowing (`plantedViolations`),
+not confirmed findable by reading the RESERVA screen."
+**Status (C3-W6): WITHDRAWN.** The COO review found two real bugs in this
+file's original driver: it read only the FIRST of a guest's two documents
+(a guest carries both an "id" and a "resSlip"), and it compared
+same-NAMED keys, so a `name` (ID) vs `guestName` (reservation) mismatch —
+the headline fraud — could never be detected by that logic. Separately,
+F1 (the shipped game's `fraudRatePermille: 0`) meant no fraud existed in
+the build being played at all, so B3's "my session's only fraud case"
+sentence described an event that could not have occurred. Both are fixed
+this re-run: the driver now reads all of a guest's documents and decides
+via the sim's own `evaluateRules` (mirroring `scenarios/lib/hotel-owner.mjs`,
+never `plantedViolations`), and `fraudRatePermille` is now 200/1000
+upstream. Result: **two real fraud cases were caught this session and
+confirmed legible by eye** — see B10 below and
+apps/hotel/docs/walkthrough §4 for the exact fields and screenshots.
 
-### B4 — No broken prop appeared in the first ~20 minutes of play
+### B4 — No broken prop appeared during play
 Severity: note
 Build: artifact-5203
-Expected: beats 5/6 ("clean a mess", "repair a prop") reachable early, per VISION's loop ordering (steps 3-4, before the audit).
-Actual: in this run a mess DID appear (tick 5677, room 8, cleaned successfully) but no broken prop appeared within the ~20-minute session, even after an explicit 60s poll. This may simply be pacing/RNG for this seed's early game rather than a bug — I did not have budget to confirm against a second seed or a longer wait. Recorded as a note, not a blocker: prop repair is gate-verified elsewhere (`prop.repaired` is asserted by existing headless gates) and I have no evidence it is broken, only that I did not personally observe it in the time I had.
-Screenshot: apps/hotel/docs/walkthrough/05-mess-before.png, 06-mess-after.png
+Original text: no broken prop observed in ~20 minutes of C2-W1 play.
+**Status (C3-W6): STILL NOT OBSERVED, unchanged verdict (note, not a
+blocker).** Also not observed in this re-run's ~10-minute active-play
+window before the wait beats took over. Plausibly pacing/RNG for this
+seed's early game, consistent with the original assessment — still no
+evidence either way that repair itself is broken (`prop.repaired` remains
+gate-verified elsewhere).
+Screenshot: artifacts/playtest-shots/final2-12-prop-before.png
 
-### B5 — No staff candidate appeared within the session
+### B5 — No staff candidate appeared during play
 Severity: note
 Build: artifact-5203
-Expected: beat 11 ("hire the clerk") reachable "at any point" per the brief's beat table.
-Actual: no `candidate` entity existed in world state at tick 24,364 (end of my session). Given a cash/day gate on candidate spawning (`apps/hotel/src/sim/economy.ts`'s `HIRE_THRESHOLD_MINOR`), this is plausibly a threshold the session's ~20 minutes of play never crossed, consistent with B2's pacing finding, rather than a broken feature. Recorded as a note for the same reason as B4.
-Screenshot: apps/hotel/docs/walkthrough/10-staff.png (STAFF app open, "No candidates waiting.")
+Original text: no `candidate` entity present at end of C2-W1 session.
+**Status (C3-W6): STILL NOT OBSERVED.** Consistent with B9 below — this
+session's cash went deeply negative rather than growing, so any
+cash/day-gated candidate spawn threshold plausibly was never crossed.
+Screenshot: apps/hotel/docs/walkthrough/14-staff.png
 
-### B6 — Entry overlay controls list is accurate (verification note, not a bug)
-Severity: note
+### B6 — Entry overlay controls list is accurate
+Severity: note (positive finding)
 Build: artifact-5203
-Expected/Actual: the entry overlay reads "W A S D move · Mouse look · Click interact · V third person · H hints · Esc release mouse" — accurate and complete against what I actually used to play (I never needed a key the overlay didn't mention). No blocker; recorded because the brief asks me to confirm this explicitly.
-Screenshot: apps/hotel/docs/walkthrough/01-entry.png
+**Status (C3-W6): RE-CONFIRMED, AND NOW ALSO COVERS T.** The overlay now
+reads "W A S D move · Mouse look · Click interact · Hold T to fast-forward
+· V third person · H hints · Esc release mouse" — fix-list item F4 (T
+discoverability) is closed; the control that fixed B2 is itself
+discoverable.
+Screenshot: apps/hotel/docs/walkthrough/02-entry.png
 
-### B7 — H (skip walkthrough) did not visibly change the hint's `data-visible` attribute in my late-session check
-Severity: rough-edge
+### B7 — H-key check was inconclusive in the C2-W1 session
+Severity: rough-edge — NOT A CONFIRMED DEFECT
 Build: artifact-5203
-Expected: pressing H skips the walkthrough; the brief asks me to confirm this.
-Actual: `.hud-hint[data-visible]` read "1" both before and after pressing H in my driver's automated check, at a point (tick 24,377, deep into the session, after the RENOVATE press attempts) where the hint may already have advanced past a state where visibility changes on skip, or the walkthrough may already have been implicitly finished. I did not manually re-test H in isolation near the start of a fresh run within budget, so I cannot rule out a real bug versus a bad check window — flagging as a rough-edge in my OWN verification rather than asserting a confirmed defect.
-Screenshot: artifacts/playtest-shots/artifact-clean-24-h-skip.png
+Original text: `data-visible` did not change in a late-session check
+(tick 24,377), timing self-flagged as unreliable.
+**Status (C3-W6): RESOLVED — NOT A DEFECT, per COO ruling AND re-verified
+fresh this session (R1).** `main.ts:550` gates H on `!focusedScreen`,
+which was working correctly all along; the original check's problem was
+running it after LEDGER was already focused. This re-run checked H in a
+**separate, fresh page/session, before any terminal was ever focused**
+(walkthrough.skip() is one-way, so this could not safely run on the same
+page as the rest of the beats): `data-visible` "1" -> "0" in one press,
+confirmed. See apps/hotel/docs/walkthrough §0.
+Screenshot: apps/hotel/docs/walkthrough/01-h-key-isolated.png
 
-### B8 — Shared worktree: `apps/hotel/dist-game` was deleted out from under me twice by concurrent lanes
+### B8 — Shared worktree: `apps/hotel/dist-game` raced by concurrent lanes
 Severity: note (infra, not a src bug)
-Build: n/a (build tooling)
-Expected: my own rebuild-discipline steps (`rm -rf dist-game && npm run build`) produce a stable dist-game I can inspect.
-Actual: this worktree is shared with other C2 lanes running their own builds concurrently; `apps/hotel/dist-game` was fully absent (not just stale) at two points in my session despite a clean build having just finished, exit 0, moments earlier. I could not tell whether it was my own overlapping commands or another lane's rebuild that raced it, and I deliberately stopped relying on `dist-game` in my own driver (see `apps/hotel/dev/playtest.mjs`'s header comment) rather than debug a directory outside my globs. Not filed against any lane's src — just a wiring note for the orchestrator (see report §7).
+Build: n/a
+**Status (C3-W6): N/A this re-run** — the coordinator's brief this cycle
+said not to rebuild `dist`, and this lane's own use of `dist-game` (for
+the `evaluateRules` import, see B10) read it read-only without rebuilding,
+so no race was hit this session. Leaving the original note in place for
+the historical record; no new instance to report.
+
+---
+
+## New findings, C3-W6 re-run
+
+### B9 — This session's economy went cash-negative; RENOVATE never became affordable (driver limitation, flagged honestly)
+Severity: note (driver limitation — NOT a game defect claim)
+Build: artifact-5203
+What happened: cash went `500 -> -4000` across the first night rollover
+(tick 12072) and never recovered; by tick 128301 (end of session) the
+hint step "renovate" had still not surfaced. Root cause, as best I can
+tell without further instrumentation: this driver serves guests in ONE
+active window (beat 4's ~5000-tick loop, checking in exactly one guest
+and denying two frauds) and then switches to blind `holdT()` waiting for
+the remaining ~123,000 ticks, during which nightly expenses accrue with
+nobody working the desk. A real player — and the headless `alpha-loop`
+scenario's bot, which DOES serve continuously — would keep working the
+desk through that stretch. I am NOT re-opening B2 (time acceleration is
+verified working, see above) or claiming the shipped economy is broken;
+I am flagging that THIS DRIVER cannot currently produce a tier-1/tier-2/
+end-card frame set, and saying so rather than fabricating one. A future
+re-run needs a driver that interleaves guest-serving with the T-held
+waits, not one that treats them as separate phases.
+Screenshot: apps/hotel/docs/walkthrough/13-tier0.png (the only tier frame
+this session has real evidence for)
+
+### B10 — Two real frauds caught and confirmed legible by eye this session
+Severity: none — this is the CLOSED version of the old B3/F1 gap
+Build: artifact-5203
+With `fraudRatePermille` now non-zero upstream and the driver's field
+diff fixed (all documents read, `evaluateRules` used for ground truth
+instead of `plantedViolations`), this session hit two fraud cases in the
+same guest and both are legible on the RESERVA screen without any code
+knowledge:
+- `res-code-mismatch`: `resSlip.resCode = "RC-4715~803728"` vs
+  `reservation.resCode = "RC-4715"`.
+- `name-mismatch`: `id.name = "Quinn Baptiste~557147"` vs
+  `reservation.guestName = "Quinn Baptiste"`.
+Both denied via DENY; a third, legitimate guest in the same session was
+checked in cleanly. See apps/hotel/docs/WALKTHROUGH.md §4 for the
+screenshots and full narrative.
+Screenshot: apps/hotel/docs/walkthrough/06-fraud-rescode.png,
+07-fraud-name.png
+
+### B11 — This driver's own bug: submitting a "face" command does nothing in the real browser app (found and fixed, not a game defect)
+Severity: none — driver bug, fixed in `apps/hotel/dev/playtest.mjs`
+Build: n/a (tooling)
+The C2-W1 driver's navigation submitted `{type:"face", payload:{yawMdeg}}`
+directly via `window.__WORLDFORGE__.submit`, mirroring
+`scenarios/lib/hotel-owner.mjs`. That works for a headless-harness bot
+driving a bare `Sim` directly, but NOT for the real browser app:
+`packages/player-fps/src/index.ts` (~line 316) maintains its own internal
+`camYawMdeg`, driven only by pointer-look deltas, and re-submits a face
+command every frame to snap the sim's yaw back toward that internal value
+whenever they drift — silently overwriting any directly-submitted face
+command on the very next frame. Confirmed live
+(`artifacts/diag-guest.mjs`): six submitted face commands with six
+different target bearings left the player's actual yaw at exactly 0 every
+time. This is very likely why the C2-W1 session's beat 4 loop only ever
+served one real guest despite a 4-minute budget — the player was almost
+never actually facing the queue head. Fixed by turning via
+`window.__WORLDFORGE__.pointer.look(dx)` instead (a small proportional
+controller, `turnToBearing()`), exactly as the original brief's §3.0
+always specified. Also fixed in the same pass: `walkTo()` had no
+door-awareness at all and would walk in place against a closed bedroom
+door forever (messes/props live behind doors); it now opens a closed door
+in range before continuing to path toward the target.

@@ -663,6 +663,24 @@ export function buildArchitecture(floor: GroundFloor, hotelTier: HotelTier): THR
       const midZ = (z0 + z1) / 2;
       if (nearDoorSpanM(bx, midZ, 0.3)) return;
       if (z1 - z0 < winW + 0.4) return;
+      // Skip a window whose glass/frame would land near the front desk
+      // when the desk is flush against THIS wall (COO review W3-2: a fake
+      // window's frame -- not a pilaster -- was the "full-height pale
+      // column" bisecting the tier-0 desk from the desk pose, since window
+      // generation never consulted the desk rect at all, at any tier). A
+      // 0.5m margin was not enough: the offending window's glass edge sat
+      // only ~0.65m from the desk, well inside the desk pose's near field
+      // of view even though its FOOTPRINT technically cleared the rect --
+      // 1.0m keeps a window from reading as "next to the desk" from where
+      // a guest actually stands to look at it, not just off the rect.
+      const deskWindowMarginM = 1.0;
+      if (
+        desk &&
+        Math.abs(desk.xM0 - bx) < 0.3 &&
+        midZ > desk.zM0 - deskWindowMarginM - winW / 2 &&
+        midZ < desk.zM1 + deskWindowMarginM + winW / 2
+      )
+        return;
       // one per ~3m: skip if too close to previous window on this wall coordinate
       const g = new THREE.PlaneGeometry(winW, winH);
       g.rotateY(Math.PI / 2);
@@ -680,6 +698,16 @@ export function buildArchitecture(floor: GroundFloor, hotelTier: HotelTier): THR
       const midX = (x0 + x1) / 2;
       if (nearDoorSpanM(midX, bz, 0.3)) return;
       if (x1 - x0 < winW + 0.4) return;
+      // Same desk exclusion as tryWindowX (1.0m margin, see there), for a
+      // north/south-wall desk.
+      const deskWindowMarginZ = 1.0;
+      if (
+        desk &&
+        Math.abs(desk.zM0 - bz) < 0.3 &&
+        midX > desk.xM0 - deskWindowMarginZ - winW / 2 &&
+        midX < desk.xM1 + deskWindowMarginZ + winW / 2
+      )
+        return;
       const g = new THREE.PlaneGeometry(winW, winH);
       g.translate(midX, sillY + winH / 2, bz + (solidOnPlus ? 0.01 : -0.01));
       glassGeoms.push(g);

@@ -6,8 +6,9 @@
  */
 import * as THREE from "three";
 import type { GroundFloor } from "@claude-engine/interiors";
-import { roomRects, doorRects, ROOM, WALL_HEIGHT_M } from "./floorplan.js";
+import { roomRects, ROOM, WALL_HEIGHT_M } from "./floorplan.js";
 import { loadModel, fitToFootprint } from "./assets.js";
+import { roomOccupancyFor, placeOnWallSurface, type WallSide } from "./placement.js";
 import type { HotelTier } from "./procedural.js";
 
 export type { HotelTier };
@@ -124,20 +125,11 @@ function fallbackBareBulb(): THREE.Group {
   return g;
 }
 
-/** True when a wall-mounted point at (x,z) along the given axis falls
- *  inside any door's span — used to keep sconces out of doorways. */
-function insideAnyDoor(x: number, z: number, doors: ReturnType<typeof doorRects>, marginM = 0.3): boolean {
-  return doors.some(
-    (d) => x >= d.xM0 - marginM && x <= d.xM1 + marginM && z >= d.zM0 - marginM && z <= d.zM1 + marginM
-  );
-}
-
 export function buildFixtures(floor: GroundFloor, hotelTier: HotelTier): THREE.Group {
   const group = new THREE.Group();
   group.name = "fixtures";
 
   const rects = roomRects(floor);
-  const doors = doorRects(floor);
 
   // -- lobby: chandelier (tier 2), recessed cans (tier 1), fluorescent
   //    trough (tier 0) --
@@ -192,21 +184,23 @@ export function buildFixtures(floor: GroundFloor, hotelTier: HotelTier): THREE.G
     } else {
       addDownlightGrid(group, corridor.xM0, corridor.zM0, corridor.xM1, corridor.zM1);
 
-      const alongX = corridor.widthM >= corridor.depthM;
-      const spacingM = 3;
-      const sconceY = 2.15; // above the 1.5 m painting line (C2-W4 review P3)
-      if (alongX) {
-        const count = Math.max(1, Math.floor(corridor.widthM / spacingM));
-        for (let i = 1; i <= count; i++) {
-          const x = corridor.xM0 + (corridor.widthM * i) / (count + 1);
-          addSconcePair(group, x, corridor.zM0, corridor.zM1, sconceY, doors, "x", hotelTier);
-        }
-      } else {
-        const count = Math.max(1, Math.floor(corridor.depthM / spacingM));
-        for (let i = 1; i <= count; i++) {
-          const z = corridor.zM0 + (corridor.depthM * i) / (count + 1);
-          addSconcePair(group, z, corridor.xM0, corridor.xM1, sconceY, doors, "z", hotelTier);
-        }
+      // Sconces routed through the SAME shared placement solver/occupancy
+      // grid decor.ts uses for paintings (`roomOccupancyFor` -- see
+      // placement.ts), rather than a fixed 3m stepping loop that never
+      // consulted anything. `clearanceM=0.6` keeps a sconce at least 0.6m
+      // from any painting span already blocked on this wall's channel
+      // (COO review W3-1). sconceY stays 2.15 -- above the 1.5m painting
+      // line -- as a belt-and-braces height separation on top of the
+      // now-real spatial one.
+      const sconceY = 2.15;
+      const sconceSides: WallSide[] = corridor.widthM >= corridor.depthM ? ["north", "south"] : ["west", "east"];
+      const corridorOcc = roomOccupancyFor(floor, corridor, hotelTier);
+      // Same longest-run-first behaviour as the painting loops in
+      // decor.ts: keep asking until the solver has nothing left to give.
+      for (let i = 0; i < 8; i++) {
+        const pose = placeOnWallSurface(corridorOcc, 0.2, 0.2, sconceSides, 0.15, 0.6);
+        if (!pose) break;
+        addSconceAt(group, pose.x, pose.z, pose.yawRad, sconceY, hotelTier);
       }
     }
   }
@@ -249,43 +243,31 @@ function addDownlightGrid(group: THREE.Group, xM0: number, zM0: number, xM1: num
   }
 }
 
-/** Places a sconce on each of the two walls perpendicular to `crossAxis` at
- *  fixed coordinate `along`, spanning between `crossM0`/`crossM1`, skipping
- *  any position that falls inside a door span. */
-function addSconcePair(
-  group: THREE.Group,
-  along: number,
-  crossM0: number,
-  crossM1: number,
-  yM: number,
-  doors: ReturnType<typeof doorRects>,
-  axis: "x" | "z",
-  hotelTier: HotelTier
-): void {
-  const positions: Array<[number, number]> =
-    axis === "x"
-      ? [
-          [along, crossM0 + 0.05],
-          [along, crossM1 - 0.05],
-        ]
-      : [
-          [crossM0 + 0.05, along],
-          [crossM1 - 0.05, along],
-        ];
-  for (const [x, z] of positions) {
-    if (insideAnyDoor(x, z, doors)) continue;
-    const sconceGroup = new THREE.Group();
-    sconceGroup.position.set(x, yM, z);
-    sconceGroup.add(fallbackSconce());
-    group.add(sconceGroup);
+/** Places one sconce at a pose returned by `placeOnWallSurface` (world
+ *  x/z already flush to the wall) -- replaces the old `addSconcePair`'s
+ *  fixed-spacing loop plus its own door check, both now subsumed by the
+ *  shared solver/occupancy grid (COO review W3-1: the solver's own door
+ *  lane blocking is what used to be `insideAnyDoor`, now for real instead
+ *  of a second bespoke check). Insets 0.05m off the wall face, same as the
+ *  fixed-loop version did, so the bracket doesn't z-fight the wall mesh. */
+function addSconceAt(group: THREE.Group, xOnWall: number, zOnWall: number, yawRad: number, yM: number, hotelTier: HotelTier): void {
+  // `yawRad` faces INTO the room (same convention as placement.ts's
+  // `wallPoint`), so stepping 0.05m along it insets the sconce off the
+  // wall face without needing to know which side it came from.
+  const insetM = 0.05;
+  const x = xOnWall + Math.sin(yawRad) * insetM;
+  const z = zOnWall + Math.cos(yawRad) * insetM;
+  const sconceGroup = new THREE.Group();
+  sconceGroup.position.set(x, yM, z);
+  sconceGroup.add(fallbackSconce());
+  group.add(sconceGroup);
 
-    if (hotelTier === 2) {
-      void loadModel("wall-sconce").then((model) => {
-        if (!model) return;
-        fitToFootprint(model.scene, { w: 0.15, d: 0.1, h: 0.2 });
-        sconceGroup.clear();
-        sconceGroup.add(model.scene);
-      });
-    }
+  if (hotelTier === 2) {
+    void loadModel("wall-sconce").then((model) => {
+      if (!model) return;
+      fitToFootprint(model.scene, { w: 0.15, d: 0.1, h: 0.2 });
+      sconceGroup.clear();
+      sconceGroup.add(model.scene);
+    });
   }
 }

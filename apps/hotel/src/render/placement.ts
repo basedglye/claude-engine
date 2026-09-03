@@ -13,7 +13,7 @@
  * mark what they use (plus a small usage margin), and return `undefined`
  * when nothing fits so callers can omit the item instead of overlapping.
  */
-import { CELL_M, doorRects, type RoomRect } from "./floorplan.js";
+import { CELL_M, deskRect, cellCenterM, doorRects, type RoomRect } from "./floorplan.js";
 import type { GroundFloor } from "@claude-engine/interiors";
 
 const GRID_M = 0.25;
@@ -205,6 +205,43 @@ export function buildOccupancy(
 }
 
 // -- wall runs ------------------------------------------------------------
+
+/** Memoised per (floor, room, tier) so `decor.ts` and `fixtures.ts` --
+ *  different modules, both called once per (floor, hotelTier) render pass
+ *  from `main.ts`/`tour.ts` -- build against the exact SAME `RoomOccupancy`
+ *  instance instead of two independent grids that can never see each
+ *  other's wall-mounted items (COO review W3-1: sconces bypassed the
+ *  solver entirely because they had no shared grid to route through).
+ *  `floor` is a stable object for the lifetime of one render pass, so a
+ *  `WeakMap` keyed on it (then on `roomId:tier`) is exactly "once per
+ *  render pass, shared across modules" without either module needing to
+ *  pass the other's options in. Desk/lobby-lane/bedroom-goal options are
+ *  derived internally from `floor`/`room` so callers need only the three
+ *  positional args. */
+const occupancyCache = new WeakMap<GroundFloor, Map<string, RoomOccupancy>>();
+
+export function roomOccupancyFor(floor: GroundFloor, room: RoomRect, tier: number): RoomOccupancy {
+  let byKey = occupancyCache.get(floor);
+  if (!byKey) {
+    byKey = new Map();
+    occupancyCache.set(floor, byKey);
+  }
+  const key = `${room.roomId}:${tier}`;
+  let occ = byKey.get(key);
+  if (occ) return occ;
+
+  const opts: Parameters<typeof buildOccupancy>[2] = {};
+  if (room.kind === "lobby") {
+    opts.deskRect = deskRect(floor);
+    opts.lobbyDoorLane = true;
+  }
+  if (room.kind === "bedroom") {
+    opts.bedroomGoals = floor.bedrooms.filter((b) => b.roomId === room.roomId).map((b) => cellCenterM(b.goalCx, b.goalCz));
+  }
+  occ = buildOccupancy(floor, room, opts);
+  byKey.set(key, occ);
+  return occ;
+}
 
 /** Free spans (in the "along the wall" coordinate) along `side` of `room`,
  *  found by sampling every GRID_M and merging free samples into runs. This

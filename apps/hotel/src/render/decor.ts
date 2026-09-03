@@ -15,10 +15,10 @@
  */
 import * as THREE from "three";
 import type { GroundFloor } from "@claude-engine/interiors";
-import { roomRects, deskRect, cellCenterM, doorRects, WALL_HEIGHT_M, ROOM, type RoomRect } from "./floorplan.js";
+import { roomRects, deskRect, doorRects, WALL_HEIGHT_M, ROOM, type RoomRect } from "./floorplan.js";
 import { loadModel, fitToFootprint, makePbrMaterial } from "./assets.js";
 import { neonSignTexture, type HotelTier } from "./procedural.js";
-import { buildOccupancy, placeAgainstWall, placeOnWallSurface, placeCorner, wallPoint, WALL_SIDES, type WallSide } from "./placement.js";
+import { roomOccupancyFor, placeAgainstWall, placeOnWallSurface, placeCorner, wallPoint, WALL_SIDES, type WallSide } from "./placement.js";
 
 export type { HotelTier };
 
@@ -198,16 +198,80 @@ function buildPlant(): THREE.Group {
   return g;
 }
 
+/** Deterministic "painted-looking" canvas texture: a warm landscape
+ *  gradient (sky/horizon/ground bands keyed off the seed's hue) with a
+ *  handful of hashed brush strokes on top. Canvas 2D, never `Math.random`
+ *  -- every coordinate/length/hue below comes from re-hashing `seed`
+ *  through `hashInt`, the same chained-hash technique the rest of this
+ *  module uses for deterministic variety (see the file's determinism
+ *  note at the top: Math.* is fine here, this is host-only presentation
+ *  code, never hashed into sim state). */
+function paintingCanvasTexture(seed: number): THREE.CanvasTexture {
+  const w = 128;
+  const h = 96; // matches the 0.6 x 0.4 canvas plane's aspect ratio
+  const el = document.createElement("canvas");
+  el.width = w;
+  el.height = h;
+  const ctx = el.getContext("2d")!;
+  const seedHash = hashInt(seed);
+  const hue = seedHash % 360;
+
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, `hsl(${(hue + 15) % 360}, 45%, 58%)`);
+  grad.addColorStop(0.55, `hsl(${(hue + 35) % 360}, 55%, 72%)`);
+  grad.addColorStop(0.58, `hsl(${hue}, 42%, 32%)`);
+  grad.addColorStop(1, `hsl(${hue}, 38%, 16%)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+
+  // Hashed brush strokes: chain `hashInt` to get a deterministic stream
+  // of pseudo-random-looking values without ever calling Math.random.
+  let stream = seedHash;
+  const strokeCount = 10 + (stream % 6);
+  for (let i = 0; i < strokeCount; i++) {
+    stream = hashInt(stream + i * 7919);
+    const sx = ((stream % 1000) / 1000) * w;
+    stream = hashInt(stream);
+    const sy = ((stream % 1000) / 1000) * h;
+    stream = hashInt(stream);
+    const len = 5 + (stream % 16);
+    stream = hashInt(stream);
+    const ang = ((stream % 360) * Math.PI) / 180;
+    stream = hashInt(stream);
+    const strokeHue = (hue + (stream % 60) - 30 + 360) % 360;
+    stream = hashInt(stream);
+    const lightness = 35 + (stream % 35);
+    ctx.strokeStyle = `hsla(${strokeHue}, 50%, ${lightness}%, 0.55)`;
+    ctx.lineWidth = 1 + (stream % 3);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + Math.cos(ang) * len, sy + Math.sin(ang) * len);
+    ctx.stroke();
+  }
+
+  const texture = new THREE.CanvasTexture(el);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
 function buildPainting(seed: number): THREE.Group {
   const g = new THREE.Group();
   const frame = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.04), mat("wood-trim", 0x5a3d24, 0.5));
-  const h = hashInt(seed);
-  const canvasColor = new THREE.Color().setHSL((h % 360) / 360, 0.35, 0.4);
-  const canvas = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.4), new THREE.MeshStandardMaterial({ color: canvasColor, roughness: 0.9 }));
-  canvas.position.z = 0.025;
-  g.add(frame, canvas);
+  g.add(frame);
   shadowize(g);
+  // Only the FRAME is wrapped as the upgrade-in-place fallback -- the
+  // procedural artwork below is added straight to `g` afterward, as a
+  // sibling of both the fallback frame and (once it resolves) the loaded
+  // glTF frame, so it stays visible either way. Needed because the
+  // Poly Haven "painting" model is a bare frame with no artwork baked in
+  // (COO review R1): without this, tier 2 renders an empty gilt rectangle.
   upgrade(g, wrapChildren(g), "painting", { w: 0.7, d: 0.05, h: 0.5 });
+
+  const texture = paintingCanvasTexture(seed);
+  const canvas = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.4), new THREE.MeshStandardMaterial({ map: texture, roughness: 0.9 }));
+  canvas.position.z = 0.025;
+  shadowize(canvas);
+  g.add(canvas);
   return g;
 }
 
@@ -550,7 +614,10 @@ function buildCurtains(widthM: number): THREE.Group {
 
 function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): void {
   const desk = deskRect(floor);
-  const occ = buildOccupancy(floor, room, { deskRect: desk, lobbyDoorLane: true });
+  // Shared with fixtures.ts (sconces) via a memoised instance keyed on
+  // (floor, room, tier) -- see placement.ts `roomOccupancyFor` -- so the
+  // two modules never independently pick "the middle of the nicest wall".
+  const occ = roomOccupancyFor(floor, room, activeTier);
 
   // Seating cluster in the east half against north or south wall, clear of
   // the desk/queue lane and the entrance->corridor walking lane (both
@@ -663,7 +730,7 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
 }
 
 function buildCorridor(group: THREE.Group, floor: GroundFloor, room: RoomRect): void {
-  const occ = buildOccupancy(floor, room);
+  const occ = roomOccupancyFor(floor, room, activeTier);
 
   // Console table + plant centred on the end wall (south, the far end from
   // the lobby door which sits at the north end of the corridor).
@@ -727,8 +794,10 @@ function isExteriorSide(floor: GroundFloor, room: RoomRect, side: WallSide): boo
 }
 
 function buildBedroom(group: THREE.Group, floor: GroundFloor, room: RoomRect, bedroom: GroundFloor["bedrooms"][number]): void {
-  const goal = cellCenterM(bedroom.goalCx, bedroom.goalCz);
-  const occ = buildOccupancy(floor, room, { bedroomGoals: [goal] });
+  // The goal-cell block is now computed inside `roomOccupancyFor` itself
+  // (shared with fixtures.ts), so this function no longer needs its own
+  // copy of the goal centre.
+  const occ = roomOccupancyFor(floor, room, activeTier);
 
   const rug = buildRug(Math.min(room.widthM - 0.6, 2.4), Math.min(room.depthM - 0.6, 2.4));
   rug.position.set(room.centerXM, 0, room.centerZM);

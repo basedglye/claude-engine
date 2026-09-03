@@ -721,8 +721,10 @@ const host = createThreeHost(sim, {
       const g = new THREE.Group();
       g.add(buildArchitecture(floor, hotelTier));
       g.add(buildExterior(floor, hotelTier));
-      g.add(buildFixtures(floor, hotelTier));
+      // Decor before fixtures: both share one RoomOccupancy per room
+      // (placement.ts), and paintings must claim wall space before sconces.
       g.add(buildDecor(floor, hotelTier));
+      g.add(buildFixtures(floor, hotelTier));
       return g;
     });
     sceneryByTier.set(hotelTier, tierGroup);

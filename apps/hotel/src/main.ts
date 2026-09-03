@@ -47,6 +47,7 @@ import { configureRenderer, buildLighting, setFlickerEnabled, isFlickerEnabled, 
 import { buildFixtures } from "./render/fixtures.js";
 import { buildDecor } from "./render/decor.js";
 import { createHud, type HudState } from "./render/hud.js";
+import { createDeskStamp } from "./render/desk-stamp.js";
 import { assetStatus } from "./render/assets.js";
 import type { InteractableKind, Interactable, Hotel } from "./sim/components.js";
 import { RENOVATE_COST_MINOR } from "./sim/economy.js";
@@ -225,6 +226,10 @@ const controller = createFpsController({
 //    `thirdPerson` are mirrored here because FpsController exposes neither;
 //    the mirrors are presentation-only and never reach the sim. --
 const hud = createHud();
+// Desk feedback stamp (render/desk-stamp.ts): a host-side flash on the
+// focused terminal when a check-in resolves, driven by the sim event stream.
+const deskStamp = createDeskStamp();
+let lastStampFrameMs = performance.now();
 let thirdPersonMirror = false;
 /** The controller's own notion of "locked" (real pointer lock OR the
  *  harness's synthetic lock — both go through applyLockChange and land in
@@ -712,6 +717,10 @@ const host = createThreeHost(sim, {
     // Walkthrough: feed only the events since the last frame.
     const newEvents = sim.eventsSince(walkthroughLastTick + 1);
     if (newEvents.length > 0) walkthroughLastTick = newEvents[newEvents.length - 1]!.tick;
+    const nowStampMs = performance.now();
+    const stampDtMs = Math.min(100, nowStampMs - lastStampFrameMs);
+    lastStampFrameMs = nowStampMs;
+    deskStamp.update(newEvents, focusedScreen?.group, stampDtMs);
     const hotelNow = readHotel(world);
     walkthrough.advance({
       tick: sim.tick,

@@ -228,5 +228,25 @@ export default {
         return net === 0 && hasCapex;
       },
     },
+    {
+      // CYCLE-3 lane 5 follow-up (CEO ruling): the missed-fraud chargeback
+      // mechanism is accepted as-is, with no severity retune -- so the
+      // gate asserts the owner's DESK COMPETENCE directly instead of
+      // relying on the chargeback's economic weight alone to sink an
+      // incompetent run. $100 is well above the ~$0 a bot that actually
+      // reads the documents accrues here (fraudLoss is $0 in the clean
+      // run), and well below the ~$880 an accept-everything bot racks up
+      // over the same 14-day arc (measured directly) -- red for the
+      // careless bot, green for the competent one, on the SAME seed.
+      // desk.fraudCaught >= 1 keeps this from passing vacuously on a run
+      // that never actually presented the desk with a real violation.
+      description: "desk competence: total fraud chargeback loss across the arc is under $100 (<= 10,000 minor), and at least one planted violation was actually caught",
+      check: (s) => {
+        const chargebacks = eventsOfType(s, "desk.fraudChargeback");
+        const totalLossMinor = chargebacks.reduce((sum, e) => sum + (e.payload?.amountMinor ?? 0), 0);
+        const caught = eventsOfType(s, "desk.fraudCaught").length;
+        return totalLossMinor <= 10_000 && caught >= 1;
+      },
+    },
   ],
 };

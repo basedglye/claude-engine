@@ -584,7 +584,26 @@ export function makeOwnerBot(opts) {
         const tiers = Object.keys(pricingView.rateByTier)
           .map((k) => Number.parseInt(k, 10))
           .sort((a, b) => a - b);
-        const offTarget = tiers.find((t) => pricingView.rateByTier[String(t)] !== targetRateMinor);
+        // A room tier whose CURRENT rate is already outside [min, max] for
+        // the current hotel tier (e.g. the tier-2 room's committed opening
+        // rate, $80, is above hotel-tier-0/1's $60/$65 ceiling) can never
+        // be walked toward target one step at a time: PRICER's own guard
+        // refuses any click whose result is still out of bounds, so
+        // "current !== target" alone made the bot click the SAME refused
+        // "down" forever — an infinite loop that left the terminal focused
+        // and locked a hired clerk out of the desk for the rest of the
+        // run (measured directly: fraudRatePermille 200's real desk load
+        // never mattered, the bot was stuck on this before a single guest
+        // could even be invited). Only treat a tier as reachable-this-tick
+        // if the very next step actually lands inside bounds; an
+        // unreachable tier is left alone until a renovation raises the
+        // ceiling enough to admit its first step.
+        const offTarget = tiers.find((t) => {
+          const current = pricingView.rateByTier[String(t)];
+          if (current === targetRateMinor) return false;
+          const next = current < targetRateMinor ? current + pricingView.stepMinor : current - pricingView.stepMinor;
+          return next >= pricingView.minRateMinor && next <= pricingView.maxRateMinor;
+        });
         if (offTarget !== undefined) {
           if (!focused) return reachAndInteract(world, terminal, { xMm: floor.desk.xMm, zMm: floor.desk.zMm });
           const state = world.getComponent(terminal, "screenApp").state;

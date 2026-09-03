@@ -33,6 +33,7 @@ import { buildArchitecture } from "../src/render/architecture.js";
 import { buildDecor } from "../src/render/decor.js";
 import { buildExterior } from "../src/render/exterior.js";
 import { buildFixtures } from "../src/render/fixtures.js";
+import type { HotelTier } from "../src/render/procedural.js";
 import { syncCharacter, pruneCharacters } from "../src/render/characters.js";
 import { syncUpkeepObjects } from "../src/render/upkeep.js";
 import { syncTerminalScreens } from "../src/render/screens.js";
@@ -73,6 +74,21 @@ if (params.get("forceMess") === "1") {
 const preTicks = params.has("tick") ? Number(params.get("tick")) : 1500;
 for (let i = 0; i < preTicks; i++) sim.step();
 
+// Dev-page-only tier override: ?hotelTier=0|1|2, defaulting to the sim's
+// own value (W1's `hotel.tier`, once it lands) so all three tiers can be
+// posed for screenshots regardless of lane-landing order. Never written
+// back to the sim -- read-only, same as everywhere else in the renderer.
+function readHotelTierFromSim(): HotelTier {
+  const hotel = sim.getComponent<{ tier?: number }>(PLAYER_ENTITY, "hotel");
+  const t = hotel?.tier;
+  return t === 0 || t === 1 || t === 2 ? t : 0;
+}
+const hotelTierParam = params.get("hotelTier");
+const hotelTier: HotelTier =
+  hotelTierParam === "0" || hotelTierParam === "1" || hotelTierParam === "2"
+    ? (Number(hotelTierParam) as HotelTier)
+    : readHotelTierFromSim();
+
 const floor = loadGroundFloor(SEED);
 if (params.get("debugRooms") === "1") {
   const rects = [...roomRects(floor).values()].map((r) => ({ id: r.roomId, kind: r.kind, cx: r.centerXM, cz: r.centerZM, w: r.widthM, d: r.depthM }));
@@ -89,12 +105,27 @@ configureRenderer(renderer);
 const scene = new THREE.Scene();
 (window as unknown as { __scene?: THREE.Scene }).__scene = scene;
 scene.background = new THREE.Color(0x05060a);
-scene.add(buildArchitecture(floor));
-scene.add(buildDecor(floor));
-scene.add(buildExterior(floor));
-scene.add(buildFixtures(floor));
+scene.add(buildArchitecture(floor, hotelTier));
+scene.add(buildDecor(floor, hotelTier));
+scene.add(buildExterior(floor, hotelTier));
+scene.add(buildFixtures(floor, hotelTier));
 
-const lightingRig = buildLighting(floor, scene, renderer);
+let lightingRig = buildLighting(floor, scene, renderer, hotelTier);
+
+// Dev-only: ?tierSwitchTest=1 exercises two tier changes right after load
+// so `renderer.info.memory` can be sampled before/after to prove
+// `dispose()` actually disposes (W2 non-vacuity obligation §6).
+if (params.get("tierSwitchTest") === "1") {
+  const memBefore = renderer.info.memory.geometries + renderer.info.memory.textures;
+  lightingRig.dispose();
+  lightingRig = buildLighting(floor, scene, renderer, hotelTier === 0 ? 1 : 0);
+  lightingRig.dispose();
+  lightingRig = buildLighting(floor, scene, renderer, hotelTier);
+  const memAfter = renderer.info.memory.geometries + renderer.info.memory.textures;
+  (window as unknown as { __memBefore?: number; __memAfter?: number }).__memBefore = memBefore;
+  (window as unknown as { __memAfter?: number }).__memAfter = memAfter;
+  console.log("TIER_SWITCH_MEMORY", JSON.stringify({ memBefore, memAfter }));
+}
 
 // -- minimal hand-built SceneContext, same shape as three-host.ts's --------
 const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);

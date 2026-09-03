@@ -52,6 +52,16 @@ export interface ScreenLedgerView {
   cashMinor: number;
   hireUnlocked: boolean;
   hireThresholdMinor: number;
+  /** Hotel renovation tier, 0..2. */
+  hotelTier: number;
+  /** Cost of the NEXT renovation, or 0 at max tier. */
+  renovateCostMinor: number;
+  /** Stars required for the next renovation, or 0 at max tier. */
+  renovateStarReq: number;
+  /** True when pressing RENOVATE at the desk would actually succeed
+   *  (tier, stars and cash all satisfied). Proximity is NOT folded in —
+   *  the view has no actor. */
+  renovateAvailable: boolean;
 }
 
 /** One past day's closed figures, for LEDGER's paging. Ascending by day. */

@@ -22,6 +22,7 @@ export interface LedgerState {
 
 const PREV_RECT: Rect = { x: 8, y: 420, w: 96, h: 18 };
 const NEXT_RECT: Rect = { x: 112, y: 420, w: 96, h: 18 };
+const RENOVATE_RECT: Rect = { x: 8, y: 380, w: 200, h: 18 };
 const ROWS_PER_PAGE = 8;
 
 function viewData(view: ScreenWorldView): ScreenViewData {
@@ -30,7 +31,7 @@ function viewData(view: ScreenWorldView): ScreenViewData {
 
 /** The one geometry source: reduce hit-tests it, paintSpec places from it. */
 function layoutRects(): Record<string, Rect> {
-  return { prev: PREV_RECT, next: NEXT_RECT };
+  return { prev: PREV_RECT, next: NEXT_RECT, renovate: RENOVATE_RECT };
 }
 
 /** How many pages of closed days exist. Always at least 1 so the guard
@@ -69,6 +70,12 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
     }
     if (hit === "next") {
       return state.pageOffset <= 0 ? state : { pageOffset: state.pageOffset - 1 };
+    }
+    if (hit === "renovate") {
+      // The app's guard is a courtesy, never the authority — the sim
+      // re-checks range, tier, stars and cash regardless (applyRenovate).
+      if (!viewData(view).ledger.renovateAvailable) return state;
+      return { state, effect: { type: "hotel.renovate", payload: {} } };
     }
     return state;
   },
@@ -123,9 +130,25 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
       }
     }
 
+    // RENOVATE status line, printed every day, locked or not — same
+    // anti-dark-pattern stance as the STAFF BUDGET line (DESIGN §6).
+    const renovateGap = data.ledger.renovateCostMinor - data.ledger.cashMinor;
+    const atMaxTier = data.ledger.renovateCostMinor === 0 && data.ledger.hotelTier > 0;
+    const renovateLine = atMaxTier
+      ? "GRAND FOYER - fully renovated, open for business"
+      : `RENOVATE to tier ${data.ledger.hotelTier + 1}: ${formatMinor(data.ledger.renovateCostMinor)}, ` +
+        `${data.ledger.renovateStarReq} stars required (${formatMinor(renovateGap > 0 ? renovateGap : 0)} to go)`;
+    nodes.push({ kind: "text", x: 8, y: 362, text: renovateLine, color: data.ledger.renovateAvailable ? 9 : 14 });
+
     nodes.push({ kind: "text", x: 8, y: 404, text: `Page ${offset + 1} of ${pages}`, color: 8 });
     nodes.push({ kind: "button", rect: PREV_RECT, label: "OLDER", color: 15 });
     nodes.push({ kind: "button", rect: NEXT_RECT, label: "NEWER", color: 15 });
+    nodes.push({
+      kind: "button",
+      rect: RENOVATE_RECT,
+      label: atMaxTier ? "GRAND FOYER OPEN" : "RENOVATE",
+      color: data.ledger.renovateAvailable ? 15 : 8,
+    });
     return nodes;
   },
 };

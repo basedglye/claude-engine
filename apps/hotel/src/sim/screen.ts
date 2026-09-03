@@ -25,9 +25,12 @@ import { staffApp } from "./staff-app.js";
 import { hash32 } from "./nav.js";
 import {
   MIN_RATE_MINOR,
-  MAX_RATE_MINOR,
   RATE_STEP_MINOR,
   HIRE_THRESHOLD_MINOR,
+  MAX_HOTEL_TIER,
+  RENOVATE_COST_MINOR,
+  RENOVATE_STAR_REQ,
+  maxRateForHotelTier,
 } from "./economy.js";
 import { DEMAND_BUCKETS } from "./pricer-app.js";
 import type {
@@ -249,6 +252,13 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
 
   const cashMinor = hotel ? hotel.cash : 0;
   const hireUnlocked = hotel ? hotel.hireUnlocked : false;
+  const hotelTier = hotel ? hotel.tier : 0;
+  const hotelStars = hotel ? hotel.stars : 1;
+  const nextHotelTier = hotelTier < MAX_HOTEL_TIER ? hotelTier + 1 : hotelTier;
+  const renovateCostMinor = hotelTier < MAX_HOTEL_TIER ? RENOVATE_COST_MINOR[nextHotelTier] ?? 0 : 0;
+  const renovateStarReq = hotelTier < MAX_HOTEL_TIER ? RENOVATE_STAR_REQ[nextHotelTier] ?? 0 : 0;
+  const renovateAvailable =
+    hotelTier < MAX_HOTEL_TIER && hotelStars >= renovateStarReq && cashMinor >= renovateCostMinor;
 
   const data: ScreenViewData = {
     queue,
@@ -262,13 +272,17 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
       cashMinor,
       hireUnlocked,
       hireThresholdMinor: HIRE_THRESHOLD_MINOR,
+      hotelTier,
+      renovateCostMinor,
+      renovateStarReq,
+      renovateAvailable,
     },
     ledgerDays,
     objectives: todaysObjectives,
     pricing: {
       rateByTier,
       minRateMinor: MIN_RATE_MINOR,
-      maxRateMinor: MAX_RATE_MINOR,
+      maxRateMinor: maxRateForHotelTier(hotelTier),
       stepMinor: RATE_STEP_MINOR,
       demandBuckets,
     },

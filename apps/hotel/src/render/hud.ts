@@ -1,9 +1,11 @@
 import type { InteractableKind } from "../sim/components.js";
 import { t } from "./i18n.js";
+import type { EndCard, WalkthroughStep } from "./walkthrough.js";
 
 /** First-person HUD state. There is no management-style HUD in this game
  *  (see docs/DESIGN.md §1, §4) — this covers only a reticle, an interaction
- *  prompt, and an entry/loading overlay. */
+ *  prompt, an entry/loading overlay, and the one-line walkthrough / end
+ *  card (both live inside #hud and inherit its pointer-events: none). */
 export interface HudState {
   phase: "loading" | "entry" | "playing" | "focused";
   locked: boolean;
@@ -15,6 +17,8 @@ export interface HudState {
     missing: number;
     manifest: "pending" | "ok" | "missing";
   };
+  walkthrough?: WalkthroughStep | undefined;
+  endCard?: EndCard | undefined;
 }
 
 export interface Hud {
@@ -150,6 +154,59 @@ const STYLE = `
   opacity: 1;
 }
 
+/* --- walkthrough hint line: one line, bottom-centre, above the prompt --- */
+#hud .hud-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 64px;
+  transform: translate(-50%, 0);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #f2e9d8;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85), 0 0 2px rgba(0, 0, 0, 0.9);
+  opacity: 0;
+  transition: opacity 150ms ease;
+  max-width: min(90vw, 640px);
+  white-space: normal;
+  text-wrap: balance;
+  text-align: center;
+}
+#hud .hud-hint[data-visible="1"] {
+  opacity: 1;
+}
+
+/* --- end card: centred, inside #hud, never intercepts input --- */
+#hud .hud-endcard {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  min-width: 320px;
+  padding: 28px 36px;
+  text-align: center;
+  background: rgba(5, 4, 3, 0.82);
+  border: 1px solid rgba(212, 175, 55, 0.5);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+#hud .hud-endcard[data-visible="1"] {
+  opacity: 1;
+}
+#hud .hud-endcard-title {
+  font-family: Georgia, "Times New Roman", Times, serif;
+  font-size: 28px;
+  letter-spacing: 0.08em;
+  color: #d4af37;
+  margin-bottom: 12px;
+}
+#hud .hud-endcard-body {
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  color: #f2e9d8;
+}
+
 @media (prefers-reduced-motion: reduce) {
   #hud, #hud * {
     transition: none !important;
@@ -183,6 +240,11 @@ export function createHud(root: HTMLElement = document.body): Hud {
     </div>
     <div class="hud-reticle"></div>
     <div class="hud-prompt"></div>
+    <div class="hud-hint" data-visible="0" data-step=""></div>
+    <div class="hud-endcard" data-visible="0">
+      <div class="hud-endcard-title"></div>
+      <div class="hud-endcard-body"></div>
+    </div>
   `;
   root.appendChild(el);
 
@@ -190,6 +252,10 @@ export function createHud(root: HTMLElement = document.body): Hud {
   const prompt = el.querySelector<HTMLDivElement>(".hud-prompt")!;
   const assetsMissing = el.querySelector<HTMLDivElement>(".hud-assets-missing")!;
   const loadingStatus = el.querySelector<HTMLDivElement>(".hud-loading-status")!;
+  const hint = el.querySelector<HTMLDivElement>(".hud-hint")!;
+  const endCardEl = el.querySelector<HTMLDivElement>(".hud-endcard")!;
+  const endCardTitle = el.querySelector<HTMLDivElement>(".hud-endcard-title")!;
+  const endCardBody = el.querySelector<HTMLDivElement>(".hud-endcard-body")!;
 
   function update(state: HudState): void {
     // NOTE: deliberately does not diff against a stored `last` state object
@@ -231,6 +297,25 @@ export function createHud(root: HTMLElement = document.body): Hud {
     } else {
       loadingStatus.hidden = true;
     }
+
+    if (state.walkthrough) {
+      hint.textContent = t(state.walkthrough.textKey);
+      hint.dataset.visible = "1";
+      hint.dataset.step = state.walkthrough.id;
+    } else {
+      hint.dataset.visible = "0";
+      hint.dataset.step = "";
+    }
+
+    if (state.endCard) {
+      endCardTitle.textContent = t(state.endCard.titleKey);
+      endCardBody.textContent = t(state.endCard.bodyKey)
+        .replace("{day}", String(state.endCard.day))
+        .replace("{cash}", formatMinor(state.endCard.cashMinor));
+      endCardEl.dataset.visible = "1";
+    } else {
+      endCardEl.dataset.visible = "0";
+    }
   }
 
   function destroy(): void {
@@ -238,6 +323,17 @@ export function createHud(root: HTMLElement = document.body): Hud {
   }
 
   return { update, destroy };
+}
+
+/** Same format as sim/ledger-app.ts's formatMinor: "$" + major + "." +
+ *  2-digit cents. Duplicated rather than imported because hud.ts must stay
+ *  free of a runtime dependency on a specific screen app module. */
+function formatMinor(minor: number): string {
+  const negative = minor < 0;
+  const abs = Math.abs(minor);
+  const major = Math.trunc(abs / 100);
+  const cents = abs % 100;
+  return `${negative ? "-" : ""}$${major}.${cents < 10 ? "0" : ""}${cents}`;
 }
 
 function escapeHtml(s: string): string {

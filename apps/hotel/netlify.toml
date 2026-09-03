@@ -1,0 +1,23 @@
+# Netlify config for the GRAND FOYER hosted fallback.
+#
+# The single-file artifact (apps/hotel/scripts/build-artifact.mjs) is the
+# primary deliverable; this hosted build is the fallback for hosts that
+# won't run the artifact from file://. IMPORTANT: the ~90 MB CC0 PBR/HDRI
+# asset payload (apps/hotel/public/assets/{textures,models,env}) is
+# gitignored and NOT in the repo, so this hosted build is the procedural
+# (flat-colour) build plus whatever apps/hotel/public/assets happens to
+# contain at deploy time on Netlify's own checkout — it is not guaranteed
+# to have the real-hotel look. This is the fallback for the artifact, not
+# a second product.
+#
+# No `base` here on purpose: Netlify's default base IS the repo root, and
+# `command` always runs FROM `base`, with `publish` resolved RELATIVE TO
+# `base`. `npm run build -w apps/hotel` is an npm-workspaces invocation
+# that only resolves from the repo root (apps/hotel/package.json itself
+# declares no workspaces), and it needs the root node_modules + built
+# workspace packages either way — so base stays at the repo root rather
+# than apps/hotel, and `publish` is the repo-root-relative path to the
+# workspace's own dist/.
+[build]
+  command = "npm run build -w apps/hotel"
+  publish = "apps/hotel/dist"

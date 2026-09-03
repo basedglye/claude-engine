@@ -15,6 +15,7 @@ import * as THREE from "three";
 import { BufferGeometryUtils } from "three/examples/jsm/Addons.js";
 import type { GroundFloor } from "@claude-engine/interiors";
 import { makePbrMaterial } from "./assets.js";
+import { stainedCarpetTexture, cleanCarpetTexture, scuffedPaintTexture, ceilingTileTexture, laminateTexture, type HotelTier } from "./procedural.js";
 import {
   CELL_M,
   WALL_HEIGHT_M,
@@ -113,6 +114,7 @@ const MATERIAL_TILE_M: Record<string, number> = {
   "wood-door": 1,
   "desk-top": 1,
   "metal-brass": 0.5,
+  "ceiling-tee": 3,
 };
 const FALLBACK_COLOR: Record<string, number> = {
   "lobby-floor": 0xd8cdb8,
@@ -129,9 +131,13 @@ const FALLBACK_COLOR: Record<string, number> = {
   "wood-door": 0x4a3220,
   "desk-top": 0x2e2a26,
   "metal-brass": 0xb08d3f,
+  "ceiling-tee": 0xc7c6c0,
 };
 
-function wallMaterialForKind(kind: RoomKind): string {
+export type { HotelTier };
+
+function wallMaterialForKind(kind: RoomKind, hotelTier: HotelTier): string {
+  if (hotelTier === 0) return "wall-paper"; // flat scuffed paint everywhere
   switch (kind) {
     case "lobby":
       return "wall-lobby";
@@ -143,7 +149,11 @@ function wallMaterialForKind(kind: RoomKind): string {
       return "wall-lobby";
   }
 }
-function floorMaterialForKind(kind: RoomKind): string {
+function floorMaterialForKind(kind: RoomKind, hotelTier: HotelTier): string {
+  if (hotelTier === 0) {
+    // Stained beige carpet in every room, per the vision table.
+    return kind === "street" ? "street" : "room-carpet";
+  }
   switch (kind) {
     case "lobby":
       return "lobby-floor";
@@ -158,7 +168,48 @@ function floorMaterialForKind(kind: RoomKind): string {
   }
 }
 
-export function buildArchitecture(floor: GroundFloor): THREE.Group {
+/** Procedural (canvas) materials used at tiers 0/1 in place of the CC0 PBR
+ *  set. Cached per (name, hotelTier) — a module-level cache keyed on name
+ *  alone would hand tier 1 the tier-0 material (see brief §3). */
+const proceduralMatCache = new Map<string, THREE.MeshStandardMaterial>();
+function proceduralMatFor(name: string, hotelTier: HotelTier): THREE.MeshStandardMaterial {
+  const key = `${name}:${hotelTier}`;
+  let m = proceduralMatCache.get(key);
+  if (m) return m;
+  if (name === "ceiling-tee") {
+    // Cheap dull aluminium/white tee -- explicitly low metalness, high
+    // roughness, never the "metal-brass" gold.
+    m = new THREE.MeshStandardMaterial({ color: FALLBACK_COLOR["ceiling-tee"], roughness: 0.85, metalness: 0.15 });
+    proceduralMatCache.set(key, m);
+    return m;
+  }
+  const roughness = name === "desk-top" ? 0.9 : name.startsWith("wall") || name === "ceiling" ? 0.95 : 0.92;
+  m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness, metalness: 0 });
+  if (name === "room-carpet" || name === "corridor-carpet" || name === "lobby-floor" || name === "lobby-floor-border") {
+    // Tier 0: stained (the vision's "stained beige carpet"). Tier 1: the
+    // vision explicitly says "clean carpet" -- the earlier version reused
+    // the stain generator with a different seed, so the stains just moved
+    // (COO review item 3). No stain pass at all for tier 1.
+    m.map = hotelTier === 0 ? stainedCarpetTexture(1) : cleanCarpetTexture();
+  } else if (name.startsWith("wall")) {
+    m.map = scuffedPaintTexture(hotelTier === 0 ? 1 : 2);
+  } else if (name === "ceiling") {
+    m.map = ceilingTileTexture();
+  } else if (name === "desk-top") {
+    m.map = laminateTexture();
+  } else {
+    m.color.set(FALLBACK_COLOR[name] ?? 0x999999);
+  }
+  const tileM = MATERIAL_TILE_M[name] ?? 1;
+  if (m.map) {
+    m.map.repeat.set(1 / tileM, 1 / tileM);
+    m.map.needsUpdate = true;
+  }
+  proceduralMatCache.set(key, m);
+  return m;
+}
+
+export function buildArchitecture(floor: GroundFloor, hotelTier: HotelTier): THREE.Group {
   const group = new THREE.Group();
   group.name = "architecture";
 
@@ -167,11 +218,14 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
   function matFor(name: string): THREE.MeshStandardMaterial {
     let m = materials.get(name);
     if (!m) {
-      m = makePbrMaterial(name, {
-        fallbackColor: FALLBACK_COLOR[name] ?? 0x999999,
-        tileM: MATERIAL_TILE_M[name] ?? 1,
-        roughness: name === "desk-top" ? 0.35 : name.startsWith("wall") ? 0.9 : 0.85,
-      });
+      m =
+        hotelTier === 2
+          ? makePbrMaterial(name, {
+              fallbackColor: FALLBACK_COLOR[name] ?? 0x999999,
+              tileM: MATERIAL_TILE_M[name] ?? 1,
+              roughness: name === "desk-top" ? 0.35 : name.startsWith("wall") ? 0.9 : 0.85,
+            })
+          : proceduralMatFor(name, hotelTier);
       materials.set(name, m);
       accums.set(name, newAccum());
     }
@@ -201,7 +255,7 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
       const z1 = z0 + CELL_M;
 
       // Floor
-      let floorMat = floorMaterialForKind(kind);
+      let floorMat = floorMaterialForKind(kind, hotelTier);
       if (kind === "lobby") {
         // 1-cell border along every lobby wall: this cell is a border
         // cell if any 4-neighbour is non-walkable or a different room.
@@ -227,8 +281,10 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
     }
   }
 
-  // --- Coffered lobby ceiling beams: grid at ~2.5m pitch. ---
-  {
+  // --- Coffered lobby ceiling beams (tier 2 only): grid at ~2.5m pitch. ---
+  //     Tier 0 swaps this for a drop-ceiling grid (tile seams + a couple of
+  //     thin support tees) instead; tier 1 gets neither (plain ceiling).
+  if (hotelTier === 2) {
     const lobby = rects.get(ROOM.LOBBY);
     if (lobby) {
       const trimAcc = accFor("wood-trim");
@@ -246,6 +302,26 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
         pushBox(trimAcc, lobby.xM0, lobby.xM1, y0, y1, z - beamW / 2, z + beamW / 2);
       }
     }
+  } else if (hotelTier === 0) {
+    // Drop-ceiling grid: thin sheet-metal tee bars in a 0.6m grid, over
+    // every interior room (not just the lobby) -- tier 0 is cheap everywhere.
+    // Own material, not "metal-brass" -- a suspended-ceiling tee is dull
+    // white/aluminium, not polished gold (COO review item 2).
+    const teeAcc = accFor("ceiling-tee");
+    const teeW = 0.02;
+    const teeD = 0.03;
+    const pitch = 0.6;
+    const y1 = H;
+    const y0 = H - teeD;
+    for (const rect of rects.values()) {
+      if (rect.kind === "street") continue;
+      for (let x = Math.ceil(rect.xM0 / pitch) * pitch; x < rect.xM1; x += pitch) {
+        pushBox(teeAcc, x - teeW / 2, x + teeW / 2, y0, y1, rect.zM0, rect.zM1);
+      }
+      for (let z = Math.ceil(rect.zM0 / pitch) * pitch; z < rect.zM1; z += pitch) {
+        pushBox(teeAcc, rect.xM0, rect.xM1, y0, y1, z - teeW / 2, z + teeW / 2);
+      }
+    }
   }
 
   // --- helper: is (cx,cz) within any door span (in cell coords)? ---
@@ -259,7 +335,7 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
   // --- 3. Walls: scan x-edges and z-edges exactly like mesh-gen.ts. ---
   function wallMatForSide(walkCx: number, walkCz: number): string {
     const roomId = roomAt(floor, walkCx, walkCz);
-    return wallMaterialForKind(roomKind(roomId));
+    return wallMaterialForKind(roomKind(roomId), hotelTier);
   }
 
   // The street strip is bordered by SOLID cells on three sides purely
@@ -387,8 +463,10 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
       const zLo = faceSign === 1 ? z : z - SKIRT_D;
       const zHi = faceSign === 1 ? z + SKIRT_D : z;
       pushBox(trimAcc, sx0, sx1, 0, SKIRT_H, zLo, zHi);
-      pushBox(ceilTrimAcc, sx0, sx1, H - CORNICE_H, H, faceSign === 1 ? z : z - CORNICE_D, faceSign === 1 ? z + CORNICE_D : z);
-      if (kind === "lobby" || kind === "corridor") {
+      if (hotelTier === 2) {
+        pushBox(ceilTrimAcc, sx0, sx1, H - CORNICE_H, H, faceSign === 1 ? z : z - CORNICE_D, faceSign === 1 ? z + CORNICE_D : z);
+      }
+      if (hotelTier >= 1 && (kind === "lobby" || kind === "corridor")) {
         pushBox(trimAcc, sx0, sx1, RAIL_Y, RAIL_Y + RAIL_H, faceSign === 1 ? z : z - WAINS_D, faceSign === 1 ? z + WAINS_D : z);
         pushBox(trimAcc, sx0, sx1, 0, RAIL_Y, faceSign === 1 ? z : z - WAINS_D * 0.6, faceSign === 1 ? z + WAINS_D * 0.6 : z);
       }
@@ -401,8 +479,10 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
       const xLo = faceSign === 1 ? x : x - SKIRT_D;
       const xHi = faceSign === 1 ? x + SKIRT_D : x;
       pushBox(trimAcc, xLo, xHi, 0, SKIRT_H, sz0, sz1);
-      pushBox(ceilTrimAcc, faceSign === 1 ? x : x - CORNICE_D, faceSign === 1 ? x + CORNICE_D : x, H - CORNICE_H, H, sz0, sz1);
-      if (kind === "lobby" || kind === "corridor") {
+      if (hotelTier === 2) {
+        pushBox(ceilTrimAcc, faceSign === 1 ? x : x - CORNICE_D, faceSign === 1 ? x + CORNICE_D : x, H - CORNICE_H, H, sz0, sz1);
+      }
+      if (hotelTier >= 1 && (kind === "lobby" || kind === "corridor")) {
         pushBox(trimAcc, faceSign === 1 ? x : x - WAINS_D, faceSign === 1 ? x + WAINS_D : x, RAIL_Y, RAIL_Y + RAIL_H, sz0, sz1);
         pushBox(trimAcc, faceSign === 1 ? x : x - WAINS_D * 0.6, faceSign === 1 ? x + WAINS_D * 0.6 : x, 0, RAIL_Y, sz0, sz1);
       }
@@ -517,8 +597,10 @@ export function buildArchitecture(floor: GroundFloor): THREE.Group {
     }
   }
 
-  // --- 6. Pilasters on lobby's long walls every ~3m. ---
-  {
+  // --- 6. Pilasters on lobby's long walls every ~3m (tier 2 only -- the
+  //        vision drops pilasters at tier 0, and tier 1 interpolates by
+  //        not yet having them either). ---
+  if (hotelTier === 2) {
     const lobby = rects.get(ROOM.LOBBY);
     if (lobby) {
       const pilW = 0.35;

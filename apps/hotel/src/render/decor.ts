@@ -17,6 +17,9 @@ import * as THREE from "three";
 import type { GroundFloor } from "@claude-engine/interiors";
 import { roomRects, deskRect, hasClearance, cellCenterM, doorRects, WALL_HEIGHT_M, ROOM, type RoomRect } from "./floorplan.js";
 import { loadModel, fitToFootprint, makePbrMaterial } from "./assets.js";
+import { neonSignTexture, type HotelTier } from "./procedural.js";
+
+export type { HotelTier };
 
 // -- deterministic per-room variety (no host-side randomness) --------------
 
@@ -28,11 +31,25 @@ function hashInt(n: number): number {
   return h >>> 0;
 }
 
+/** The tier `buildDecor` is currently building for. Every builder in this
+ *  module runs synchronously inside `buildDecor`'s call, so `upgrade()`
+ *  captures this into a local const AT SCHEDULE TIME (before the promise
+ *  is ever awaited) -- safe even though this module-level flag itself
+ *  changes on the next `buildDecor` call. See `upgrade()` below. */
+let activeTier: HotelTier = 2;
+
 // -- upgrade-in-place helper -------------------------------------------------
 
 /** Adds a procedural fallback to `parent` now, and swaps in the real model
  *  (hiding the fallback) if/when it resolves. Both fallback and model sit
- *  under the SAME parent group so callers can position/rotate once. */
+ *  under the SAME parent group so callers can position/rotate once.
+ *
+ *  The glTF upgrade path runs ONLY at tier 2 -- a marble side table in the
+ *  motel is the failure everyone would spot first. `tierAtSchedule` is
+ *  captured synchronously, before the `.then` is ever reached, so a later
+ *  `buildDecor` call for a different tier (which reassigns `activeTier`)
+ *  cannot retroactively flip an already-scheduled tier-2 upgrade or vice
+ *  versa. */
 function upgrade(
   parent: THREE.Object3D,
   fallback: THREE.Object3D,
@@ -40,6 +57,8 @@ function upgrade(
   footprint: { w: number; d: number; h: number }
 ): void {
   parent.add(fallback);
+  const tierAtSchedule = activeTier;
+  if (tierAtSchedule !== 2) return;
   void loadModel(modelName).then((loaded) => {
     if (!loaded) return;
     fitToFootprint(loaded.scene, footprint);
@@ -69,8 +88,28 @@ function shadowize(obj: THREE.Object3D): void {
 
 // -- shared materials (fallbacks; upgraded in place by makePbrMaterial) ----
 
+/** Cache for tier-0/1 flat materials, keyed by (name, color, tier) so a
+ *  rebuild is cheap and tier 1 never reuses tier 0's material instance. */
+const flatMatCache = new Map<string, THREE.MeshStandardMaterial>();
+
 function mat(name: string, color: THREE.ColorRepresentation, roughness = 0.8, metalness = 0): THREE.MeshStandardMaterial {
-  return makePbrMaterial(name, { fallbackColor: color, roughness, metalness });
+  if (activeTier === 2) return makePbrMaterial(name, { fallbackColor: color, roughness, metalness });
+  // Tiers 0/1 stay fully procedural (no CC0 fetch): a flat colour is
+  // procedural in the trivial sense and, critically, fetches nothing.
+  // Tier 0 is desaturated and darkened a touch -- "flat scuffed paint" --
+  // tier 1 keeps the same hue but clean and a little brighter.
+  const key = `${name}:${String(color)}:${activeTier}`;
+  let m = flatMatCache.get(key);
+  if (m) return m;
+  const c = new THREE.Color(color);
+  if (activeTier === 0) {
+    const hsl = { h: 0, s: 0, l: 0 };
+    c.getHSL(hsl);
+    c.setHSL(hsl.h, hsl.s * 0.55, Math.max(0.12, hsl.l * 0.82));
+  }
+  m = new THREE.MeshStandardMaterial({ color: c, roughness: Math.min(1, roughness + (activeTier === 0 ? 0.15 : 0)), metalness });
+  flatMatCache.set(key, m);
+  return m;
 }
 
 // ============================================================================
@@ -386,6 +425,111 @@ function buildDresserWithTv(): THREE.Group {
   return g;
 }
 
+// -- tier 0 (motel) only: cheap, tired, a little funny -----------------
+
+function buildFoldingChair(seed: number): THREE.Group {
+  const g = new THREE.Group();
+  const h = hashInt(seed);
+  // Mismatched paint: a small set of grubby folding-chair colours picked
+  // deterministically from the seed, never Math.random().
+  const palette = [0x8a1f1f, 0x1f3a5f, 0x3a5f2a, 0x6b5a1f];
+  const metal = mat("wood-trim", palette[h % palette.length]!, 0.7, 0.4);
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.03, 0.42), metal);
+  seat.position.y = 0.45;
+  const back = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.4, 0.03), metal);
+  back.position.set(0, 0.45 + 0.2, -0.19);
+  g.add(seat, back);
+  const legCorners: [number, number][] = [
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+  ];
+  for (const [sx, sz] of legCorners) {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.45, 6), metal);
+    leg.position.set((sx * 0.42) / 2 - sx * 0.02, 0.225, (sz * 0.42) / 2 - sz * 0.02);
+    g.add(leg);
+  }
+  shadowize(g);
+  return g;
+}
+
+/** Vending machine: a plain box with an emissive front panel (the neon-
+ *  sign texture generator doubles as a backlit-menu look). */
+function buildVendingMachine(): THREE.Group {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.75, 1.8, 0.7), mat("wood-door", 0x2a2f33, 0.6, 0.3));
+  body.position.y = 0.9;
+  g.add(body);
+  const panelTex = neonSignTexture("COLD SODA");
+  const panelMat = new THREE.MeshStandardMaterial({ map: panelTex, emissiveMap: panelTex, emissive: 0xffffff, emissiveIntensity: 0.9, roughness: 0.4 });
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 1.0), panelMat);
+  panel.position.set(0, 1.05, 0.351);
+  g.add(panel);
+  const kickplate = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.15, 0.72), mat("metal-brass", 0x3a3a3a, 0.7, 0.5));
+  kickplate.position.y = 0.075;
+  g.add(kickplate);
+  shadowize(g);
+  return g;
+}
+
+/** Cheap plastic ficus: a flat green cone (no real foliage detail) in a
+ *  black plastic pot -- the tier-0 counterpart to `buildPlant()`. */
+function buildPlasticFicus(): THREE.Group {
+  const g = new THREE.Group();
+  const pot = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.16, 0.3, 8), mat("wood-trim", 0x1a1a1a, 0.6, 0.1));
+  pot.position.y = 0.15;
+  const foliage = new THREE.Mesh(new THREE.ConeGeometry(0.35, 0.9, 6), mat("room-carpet", 0x2f5a2f, 0.85));
+  foliage.position.y = 0.3 + 0.45;
+  g.add(pot, foliage);
+  shadowize(g);
+  return g;
+}
+
+/** Cheap mismatched bedroom furniture: same layout roles as the tier-1/2
+ *  set but built as plain, differently-proportioned boxes whose colour
+ *  varies by room id (never Math.random()) so adjacent rooms look
+ *  intentionally mismatched rather than uniform. */
+function buildMotelBed(roomId: number): THREE.Group {
+  const g = new THREE.Group();
+  const h = hashInt(roomId);
+  const palette = [0x8a6a55, 0x6b5540, 0x7a4a4a, 0x4a5a6b];
+  const spreadColor = palette[h % palette.length]!;
+  const mattress = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.3, 1.9), mat("fabric", 0xbdb6a5, 0.95));
+  mattress.position.y = 0.3;
+  const spread = new THREE.Mesh(new THREE.BoxGeometry(1.55, 0.12, 1.5), mat("fabric", spreadColor, 0.95));
+  spread.position.set(0, 0.3 + 0.15 + 0.05, 0.2);
+  const pillow = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.14, 0.4), mat("fabric", 0xe6e1d2, 0.9));
+  pillow.position.set(0, 0.3 + 0.15 + 0.07, -0.7);
+  const headboard = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.7, 0.05), mat("wood-door", 0x5a4a3a, 0.8));
+  headboard.position.set(0, 0.4, -0.95 - 0.025);
+  g.add(mattress, spread, pillow, headboard);
+  shadowize(g);
+  return g;
+}
+
+function buildMotelNightstand(roomId: number): THREE.Group {
+  const g = new THREE.Group();
+  const h = hashInt(roomId + 1);
+  const palette = [0x5a3d24, 0x3a3a3a, 0x6b5540];
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.45, 0.3), mat("wood-trim", palette[h % palette.length]!, 0.9));
+  body.position.y = 0.225;
+  g.add(body);
+  shadowize(g);
+  return g;
+}
+
+function buildMotelWardrobe(roomId: number): THREE.Group {
+  const g = new THREE.Group();
+  const h = hashInt(roomId + 2);
+  const palette = [0x4a3320, 0x33383a, 0x5a4a3a];
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.7, 0.5), mat("wood-door", palette[h % palette.length]!, 0.9));
+  body.position.y = 0.85;
+  g.add(body);
+  shadowize(g);
+  return g;
+}
+
 function buildCurtains(widthM: number): THREE.Group {
   const g = new THREE.Group();
   const fabric = mat("fabric", 0x8a2f2f, 0.9);
@@ -411,32 +555,52 @@ function buildLobby(group: THREE.Group, floor: GroundFloor, room: RoomRect): voi
   const seatZ = room.centerZM + room.depthM * 0.15;
 
   const seating = new THREE.Group();
-  seating.add(buildRug(2.6, 2.0));
-  const sofa = buildSofa();
-  sofa.rotation.y = Math.PI;
-  sofa.position.set(0, 0, -0.7);
-  seating.add(sofa);
-  const chair1 = buildArmchair();
-  chair1.position.set(-0.95, 0, 0.5);
-  chair1.rotation.y = Math.PI * 0.15;
-  seating.add(chair1);
-  const chair2 = buildArmchair();
-  chair2.position.set(0.95, 0, 0.5);
-  chair2.rotation.y = -Math.PI * 0.15;
-  seating.add(chair2);
-  const table = buildCoffeeTable();
-  table.position.set(0, 0, -0.05);
-  seating.add(table);
+  if (activeTier === 0) {
+    // Motel lobby: a vending machine plus a few mismatched folding chairs
+    // instead of the sofa/armchair cluster -- no rug, no coffee table.
+    const vending = buildVendingMachine();
+    vending.position.set(0.9, 0, -0.6);
+    seating.add(vending);
+    const chairSpots: [number, number, number][] = [
+      [-1.0, 0.4, 0],
+      [-0.4, 0.6, Math.PI * 0.1],
+      [0.2, 0.65, -Math.PI * 0.1],
+    ];
+    let seed = room.roomId * 7;
+    for (const [x, z, ry] of chairSpots) {
+      const chair = buildFoldingChair(seed++);
+      chair.position.set(x, 0, z);
+      chair.rotation.y = ry;
+      seating.add(chair);
+    }
+  } else {
+    seating.add(buildRug(2.6, 2.0));
+    const sofa = buildSofa();
+    sofa.rotation.y = Math.PI;
+    sofa.position.set(0, 0, -0.7);
+    seating.add(sofa);
+    const chair1 = buildArmchair();
+    chair1.position.set(-0.95, 0, 0.5);
+    chair1.rotation.y = Math.PI * 0.15;
+    seating.add(chair1);
+    const chair2 = buildArmchair();
+    chair2.position.set(0.95, 0, 0.5);
+    chair2.rotation.y = -Math.PI * 0.15;
+    seating.add(chair2);
+    const table = buildCoffeeTable();
+    table.position.set(0, 0, -0.05);
+    seating.add(table);
+  }
   seating.position.set(seatX, 0, seatZ);
   group.add(seating);
 
-  // Potted plants in the lobby corners.
+  // Potted plants in the lobby corners (tier 0: cheap plastic ficus).
   const corners: [number, number][] = [
     [room.xM0 + 0.4, room.zM0 + 0.4],
     [room.xM1 - 0.4, room.zM0 + 0.4],
   ];
   for (const [x, z] of corners) {
-    const plant = buildPlant();
+    const plant = activeTier === 0 ? buildPlasticFicus() : buildPlant();
     plant.position.set(x, 0, z);
     group.add(plant);
   }
@@ -541,7 +705,7 @@ function buildBedroom(group: THREE.Group, floor: GroundFloor, room: RoomRect, be
   group.add(rug);
 
   // Bed against the chosen wall, headboard flush to that wall.
-  const bed = buildBed();
+  const bed = activeTier === 0 ? buildMotelBed(bedroom.roomId) : buildBed();
   let bedX = room.centerXM;
   let bedZ = room.centerZM;
   let bedYaw = 0;
@@ -598,7 +762,7 @@ function buildBedroom(group: THREE.Group, floor: GroundFloor, room: RoomRect, be
   for (const [dx0, dz0] of nsOffsets) {
     const dx = dx0 * bedScale;
     const dz = dz0 * bedScale;
-    const nightstand = buildNightstand();
+    const nightstand = activeTier === 0 ? buildMotelNightstand(bedroom.roomId) : buildNightstand();
     nightstand.position.set(bedX + dx, 0, bedZ + dz);
     nightstand.rotation.y = bedYaw;
     group.add(nightstand);
@@ -627,7 +791,7 @@ function buildBedroom(group: THREE.Group, floor: GroundFloor, room: RoomRect, be
 
   const wardrobeSpot = wallPos(otherWalls[0]!, room.widthM * 0.28);
   if (!near(wardrobeSpot.x, wardrobeSpot.z)) {
-    const wardrobe = buildWardrobe();
+    const wardrobe = activeTier === 0 ? buildMotelWardrobe(bedroom.roomId) : buildWardrobe();
     wardrobe.position.set(wardrobeSpot.x, 0, wardrobeSpot.z);
     wardrobe.rotation.y = wardrobeSpot.ry;
     group.add(wardrobe);
@@ -678,7 +842,8 @@ function buildBedroom(group: THREE.Group, floor: GroundFloor, room: RoomRect, be
  *  Fallback geometry is added immediately; each piece upgrades in place
  *  when its glTF model resolves (see `upgrade()` above). Never reads or
  *  writes sim state -- pure function of the floorplan. */
-export function buildDecor(floor: GroundFloor): THREE.Group {
+export function buildDecor(floor: GroundFloor, hotelTier: HotelTier): THREE.Group {
+  activeTier = hotelTier;
   const root = new THREE.Group();
   root.name = "decor";
   const rects = roomRects(floor);

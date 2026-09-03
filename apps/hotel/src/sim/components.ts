@@ -297,6 +297,11 @@ export interface Hotel {
   /** True once closing cash has crossed the hire threshold. Diegetic and
    *  printed — LEDGER shows the locked line and the gap every night. */
   hireUnlocked: boolean;
+  /** Renovation tier: 0 Motel, 1 Hotel, 2 Grand Foyer. Starts at 0.
+   *  Monotonic — nothing in the alpha lowers it. DISTINCT from
+   *  `roomUnit.tier` and from the keys of `rateByTier`, which are ROOM
+   *  tiers (1 and 2) and are unrelated. */
+  tier: number;
 }
 
 export interface LedgerEntry {

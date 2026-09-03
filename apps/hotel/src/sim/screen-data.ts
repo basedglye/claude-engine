@@ -48,6 +48,11 @@ export interface ScreenLedgerView {
   day: number;
   revenueMinor: number;
   expenseMinor: number;
+  /** CYCLE-3 lane 5: today's chargebacks so far, from missed-fraud
+   *  checkouts. expense:-prefixed (CHARGEBACK_ACCOUNT, economy.ts), so
+   *  it is already inside expenseMinor above — broken out here purely
+   *  for a legible "fraud loss" line, never a second source of truth. */
+  fraudLossMinor: number;
   closingCashMinor: number;
   cashMinor: number;
   hireUnlocked: boolean;
@@ -69,6 +74,9 @@ export interface ScreenLedgerDayView {
   day: number;
   revenueMinor: number;
   expenseMinor: number;
+  /** CYCLE-3 lane 5: that closed day's chargebacks (see ScreenLedgerView's
+   *  field of the same name). */
+  fraudLossMinor: number;
 }
 
 export interface ScreenObjectiveView {

@@ -104,6 +104,7 @@ import {
   RENOVATE_COST_MINOR,
   RENOVATE_STAR_REQ,
   SEGMENT_MIN_HOTEL_TIER,
+  CHARGEBACK_ACCOUNT,
 } from "./economy.js";
 import { hotelShell, buildScreenWorldView } from "./screen.js";
 import {
@@ -1041,6 +1042,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       waitedTicks: 0,
       brokenPropNights: 0,
       paidMinor: 0,
+      fraudMissed: false,
     });
     const spawnMm = cellMm(streetCell.cx, streetCell.cz);
     s.setComponent<Pos>(guestEntity, "pos", spawnMm);
@@ -1894,7 +1896,13 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       // touched.
       const rate = hotel.rateByTier[String(room.tier)] ?? ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
       s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash + rate });
-      s.setComponent<Guest>(res.guestEntity, "guest", { ...guest, paidMinor: rate });
+      // CYCLE-3 lane 5: `fraudMissed` is set HERE, at accept-despite-
+      // violation time (the single validated path), and read once at
+      // checkout by `reviewSystem` — never recomputed there, since the
+      // rule table / documents that produced `wasPlanted` are exactly
+      // this tick's ground truth and must not be re-evaluated later
+      // against a possibly-different rule set (stars can change mid-stay).
+      s.setComponent<Guest>(res.guestEntity, "guest", { ...guest, paidMinor: rate, fraudMissed: wasPlanted });
       const ledger = s.spawn();
       s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
         day: hotel.day,
@@ -2501,6 +2509,58 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       const guestEntity = (event.payload as { guestEntity: EntityId }).guestEntity;
       const guest = s.getComponent<Guest>(guestEntity, "guest");
       if (!guest) continue;
+
+      // CYCLE-3 lane 5 (CEO ruling, docs/alpha-loop/CYCLE-3.md): a MISSED
+      // fraud (accepted despite a real rules violation) is a SKIP, not a
+      // normal stay. It pays nothing -- the check-in charge is reversed
+      // via a CHARGEBACK_ACCOUNT ledger line, symmetric with the
+      // "cash / revenue:rooms" pair applyDeskDecision posted at check-in
+      // -- and files no review (no guest.reviewed, no guest.complained,
+      // no complaint mail: this guest was never a real customer). The
+      // hotel still takes a reputation hit "equivalent to one 1-star
+      // review" in that segment: reputationBySegment (reviews.ts) reads
+      // every Review component in the rolling window by (day, segment,
+      // score) alone, with no notion of who or why, so a synthetic
+      // score-1 Review row produces EXACTLY that effect through the
+      // existing math -- no new reputation code needed, and no risk of
+      // it drifting from what a real 1-star review would do. A CAUGHT
+      // fraud (denied at the desk) never sets `fraudMissed` and never
+      // reaches this branch at all -- it stays exactly as it was.
+      if (guest.fraudMissed) {
+        if (guest.paidMinor > 0) {
+          // Re-fetch live: multiple fraud chargebacks can land in the
+          // SAME tick (this loop iterates every guest.checkedOut event
+          // since s.tick), and the outer `hotel` const captured at
+          // function entry would go stale after the first one, losing
+          // every chargeback after it (write-through demands the LATEST
+          // component, never a value carried across a setComponent this
+          // same pass already made).
+          const liveHotel = s.getComponent<Hotel>(hotelEntity, "hotel") ?? hotel;
+          s.setComponent<Hotel>(hotelEntity, "hotel", { ...liveHotel, cash: liveHotel.cash - guest.paidMinor });
+          const chargeback = s.spawn();
+          s.setComponent<LedgerEntry>(chargeback, "ledgerEntry", {
+            day: hotel.day,
+            debitAccount: CHARGEBACK_ACCOUNT,
+            creditAccount: "cash",
+            amountMinor: guest.paidMinor,
+            memo: `fraud chargeback guest ${guestEntity}`,
+          });
+        }
+        const fraudReviewEntity = s.spawn();
+        s.setComponent<Review>(fraudReviewEntity, "review", {
+          day: hotel.day,
+          segment: guest.segment,
+          score: 1,
+          factors: ["fraud-missed"],
+        });
+        s.emit("desk.fraudChargeback", {
+          guestEntity,
+          segment: guest.segment,
+          amountMinor: guest.paidMinor,
+        });
+        continue;
+      }
+
       const tierBaseline = ROOM_RATE_MINOR[1]!;
       const outcome = scoreReview({
         waitedTicks: guest.waitedTicks,
@@ -2656,10 +2716,16 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     if (newDay !== hotel.day) {
       let revenueMinor = 0;
       let expenseMinor = 0;
+      // CYCLE-3 lane 5: broken out by name (not just folded into
+      // expenseMinor, which it already is -- CHARGEBACK_ACCOUNT is
+      // expense:-prefixed) so the audit/ledger screens can print a
+      // legible "fraud loss" line instead of an anonymous total.
+      let fraudLossMinor = 0;
       for (const [, entry] of s.withComponent<LedgerEntry>("ledgerEntry")) {
         if (entry.day !== hotel.day) continue;
         if (entry.creditAccount.startsWith("revenue:")) revenueMinor += entry.amountMinor;
         if (entry.debitAccount.startsWith("expense:")) expenseMinor += entry.amountMinor;
+        if (entry.debitAccount === CHARGEBACK_ACCOUNT) fraudLossMinor += entry.amountMinor;
       }
 
       // Reputation and stars: RECOMPUTED from the rolling review window,
@@ -2711,6 +2777,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         day: hotel.day,
         revenueMinor,
         expenseMinor,
+        fraudLossMinor,
         closingCashMinor: hotel.cash,
         stars,
         repBySegment,

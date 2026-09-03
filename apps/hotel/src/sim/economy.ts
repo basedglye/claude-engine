@@ -276,3 +276,18 @@ export const DAILY_UTILITIES_MINOR = 1500;
 /** The owner's own draw. Wages for HIRED staff are additional and come from
  *  the `staffed` components. */
 export const DAILY_OVERHEAD_MINOR = 3000;
+
+// -- Fraud chargeback (CYCLE-3 lane 5, CEO ruling) ----------------------
+
+/** The ledger account a missed-fraud guest's check-in charge is reversed
+ *  through at checkout: debitAccount CHARGEBACK_ACCOUNT, creditAccount
+ *  "cash", amountMinor = what they paid -- the same double-entry shape
+ *  every other ledger line in this file's callers uses. expense:-prefixed
+ *  on purpose, exactly like expense:capex: the day-close sweep
+ *  (dayPhaseSystem, game.ts) already folds every expense:-prefixed debit
+ *  into expenseMinor with no per-account allowlist, so a missed fraud's
+ *  cost shows up in the nightly total the instant this account exists --
+ *  no separate wiring needed there. The audit ALSO breaks this one
+ *  account out by name (fraudLossMinor) so it is legible as its own line,
+ *  not just folded anonymously into "expenses". */
+export const CHARGEBACK_ACCOUNT = "expense:chargeback";

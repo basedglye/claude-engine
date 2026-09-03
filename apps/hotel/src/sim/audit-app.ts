@@ -42,8 +42,14 @@ export const auditApp: ScreenAppDef<AuditState> = {
     nodes.push({ kind: "text", x: 8, y: 36, text: `Day: ${ledger.day}`, color: 8 });
     nodes.push({ kind: "text", x: 8, y: 48, text: `Revenue (rooms): ${ledger.revenueMinor}`, color: 9 });
     nodes.push({ kind: "text", x: 8, y: 60, text: `Expenses: ${ledger.expenseMinor}`, color: 10 });
-    nodes.push({ kind: "hline", x: 8, y: 72, w: 200, color: 14 });
-    nodes.push({ kind: "text", x: 8, y: 80, text: `Closing cash: ${ledger.closingCashMinor}`, color: 8 });
+    // CYCLE-3 lane 5 (CEO ruling): a missed fraud costs the hotel a
+    // chargeback — printed on its own line, whether or not it happened
+    // today (0 is still an answer, same anti-dark-pattern stance as the
+    // STAFF BUDGET line elsewhere), so it is never a number the player
+    // only discovers by noticing expenses look a little high.
+    nodes.push({ kind: "text", x: 8, y: 72, text: `Fraud loss: ${ledger.fraudLossMinor}`, color: 10 });
+    nodes.push({ kind: "hline", x: 8, y: 84, w: 200, color: 14 });
+    nodes.push({ kind: "text", x: 8, y: 92, text: `Closing cash: ${ledger.closingCashMinor}`, color: 8 });
 
     // The day's objectives. Added in the H2a review pass: they were sim-real
     // — posted, progressed, settled, carried in `econ.audit`'s payload and

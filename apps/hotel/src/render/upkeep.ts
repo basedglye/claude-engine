@@ -442,6 +442,11 @@ export function syncUpkeepObjects(
         waitedTicks: 0,
         brokenPropNights: 0,
         paidMinor: 0,
+        // CYCLE-3 lane 5 (sim, docs/alpha-loop/CYCLE-3.md): mechanical
+        // ripple only -- Guest gained this field for checkout-time fraud
+        // handling; a render-side candidate-as-guest adapter has no
+        // desk/checkout concept at all, so it is always false here.
+        fraudMissed: false,
       };
       const rigRoot = syncCharacter(ctx, entity, asGuest, pos, prevPos, yaw, prevYaw, alpha);
       if (rigRoot) registerOnce(entity, rigRoot, registerInteractable, registered);

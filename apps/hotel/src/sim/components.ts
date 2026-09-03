@@ -83,6 +83,16 @@ export interface Guest {
   /** What this stay was actually charged, in minor units — the review
    *  compares it against the tier baseline. 0 until check-in. */
   paidMinor: number;
+  /** CYCLE-3 lane 5 (CEO ruling, docs/alpha-loop/CYCLE-3.md): true when
+   *  this guest was accepted DESPITE a real rules violation (a missed
+   *  fraud, `desk.fraudMissed` at check-in). Read once, at checkout, by
+   *  `reviewSystem`: a missed-fraud guest pays nothing (the check-in
+   *  charge is reversed via an `expense:chargeback` ledger line) and
+   *  files no review, but a synthetic one-star `Review` row still lands
+   *  in the reputation window for that guest's segment — "a missed fraud
+   *  must cost something", not nothing and not a normal bad stay. A
+   *  CAUGHT fraud (denied at the desk) never reaches this field at all. */
+  fraudMissed: boolean;
 }
 
 export interface PathCell {

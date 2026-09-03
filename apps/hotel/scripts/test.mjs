@@ -57,6 +57,7 @@ import {
   RENOVATE_COST_MINOR,
   RENOVATE_STAR_REQ,
   RATE_STEP_MINOR,
+  CHARGEBACK_ACCOUNT,
 } from "../dist-game/sim/economy.js";
 
 let failures = 0;
@@ -1002,6 +1003,116 @@ function focusTerminal(sim, terminalEntity) {
   // above) -- one more step() before the guest's FSM has moved.
   sim.step();
   check("decision(deny): the guest ends up leaving", sim.getComponent(guestEntity, "guest").state === "leaving");
+
+  // CYCLE-3 lane 5 (c): a CAUGHT fraud is unchanged by the missed-fraud
+  // ruling -- it never even sets `fraudMissed`, so none of the checkout-
+  // time consequences (chargeback, synthetic review) apply to it.
+  check("decision(deny): a caught fraud never sets guest.fraudMissed", sim.getComponent(guestEntity, "guest").fraudMissed === false);
+  const despawnedDenied = runUntil(sim, 4000, (s) => s.getComponent(guestEntity, "guest") === undefined);
+  check("decision(deny): the denied guest eventually despawns (never checked in, never a checkout)", despawnedDenied);
+  check(
+    "decision(deny): no chargeback ledger entry exists anywhere (a denied guest was never charged)",
+    [...sim.withComponent("ledgerEntry")].every(([, e]) => e.debitAccount !== CHARGEBACK_ACCOUNT),
+  );
+  check(
+    "decision(deny): no synthetic fraud-missed review exists anywhere",
+    [...sim.withComponent("review")].every(([, r]) => !r.factors.includes("fraud-missed")),
+  );
+}
+
+// --- CYCLE-3 lane 5: a missed fraud must cost something -----------------
+// CEO ruling (docs/alpha-loop/CYCLE-3.md "Lane 5"): accepting a guest
+// despite a real rules violation is a SKIP at checkout -- the check-in
+// charge is reversed via an expense:chargeback ledger line, the guest
+// files no review, but a synthetic one-star Review row still lands in
+// the reputation window for that guest's segment.
+{
+  const sim = new Sim("hotel-fraud-missed-1");
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal", upkeep: false, arrivals: "fixed" });
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+
+  const [resEntity, resBefore] = findReservationForGuest(sim, guestEntity);
+  check("fraud missed: the presenting guest's reservation carries a planted violation", resBefore.plantedViolations.length > 0);
+  const [roomEntity] = findVacantRoom(sim);
+
+  const deskTerminalPos = (() => {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  })();
+  sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+
+  // Accept DESPITE the violation -- a missed fraud.
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+
+  const missedEvents = sim.eventsSince(0).filter(
+    (e) => e.type === "desk.fraudMissed" && e.payload?.reservationEntity === resEntity,
+  );
+  check("fraud missed: desk.fraudMissed fired for this reservation", missedEvents.length === 1);
+  const guestAfterAccept = sim.getComponent(guestEntity, "guest");
+  check("fraud missed: guest.fraudMissed is set", guestAfterAccept.fraudMissed === true);
+  const paidMinor = guestAfterAccept.paidMinor;
+  check("fraud missed: the guest was actually charged something at check-in", paidMinor > 0);
+
+  const hotelEntry = () => [...sim.withComponent("hotel")][0];
+  const cashAfterCheckin = hotelEntry()[1].cash;
+
+  const checkedOut = runUntil(sim, 4000, (s) => {
+    for (const e of s.eventsSince(s.tick)) {
+      if (e.type === "guest.checkedOut" && e.payload?.guestEntity === guestEntity) return true;
+    }
+    return false;
+  });
+  check("fraud missed: the guest eventually checks out", checkedOut);
+
+  const chargebackEntries = [...sim.withComponent("ledgerEntry")]
+    .map(([, e]) => e)
+    .filter((e) => e.debitAccount === CHARGEBACK_ACCOUNT && e.creditAccount === "cash");
+  check(
+    "fraud missed: exactly one chargeback ledger entry, matching what was paid",
+    chargebackEntries.length === 1 && chargebackEntries[0].amountMinor === paidMinor,
+  );
+
+  const cashAfterCheckout = hotelEntry()[1].cash;
+  check(
+    "fraud missed: the chargeback exactly reverses the check-in charge (net zero cash from this guest -- pays nothing)",
+    cashAfterCheckout === cashAfterCheckin - paidMinor,
+  );
+
+  check(
+    "fraud missed: no guest.reviewed event was emitted (files no review)",
+    sim.eventsSince(0).filter((e) => e.type === "guest.reviewed" && e.payload?.guestEntity === guestEntity).length === 0,
+  );
+  check(
+    "fraud missed: no guest.complained event either",
+    sim.eventsSince(0).filter((e) => e.type === "guest.complained" && e.payload?.guestEntity === guestEntity).length === 0,
+  );
+
+  const fraudReview = [...sim.withComponent("review")]
+    .map(([, r]) => r)
+    .find((r) => r.segment === guestAfterAccept.segment && r.score === 1 && r.factors.includes("fraud-missed"));
+  check(
+    "fraud missed: a synthetic one-star Review row lands in the reputation window for the guest's segment",
+    fraudReview !== undefined,
+  );
+
+  // Ledger still balances overall: every account's debit/credit pair nets
+  // to zero, same check the harness scenarios run.
+  const allEntries = [...sim.withComponent("ledgerEntry")].map(([, e]) => e);
+  const byAccount = new Map();
+  for (const e of allEntries) {
+    if (!Number.isInteger(e.amountMinor)) continue;
+    byAccount.set(e.debitAccount, (byAccount.get(e.debitAccount) ?? 0) + e.amountMinor);
+    byAccount.set(e.creditAccount, (byAccount.get(e.creditAccount) ?? 0) - e.amountMinor);
+  }
+  let net = 0;
+  for (const v of byAccount.values()) net += v;
+  check("fraud missed: the ledger still balances (every debit/credit pair nets to zero)", net === 0);
 }
 
 // --- Screen overflow gate (surface-ui's findOverflowingNodes) ------------

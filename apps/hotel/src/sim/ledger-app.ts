@@ -93,15 +93,20 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
     nodes.push({ kind: "text", x: 8, y: 24, text: `Cash on hand: ${formatMinor(data.ledger.cashMinor)}`, color: 8 });
     nodes.push({ kind: "text", x: 8, y: 36, text: `Today (day ${data.ledger.day}) revenue: ${formatMinor(data.ledger.revenueMinor)}`, color: 9 });
     nodes.push({ kind: "text", x: 8, y: 48, text: `Today expenses: ${formatMinor(data.ledger.expenseMinor)}`, color: 10 });
+    // CYCLE-3 lane 5 (CEO ruling): same anti-dark-pattern stance as the
+    // STAFF BUDGET line below — a missed fraud's cost is printed every
+    // day, 0 included, never left for the player to notice only via a
+    // slightly-higher expense total.
+    nodes.push({ kind: "text", x: 8, y: 60, text: `Fraud loss: ${formatMinor(data.ledger.fraudLossMinor)}`, color: 10 });
 
     // The STAFF BUDGET line, printed every day, locked or not.
     const gap = data.ledger.hireThresholdMinor - data.ledger.cashMinor;
     const budgetLine = data.ledger.hireUnlocked
       ? "STAFF BUDGET - UNLOCKED"
       : `STAFF BUDGET - locked, unlocks at ${formatMinor(data.ledger.hireThresholdMinor)} (${formatMinor(gap > 0 ? gap : 0)} to go)`;
-    nodes.push({ kind: "text", x: 8, y: 68, text: budgetLine, color: data.ledger.hireUnlocked ? 9 : 14 });
+    nodes.push({ kind: "text", x: 8, y: 80, text: budgetLine, color: data.ledger.hireUnlocked ? 9 : 14 });
 
-    nodes.push({ kind: "hline", x: 8, y: 84, w: 400, color: 14 });
+    nodes.push({ kind: "hline", x: 8, y: 96, w: 400, color: 14 });
 
     const pages = pageCount(data.ledgerDays.length);
     const offset = state.pageOffset >= pages ? pages - 1 : state.pageOffset < 0 ? 0 : state.pageOffset;
@@ -111,11 +116,11 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
     const start = end - ROWS_PER_PAGE < 0 ? 0 : end - ROWS_PER_PAGE;
     const page = ascending.slice(start < 0 ? 0 : start, end < 0 ? 0 : end);
 
-    nodes.push({ kind: "text", x: 8, y: 92, text: "CLOSED DAYS", color: 12 });
+    nodes.push({ kind: "text", x: 8, y: 104, text: "CLOSED DAYS", color: 12 });
     if (page.length === 0) {
-      nodes.push({ kind: "text", x: 8, y: 108, text: "No days closed yet.", color: 14 });
+      nodes.push({ kind: "text", x: 8, y: 120, text: "No days closed yet.", color: 14 });
     } else {
-      let y = 108;
+      let y = 120;
       for (let i = page.length - 1; i >= 0; i--) {
         const row = page[i]!;
         const net = row.revenueMinor - row.expenseMinor;

@@ -31,6 +31,7 @@ import {
   RENOVATE_COST_MINOR,
   RENOVATE_STAR_REQ,
   maxRateForHotelTier,
+  CHARGEBACK_ACCOUNT,
 } from "./economy.js";
 import { DEMAND_BUCKETS } from "./pricer-app.js";
 import type {
@@ -186,23 +187,35 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
   const day = hotel ? hotel.day : 0;
   let revenueMinor = 0;
   let expenseMinor = 0;
-  const byDay = new Map<number, { revenueMinor: number; expenseMinor: number }>();
+  // CYCLE-3 lane 5: fraud chargebacks, tracked separately for a legible
+  // "fraud loss" line even though they are already inside expenseMinor
+  // (CHARGEBACK_ACCOUNT is expense:-prefixed).
+  let fraudLossMinor = 0;
+  const byDay = new Map<number, { revenueMinor: number; expenseMinor: number; fraudLossMinor: number }>();
   for (const entry of ledgerEntries) {
     const isRevenue = entry.creditAccount.startsWith("revenue:");
     const isExpense = entry.debitAccount.startsWith("expense:");
+    const isFraudLoss = entry.debitAccount === CHARGEBACK_ACCOUNT;
     if (entry.day === day) {
       if (isRevenue) revenueMinor += entry.amountMinor;
       if (isExpense) expenseMinor += entry.amountMinor;
+      if (isFraudLoss) fraudLossMinor += entry.amountMinor;
     }
     if (entry.day >= day) continue; // closed days only, below
-    const bucket = byDay.get(entry.day) ?? { revenueMinor: 0, expenseMinor: 0 };
+    const bucket = byDay.get(entry.day) ?? { revenueMinor: 0, expenseMinor: 0, fraudLossMinor: 0 };
     if (isRevenue) bucket.revenueMinor += entry.amountMinor;
     if (isExpense) bucket.expenseMinor += entry.amountMinor;
+    if (isFraudLoss) bucket.fraudLossMinor += entry.amountMinor;
     byDay.set(entry.day, bucket);
   }
   const ledgerDays: ScreenLedgerDayView[] = [...byDay.keys()]
     .sort((a, b) => a - b)
-    .map((d) => ({ day: d, revenueMinor: byDay.get(d)!.revenueMinor, expenseMinor: byDay.get(d)!.expenseMinor }));
+    .map((d) => ({
+      day: d,
+      revenueMinor: byDay.get(d)!.revenueMinor,
+      expenseMinor: byDay.get(d)!.expenseMinor,
+      fraudLossMinor: byDay.get(d)!.fraudLossMinor,
+    }));
 
   const todaysObjectives: ScreenObjectiveView[] = objectives
     .filter((o) => o.objective.day === day)
@@ -268,6 +281,7 @@ export function buildScreenWorldView(world: IWorld): ScreenWorldView {
       day,
       revenueMinor,
       expenseMinor,
+      fraudLossMinor,
       closingCashMinor: cashMinor,
       cashMinor,
       hireUnlocked,

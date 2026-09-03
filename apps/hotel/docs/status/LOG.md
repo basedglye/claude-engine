@@ -356,7 +356,7 @@ arc.
 - Playtest exit criteria rows 2-9 not closed (re-run pending, cycle 3
   lane 4).
 
-## 2026-09-03 — Cycle 3: the lobby gets real depth [IN PROGRESS]
+## 2026-09-03 — Cycle 3: the lobby gets real depth [DONE]
 
 **Shipped**
 - Lane 1: the lobby grows from 9-12 cells deep to **20-24 cells**
@@ -365,16 +365,14 @@ arc.
   walk (`fps-look-interact`, `reserva-readability`, `save-restore`) was
   re-derived by a new script, `apps/hotel/scripts/derive-walk.mjs`,
   rather than by hand; a follow-up (`derive-walk` W1b) tightened it to
-  pick mid-band holds with a **>=200 mm interact margin**. Gate counts
-  landed at **16/21/69/18** (re-pinned twice as the derivation
-  tightened, 8/18/69/18 midway then final at 16/21/69/18). Fence and
+  pick mid-band holds with a >=200 mm interact margin. Fence and
   rope props no longer cast shadows.
-- Lane 2: default `fraudRatePermille` set to **200** (one guest in five)
+- Lane 2: default `fraudRatePermille` set to 200 (one guest in five)
   at tier 0, unchanged across tiers for the alpha; RESERVA's ACCEPT/DENY
   moved on-screen from the standing pose; the audit screen gained its
   owed `t()` line ("The audit runs itself at midnight; this screen is
   the report").
-- Lane 3: all four C2-W4 placement blockers closed — wall-surface
+- Lane 3: all four C2-W4 placement blockers closed - wall-surface
   occupancy now tracked so paintings stop stacking, both cart call
   sites go through the solver's omit-on-undefined contract, sconces
   placed through the shared room occupancy grid, the pilaster cleared
@@ -382,44 +380,102 @@ arc.
   of the desk; decor builds before fixtures.
 - Lane 4 (playtest re-run): re-ran with hold-T time compression, a
   corrected driver, and fraud live. Owner bot's rate-chase was found
-  locking the terminal (fixed to only step toward reachable tiers).
-  `alpha-loop` now runs **13/13** with live fraud and reaches **tier 2
-  by day 9**.
-- Lane 5 (ruling only, not yet implemented): a missed fraud will become
-  a checkout skip (chargeback ledger line, no guest review, a "fraud
-  loss" audit line, and a reputation hit in that guest's segment
-  equivalent to one 1-star review) — CEO ruling recorded in
-  `docs/alpha-loop/CYCLE-3.md`; the sim-side implementation is the open
-  item.
+  locking the terminal (fixed to only step toward reachable tiles).
+  `alpha-loop` reached 13/13 with live fraud and tier 2 by day 9.
+- Lane 5, closed: a missed fraud is now a real in-sim consequence, not
+  just a CEO ruling - a checkout skip posts a chargeback ledger line, a
+  "fraud loss" line on AUDIT/LEDGER, and a one-star reputation hit in
+  that guest's segment (`e11b298`, sim files only: `game.ts`,
+  `economy.ts`, `components.ts`, `screen.ts`, `screen-data.ts`,
+  `ledger-app.ts`, `audit-app.ts`). `4f1eefb` then changed the
+  `alpha-loop` gate itself to assert desk competence directly -
+  total fraud chargeback loss across the 14-day arc must stay
+  <= $100 AND at least one planted violation must actually be caught
+  (`desk.fraudCaught >= 1`, so it can't pass vacuously on a run that
+  never saw a real violation). Measured on the same seed: a competent
+  desk accrues ~$0 in chargeback loss; an accept-everything bot racks up
+  ~$880 over the same arc - the new gate is red for the careless bot and
+  green for the competent one.
+- Playtest driver work (`78bd634`, `fba5c8a`): the driver's own bugs
+  were found and fixed - it submitted `face` commands directly, which
+  the real browser app's `player-fps` silently overwrites every frame
+  with its own internally-tracked yaw (fixed by turning through the
+  synthetic `window.__WORLDFORGE__.pointer.look(dx)` instead, matching
+  how a human's mouse look actually drives the sim), and `walkTo()` had
+  no door-awareness and would walk in place against a closed bedroom
+  door forever (now opens doors in range en route). With those fixed,
+  the re-run (`fba5c8a`) confirmed two real frauds live and legible by
+  eye on the RESERVA screen in the same session
+  (`res-code-mismatch`: `RC-4715~803728` vs `RC-4715`;
+  `name-mismatch`: `Quinn Baptiste~557147` vs `Quinn Baptiste`), plus
+  hold-T fast-forward measured live at exactly 8x (480 ticks/3000ms
+  held vs 61 ticks/3000ms with a screen focused).
+- A follow-up driver attempt at a continuous service loop (`78bd634`)
+  is recorded as incomplete, honestly: it could not keep the desk
+  served through the long `holdT()` waits (see Known issues below), so
+  it does not supersede the beat-by-beat driver that produced the
+  walkthrough screenshots.
+- Docs: `apps/hotel/docs/ALPHA-LOOK.md` gained a "cycles 1-3 verified
+  state" closing section (`1639c29`); `apps/hotel/docs/WALKTHROUGH.md`
+  was rewritten with live desk frames from the fixed driver and
+  tour-rendered tier comparisons (`8e93077`).
 
 **Verified**
-- `docs/alpha-loop/reviews/C3-W1.md`: **PASS with two numbered
-  follow-ups (neither blocking the merge)**.
-- `docs/alpha-loop/reviews/C3-W2.md`: **FIX-LIST (2 blockers, 2 rough
-  edges)** — folded into the W3-round-2 commit
-  (`08adff8`) per the commit log; re-verify against the review file
-  before calling it closed.
-- `docs/alpha-loop/reviews/C3-W3.md`: **FIX-LIST (2 blockers open, 2
-  blockers closed)** — same caveat as W2.
-- Browser gate counts re-pinned and re-confirmed: **16/21/69/18**
-  (`bc7d87b`, after an intermediate re-pin to 8/18/69/18 in `f6d2ffd`).
-- `alpha-loop` scenario (per commit `34afbd4`): **13/13**, live fraud,
-  tier 2 reached by day 9.
+- `docs/alpha-loop/reviews/C3-W1.md`: PASS with two numbered
+  follow-ups (neither blocking the merge).
+- `docs/alpha-loop/reviews/C3-W2.md`: FIX-LIST (2 blockers, 2 rough
+  edges) - folded into the W3-round-2 commit (`08adff8`).
+- `docs/alpha-loop/reviews/C3-W3.md`: FIX-LIST (2 blockers open, 2
+  blockers closed) - W3-2 (a tier-2 pilaster can partially occlude the
+  desk terminal from some standing poses) is carried forward as a
+  known, visible rough edge rather than claimed fixed (see
+  `docs/WALKTHROUGH.md` §12).
+- Headless gate suite: 13/13 scenarios green with `--verify-replay`,
+  including `alpha-loop` (14/14 assertions, live fraud at 1-in-5, tier 1
+  by day 5, tier 2 by day 9, closing cash-positive at day 14, total
+  chargeback loss under $100 with >=1 fraud actually caught).
+- Browser gate suite: 5 gates green at 16/21/69/20 -
+  `fps-look-interact` (16 commands, Chromium+Firefox), `reserva-readability`
+  (21), `save-restore` (69), `demo-visual` (20, that app's own wall-clock
+  flake, not a failure). Counts re-pinned twice during Lane 1's lobby
+  depth change (`f6d2ffd` 8/18/69/18 intermediate, `bc7d87b` 16/21/69/18)
+  and re-confirmed once more after Lane 5/driver work landed at
+  16/21/69/20.
+- `npm run build`, `npx tsc -p apps/hotel/tsconfig.json --noEmit`,
+  `npx eslint .`, `node scripts/check-purity.mjs`: green
+  (`apps/hotel/docs/ALPHA-LOOK.md`, "Verified on this branch").
+- The single-file artifact builds (`npm run build:hosted -w apps/hotel`)
+  and is published: https://claude.ai/code/artifact/0161c1c4-6a33-4307-8d77-9a6762999418
+  (supersedes the cycle-1 artifact, pinned separately at `96023cbe...`).
 
 **Next**
-- Close lane 5: implement the missed-fraud skip/chargeback/reputation
-  mechanic in sim files only, re-pin `fraud-catch` / `fraud-catch-b` /
-  `escalation-stars` hashes honestly, and confirm the alpha-loop
-  "accept everything" perturbation goes red on solvency or stars.
-- Re-verify the C3-W2 and C3-W3 FIX-LIST items are actually closed by
-  the follow-up commits rather than assuming from commit messages.
+- The human end-to-end sitting (H4b's gate: one person plays door to
+  end-card in one real sitting) is still owed - no driver run so far,
+  scripted or continuous-loop, has completed that arc; the tier-1/tier-2
+  and end-card evidence in the walkthrough comes from the tour page and
+  a direct `alpha-loop` scenario run, not a live human or bot session
+  reaching tier 2.
+- A driver that interleaves guest-serving with T-held waits (rather than
+  treating them as separate phases) would let a scripted playtest
+  produce real tier-1/tier-2 screenshots instead of tour-page renders.
 
 **Known issues**
-- **Lane 5 is not implemented yet** — a missed fraud currently has no
-  in-game consequence; only the CEO ruling exists.
-- C3-W2 and C3-W3 were reviewed FIX-LIST; the fix commits landed after
-  but have not been re-reviewed to confirm PASS.
+- The scripted playtest driver could not keep the desk served
+  continuously (`C2-W1-blockers.md` B9): it serves guests in one
+  active window then switches to blind `holdT()` waiting, so nightly
+  expenses accrue with nobody working the desk and this session's own
+  economy went cash-negative and never reached RENOVATE. This is a
+  driver limitation, not a game defect - the headless `alpha-loop` bot,
+  which does serve continuously, reaches tier 2 solvent on the same
+  seed. The human end-to-end sitting above is the real closer for this.
+- A tier-2 pilaster can partially occlude the desk terminal from some
+  standing poses (`C3-W3.md` item W3-2) - real, open, visible in
+  `docs/walkthrough/tier2-desk.png`.
+- Some gilt picture frames render empty at tier 2 - carried-forward
+  rough edge.
+- No broken prop or staff candidate is guaranteed to appear early in a
+  short session - both are plausibly gated on cash/day thresholds.
 
 **Images**
-- apps/hotel/docs/alpha-loop/C3-W1-shots/tier2-entrance.png
-- apps/hotel/docs/alpha-loop/C3-W1-shots/tier0-lobby-east.png
+- apps/hotel/docs/walkthrough/07-fraud-name.png
+- apps/hotel/docs/walkthrough/tier2-lobby-east.png

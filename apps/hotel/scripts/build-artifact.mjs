@@ -89,9 +89,7 @@ function toFragment(html) {
   let h = head[1];
   for (const tag of h.match(/<meta (?:charset|name="viewport")[^>]*>/g) ?? []) h = h.replace(tag, "");
   h = h.replace(/<title>[\s\S]*?<\/title>/, "");
-  const frag = "<title>GRAND FOYER</title>
-" + h + "
-" + body[1];
+  const frag = ["<title>GRAND FOYER</title>", h, body[1]].join(String.fromCharCode(10));
   if (!frag.includes("<metalnessmap_pars_fragment>")) fail("--fragment: shader includes missing from the fragment (stripping damaged script content)");
   return frag;
 }

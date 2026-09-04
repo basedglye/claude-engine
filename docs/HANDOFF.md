@@ -10,7 +10,8 @@ file is the repo-level index of what is on `main` today and how to resume.
 ## How to resume (one paragraph)
 
 `main` now carries H2a + H2b + the grand-foyer alpha loop (cycles 1–5)
-in one tree, commit `3ee51c6` plus the docs commit after it. Open a fresh
+in one tree, commit `3ee51c6`, plus the docs commit and the low-token
+assessment merge after it (`main` = `5171469`). Open a fresh
 worktree off `main`, run `npm ci`, `npm run check:workspace`, `npm run build`,
 `npm test`, `npm run check:goldens` (12/12 expected), and
 `npm run assets:fetch -w apps/hotel` (the CC0 pack is not in git; without it
@@ -47,6 +48,9 @@ off the level mesh.
   but is **no longer applied to the level mesh** — alpha's
   `buildArchitecture` replaced the `floor-mesh` scenery. Re-wiring it is a
   design call for the next look pass, not a regression to fix blind.
+- `claude/fable-low-token-game-builds-b69bfc` (`6887eea`) merged as
+  `5171469`, docs only: `docs/ASSESSMENT-low-token-game-builds.md`. No
+  code moved, so the verification table below still stands.
 - Alpha's `derive-walk.mjs` (a different tool with the same name as H2b's)
   is kept as `apps/hotel/scripts/derive-walk-c3.mjs`.
 - Goldens re-pinned to the alpha values in `scripts/golden-sweep.mjs`:
@@ -175,13 +179,12 @@ non-vacuous, and browser gates hold a constant command count.
 
 - `.claude/worktrees/optimistic-mahavira-9a3e26` is **not** detached at
   `e17a033` any more: it is checked out on
-  `claude/fable-low-token-game-builds-b69bfc` at `6887eea`, two doc-only
-  commits ahead of `main` (`docs/ASSESSMENT-low-token-game-builds.md`,
-  174 lines: the Fable Cities one-prompt build assessment, reconciled with
-  the /oneshot skill). Clean tree, no untracked files. The branch
+  `claude/fable-low-token-game-builds-b69bfc` at `6887eea` (the Fable
+  Cities one-prompt build assessment, reconciled with the /oneshot
+  skill), clean tree, no untracked files. **Now merged into `main`** as
+  `5171469`; the branch and worktree hold nothing unique. The branch
   `claude/optimistic-mahavira-9a3e26` itself points at `59bfc18`
-  (= `hotel-phase-2`, already in `main`). Mergeable as a docs commit when
-  wanted.
+  (= `hotel-phase-2`, already in `main`).
 - `claude/steam-giveaway-winner-leaderboard-814990` (worktree
   `zealous-villani-6ff919`) is at `28e554a` = old `main`, zero unique
   commits, clean tree, nothing stashed. It holds nothing.

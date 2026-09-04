@@ -131,6 +131,36 @@ Declined, logged so they are not re-pitched: 14-way parallel builder fan-out
 (replay-break risk against the state hash); slider turntable UI; property
 triage skill; blind A/B judging until step 6 produces stable scores.
 
+## 6a. Reconciliation with the `/oneshot` skill (added same day)
+
+`~/.claude/skills/oneshot/SKILL.md` (2026-09-04, skeptic-reviewed twice)
+already supplies, domain-agnostically: docs/PROFILE.md with a reference
+capture set and never-list, ARCHITECTURE.md with one folder per module and
+a sole integrator owning `core/`, capture harness plus per-module showcase
+mode before any feature, no-code critic per module per round scoring 0–10
+against the reference (pass ≥8.5, ≤4 rounds then `stalled`), blind A/B
+judges, STATUS.json with a `modules` block and `weakest_module`, and a
+`/loop` ceiling of 3× modules. Tiering is fixed below the parent: Sonnet
+builders, Opus integrator and critics from a Fable parent.
+
+So steps 1 and 6 above are delivered by running `/oneshot` against GRAND
+FOYER with a hotel profile, not by bespoke work. What stays engine-specific
+and is not in the skill:
+
+- The asset-level probes (wiring audit, contact sheet, scale sheet,
+  silhouette metrics with shipped controls). `/oneshot` captures scenes; it
+  has no per-asset gate. These are the "capture axes" a hotel profile should
+  name.
+- The transcendental-math guard on any micro-kit ops, and the rule that
+  synthesis output never reaches sim state. `/oneshot`'s "units & invariants"
+  row must carry CLAUDE.md invariants 1, 2 and 6 verbatim.
+- The fan-out caution stands in a narrower form: builders under `/oneshot`
+  are file-disjoint and only the integrator touches core, which is the
+  mitigation. The harness's stateHash vs stateHashSlow cross-check must run
+  at every integrator pass, not only at the final gate.
+- The model-per-stage line in review files, so the tiering claim is
+  measurable.
+
 ## 7. Verification honesty
 
 - Reddit could not be fetched by any subagent (WebFetch, curl, firecrawl and

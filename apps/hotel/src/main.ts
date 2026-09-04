@@ -1,7 +1,6 @@
 import * as THREE from "three";
 import { Sim, RestoreError, type EntityId, type IWorld, type Command, type SimSnapshot } from "@claude-engine/core";
 import {
-  createRetroMaterial,
   createThreeHost,
   installTestHook,
   type FrameStats,
@@ -10,18 +9,13 @@ import {
   type ThreeHost,
 } from "@claude-engine/renderer-three";
 import { SCREEN_W } from "@claude-engine/surface-ui";
-import { toBufferGeometry } from "@claude-engine/assets/web";
-import { generateDoorMesh, type GroundFloor, type DoorSpec } from "@claude-engine/interiors";
+import type { GroundFloor, DoorSpec } from "@claude-engine/interiors";
 import { createFpsController } from "@claude-engine/player-fps";
-import { webStore, createSavePump, exportSave } from "@claude-engine/save-web";
-// The "./recover" exports subpath (packages/persistence/package.json) now
-// exists — it resolves straight to recover.ts's compiled output without
-// pulling in the package barrel's Node-only siblings (sqliteStore /
-// postgresStore, which import better-sqlite3 / pg and would break Vite's
-// browser bundle). This used to be a deep import to
-// `@claude-engine/persistence/dist/recover.js`, which package.json's
-// "exports" map kept alive as a "./dist/*" escape hatch purely until this
-// migration landed (H1b review's prescribed spelling, done now).
+import { webStore, memoryStore, indexedDbAvailable, createSavePump, exportSave } from "@claude-engine/save-web";
+// The "./recover" exports subpath (packages/persistence/package.json)
+// resolves straight to recover.ts's compiled output without pulling in the
+// package barrel's Node-only siblings (sqliteStore / postgresStore, which
+// import better-sqlite3 / pg and would break Vite's browser bundle).
 import { recoverSim } from "@claude-engine/persistence/recover";
 import {
   setup,
@@ -47,11 +41,28 @@ import { syncCharacter, pruneCharacters } from "./render/characters.js";
 import { syncUpkeepObjects } from "./render/upkeep.js";
 import { syncHeldDocuments, pruneHeldDocuments } from "./render/documents.js";
 import { syncTerminalScreens, SCREEN_W_M, SCREEN_H_M, type TerminalScreen } from "./render/screens.js";
-import { atlasTextureFor, atlasRegionFor } from "./render/atlas.js";
-import { AMBIENT_INTENSITY, KEY_LIGHT_INTENSITY, LOOK } from "./render/look-lock.js";
+// -- The "real hotel" look (apps/hotel/docs/decisions/2026-09-02-real-hotel-look.md):
+//    host-side only; every module degrades to flat colours when the CC0
+//    payload is not fetched, and none of it touches sim state.
+import { buildArchitecture } from "./render/architecture.js";
+import { buildExterior } from "./render/exterior.js";
+import { createDoorLeaf } from "./render/door-leaf.js";
+import { configureRenderer, buildLighting, setFlickerEnabled, isFlickerEnabled, type LightingRig } from "./render/lighting.js";
+import { buildFixtures } from "./render/fixtures.js";
+import { buildDecor } from "./render/decor.js";
+import { createHud, type HudState } from "./render/hud.js";
+import { createDeskStamp } from "./render/desk-stamp.js";
+import { assetStatus } from "./render/assets.js";
+import type { InteractableKind, Interactable, Hotel } from "./sim/components.js";
+import { RENOVATE_COST_MINOR } from "./sim/economy.js";
+import { createWalkthrough } from "./render/walkthrough.js";
+import type { HotelTier } from "./render/procedural.js";
+import { installHoverLookFallback } from "./render/pointer-fallback.js";
 
-const canvas = document.querySelector<HTMLCanvasElement>("#app");
-if (!canvas) throw new Error("apps/hotel: missing #app canvas in index.html");
+const canvasEl = document.querySelector<HTMLCanvasElement>("#app");
+if (!canvasEl) throw new Error("apps/hotel: missing #app canvas in index.html");
+// Non-null binding so closures below keep the narrowing (TS18047 otherwise).
+const canvas: HTMLCanvasElement = canvasEl;
 
 // Seed must match scenarios/fps-look-interact.scenario.mjs's declared seed
 // (docs/PHASE-H0.md exit criterion 1: "seed hotel-h0-look-1"). A browser
@@ -98,7 +109,12 @@ if (configParam && configParam in SCENARIO_CONFIGS) {
 //    it live rather than closing over a fixed value.
 const GAME_ID_PREFIX = "hotel-sp";
 let gameId = GAME_ID_PREFIX;
-const store = webStore();
+// A sandboxed host (the claude.ai artifact viewer) denies IndexedDB; fall
+// back to a session-only memory store so the write-ahead pump and F5/F9
+// keep working, and say so once in the console rather than throwing on
+// every command.
+const store = indexedDbAvailable() ? webStore() : memoryStore();
+if (!indexedDbAvailable()) console.info("GRAND FOYER: IndexedDB unavailable in this host; saves are session-only.");
 // Not top-level-awaited (vite's default build target predates it) --
 // quickSave() below awaits this promise before its first store access, so
 // a record is guaranteed to exist under `gameId` by the time exportSave()
@@ -454,6 +470,69 @@ const controller = createFpsController({
   },
 });
 
+// -- HUD (render/hud.ts): entry overlay, reticle and interaction prompt.
+//    Pure DOM with pointer-events:none, hidden entirely while a terminal is
+//    focused so the readability probe never sees it. `locked` and
+//    `thirdPerson` are mirrored here because FpsController exposes neither;
+//    the mirrors are presentation-only and never reach the sim. --
+const hud = createHud();
+// Desk feedback stamp (render/desk-stamp.ts): a host-side flash on the
+// focused terminal when a check-in resolves, driven by the sim event stream.
+const deskStamp = createDeskStamp();
+// Escalation-visibility notices (creative-org cycle 5): a rising star tier
+// activates new desk procedures (rules.ts, blacklist row at 2 stars) and
+// MAILBOX bulletins arrive -- but that change is invisible to a player
+// mid-shift. Watch the sim event stream (host-side, zero goldens, same
+// pattern as the desk stamp) and surface a readable notice. Deferred until
+// the player leaves the terminal, since the change usually fires at the
+// midnight audit while the screen is focused (the HUD is hidden then).
+let pendingNotice: string | undefined;
+let lastStampFrameMs = performance.now();
+let thirdPersonMirror = false;
+/** The controller's own notion of "locked" (real pointer lock OR the
+ *  harness's synthetic lock — both go through applyLockChange and land in
+ *  the input trace), so the HUD agrees with what movement is gated on. */
+function controllerLocked(): boolean {
+  const trace = controller.inputTrace();
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const entry = trace[i];
+    if (entry && entry.kind === "lock") return entry.locked;
+  }
+  return false;
+}
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyV" && !e.repeat) thirdPersonMirror = !thirdPersonMirror;
+});
+
+/** Hold-to-fast-forward state (host-only; see tickSim). */
+const FAST_FORWARD_STEPS = 8;
+let fastForwardHeld = false;
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyT" && !e.repeat) fastForwardHeld = true;
+});
+window.addEventListener("keyup", (e: KeyboardEvent) => {
+  if (e.code === "KeyT") fastForwardHeld = false;
+});
+window.addEventListener("blur", () => {
+  fastForwardHeld = false;
+});
+
+// -- Quality toggle (Q): reload with the opposite worldforceQuality. A true
+//    in-place swap would rebuild every scene group and the light rig; a
+//    reload is instant, honest, and keeps the pose via the seed. --
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyQ" && !e.repeat && !focusedScreen) {
+    const url = new URL(window.location.href);
+    const cur = url.searchParams.get("worldforgeQuality");
+    url.searchParams.set("worldforgeQuality", cur === "low" ? "high" : "low");
+    window.location.href = url.toString();
+  }
+  // Flicker toggle (L): the tier-0 fluorescent/lamp flicker on or off.
+  if (e.code === "KeyL" && !e.repeat && !focusedScreen) {
+    setFlickerEnabled(!isFlickerEnabled());
+  }
+});
+
 // Opt-in start barrier (phase-H0 round-2 review, blocking item 1): only
 // present when the harness navigates here with ?worldforgeStartPaused=1,
 // which it only does for scenarios with tick-gated input steps
@@ -530,6 +609,18 @@ function tickSim(): void {
   sim.step();
   const elapsedMs = performance.now() - start;
   tickTimings.push(elapsedMs);
+  // Time compression (hold T): extra sim steps in the same host tick. The
+  // sim is a pure function of (seed, tick-stamped command log), so running
+  // more ticks per frame changes nothing about determinism or replay; it
+  // only shortens the real-time wait between the day's beats. Disabled
+  // while a screen is focused (typing on the terminal) and never in the
+  // harness (the start barrier / synthetic runs never hold the key).
+  if (fastForwardHeld && !focusedScreen) {
+    for (let i = 1; i < FAST_FORWARD_STEPS; i++) {
+      sim.step();
+      hook.notifyTick(sim.tick);
+    }
+  }
   // Let the harness dispatch any tick-gated input queued for this tick,
   // synchronously and in-page. Polling world.tick from out of process and
   // then dispatching over a round trip is bounded-late — it cost a move
@@ -599,6 +690,14 @@ let focusedScreen: TerminalScreen | undefined;
 let terminalScreens: Map<EntityId, TerminalScreen> = new Map();
 let focusEase = 0; // 0 = normal FPS pose, 1 = fully eased toward the screen
 const FOCUS_EASE_STEP = 0.12;
+/** Sim ticks after focus at which the ease is forced to 1 (the camera
+ *  lands exactly on the target pose). The ease step is per FRAME, so under
+ *  a slow renderer (the harness's SwiftShader, or a weak GPU) too few frames
+ *  fit between focus and a screenshot tick and the camera is still moving
+ *  when the readability probe reads its rectangle later. Tick-gating the
+ *  end of the ease makes the settled pose frame-rate independent. */
+const FOCUS_SETTLE_TICKS = 8;
+let focusStartTick = -1;
 // How far back the focused camera sits from the monitor.
 //
 // This used to be a constant tuned by eye at one window size, which is a
@@ -693,7 +792,16 @@ canvas.addEventListener("click", (e: MouseEvent) => {
   if (!focusedScreen) return;
   e.stopImmediatePropagation();
   const hit = raycastFocusedScreen(e.clientX, e.clientY);
-  if (!hit) return;
+  if (!hit) {
+    // Clicked OFF the screen while focused: leave the terminal and resume
+    // play. This is a real user gesture, so requestPointerLock() is
+    // honoured immediately -- unlike the Esc path, which the browser
+    // refuses for ~1.3s after Escape, leaving the player unlocked and
+    // feeling stuck at the desk (reported in live play 2026-09-03).
+    hook.submit(screenBlurCommand(sim.tick + 1));
+    canvas.requestPointerLock();
+    return;
+  }
   // THE seam: hand the raw uv to player-fps's applyScreenClick, the exact
   // function `syntheticPointer.screenClick(u, v)` calls too -- everything
   // downstream (uvToPixel, command construction, submit cadence) is now
@@ -745,8 +853,11 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   }
   if (!focusedScreen) return;
   if (e.code === "Escape") {
+    // Blur only. Do NOT auto re-lock: the browser refuses requestPointerLock
+    // for ~1.3s after Escape, so the call would silently fail and strand the
+    // player unlocked. Clicking the canvas (a fresh gesture) re-locks; the
+    // HUD prompt says so, and clicking off the screen also exits directly.
     hook.submit(screenBlurCommand(sim.tick + 1));
-    canvas.requestPointerLock();
     return;
   }
   hook.submit(screenKeyCommand(sim.tick + 1, e.code));
@@ -766,14 +877,70 @@ function findFocusedTerminal(world: IWorld): EntityId | undefined {
 // eslint-disable-next-line prefer-const
 let hostRef: ThreeHost | undefined;
 
+let lightingRig: LightingRig | undefined;
+let lightingTier = -1;
+const sceneryByTier = new Map<number, THREE.Object3D>();
+
+/** The hotel singleton, read fresh each frame (invariant 4: hosts render,
+ *  sims decide -- the tier is sim state the renderer only ever reads). */
+function readHotel(world: IWorld): Hotel | undefined {
+  for (const entity of world.entities()) {
+    const hotel = world.getComponent<Hotel>(entity, "hotel");
+    if (hotel) return hotel;
+  }
+  return undefined;
+}
+
+/** True within ~1.5 m of the clerk-side terminal anchor -- the walkthrough's
+ *  "walk to the desk" step. Presentation-only distance in mm. */
+function playerNearDesk(world: IWorld): boolean {
+  const pos = world.getComponent<Pos>(PLAYER_ENTITY, "pos");
+  if (!pos) return false;
+  const dx = pos.xMm - floor.desk.xMm;
+  const dz = pos.zMm - floor.desk.zMm;
+  return dx * dx + dz * dz <= 1500 * 1500;
+}
+
+// -- Walkthrough (render/walkthrough.ts): event-driven, skippable with H,
+//    never blocks input. Reads the sim's event stream incrementally. --
+const walkthrough = createWalkthrough();
+/** Events are consumed by TICK, not by index: the sim trims its event log
+ *  to a retention window, so an index cursor would skip or repeat. */
+let walkthroughLastTick = -1;
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.code === "KeyH" && !e.repeat && !focusedScreen) walkthrough.skip();
+});
+
+// -- Pointer-lock fallback (render/pointer-fallback.ts): when a sandboxed
+//    host refuses pointer lock (the claude.ai artifact iframe does), look
+//    follows the hovering cursor instead. Deltas go through the REAL mouse
+//    path so the handedness fix in player-fps applies; lock state goes
+//    through the same normalizer a real pointerlockchange would. --
+/** requestPointerLock that never throws or rejects uncaught (sandboxed
+ *  iframes refuse it); the hover-look fallback decides what to do next. */
+function requestLockQuietly(): void {
+  try {
+    const r = (canvas.requestPointerLock as () => void | Promise<void>)();
+    if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+  } catch {
+    /* refused */
+  }
+}
+installHoverLookFallback(canvas, {
+  requestLock: () => requestLockQuietly(),
+  isLocked: () => document.pointerLockElement === canvas,
+  onLook: (dx, dy) => controller.pointerHandlers.onLook?.(dx, dy),
+  setLocked: (locked) => controller.pointerHandlers.onPointerLockChange?.(locked),
+});
+
 const host = createThreeHost(sim, {
   canvas,
-  // The level's lighting is BAKED into the mesh's vertex colours (H2b,
-  // interiors' `buildFloorMesh`), so the runtime rig exists only to keep
-  // unbaked host geometry — characters, messes, props, the monitor housing
-  // — from reading as flat silhouettes. See render/look-lock.ts.
-  ambientIntensity: AMBIENT_INTENSITY,
-  keyLightIntensity: KEY_LIGHT_INTENSITY,
+  // The lighting rig in render/lighting.ts replaces three-host's default
+  // ambient + sun; the renderer gets shadows and filmic tone mapping.
+  defaultLights: false,
+  onRendererCreated(renderer) {
+    configureRenderer(renderer);
+  },
   stepSim: tickSim,
   submit: (command) => hook.submit(command),
   pointerHandlers: controller.pointerHandlers,
@@ -792,8 +959,9 @@ const host = createThreeHost(sim, {
         // the browser cursor simply becomes visible again).
         document.exitPointerLock();
       }
+      if (!focusedScreen) focusStartTick = sim.tick;
       focusedScreen = screen;
-      focusEase = Math.min(1, focusEase + FOCUS_EASE_STEP);
+      focusEase = sim.tick - focusStartTick >= FOCUS_SETTLE_TICKS ? 1 : Math.min(1, focusEase + FOCUS_EASE_STEP);
       // screen.screenMesh.position is LOCAL to its parent group (a small
       // z-offset off the housing, see render/screens.ts) -- reading it as
       // if it were a world position was one real bug here: the ease
@@ -836,24 +1004,86 @@ const host = createThreeHost(sim, {
     } else {
       focusedScreen = undefined;
       focusEase = 0;
+      focusStartTick = -1;
     }
+
+    // HUD state, derived entirely from host-side facts already known here.
+    const pointerLocked = controllerLocked();
+    const targetEntity = pointerLocked && !focusedScreen ? controller.currentTarget() : undefined;
+    const targetKind: InteractableKind | undefined =
+      targetEntity !== undefined ? world.getComponent<Interactable>(targetEntity, "interactable")?.kind : undefined;
+    // Walkthrough: feed only the events since the last frame.
+    const newEvents = sim.eventsSince(walkthroughLastTick + 1);
+    if (newEvents.length > 0) walkthroughLastTick = newEvents[newEvents.length - 1]!.tick;
+    const nowStampMs = performance.now();
+    const stampDtMs = Math.min(100, nowStampMs - lastStampFrameMs);
+    lastStampFrameMs = nowStampMs;
+    deskStamp.update(newEvents, focusedScreen?.group, stampDtMs);
+    for (const e of newEvents) {
+      if (e.type === "hotel.starsChanged") {
+        const to = (e.payload as { to?: number } | undefined)?.to ?? 0;
+        const from = (e.payload as { from?: number } | undefined)?.from ?? 0;
+        if (to > from) pendingNotice = "New procedure in effect — check MAILBOX";
+      } else if (e.type === "mail.bulletinDelivered" && pendingNotice === undefined) {
+        pendingNotice = "New bulletin in your MAILBOX";
+      }
+    }
+    if (pendingNotice !== undefined && !focusedScreen) {
+      hud.notice(pendingNotice);
+      pendingNotice = undefined;
+    }
+    const hotelNow = readHotel(world);
+    walkthrough.advance({
+      tick: sim.tick,
+      events: newEvents.map((e) => ({ type: e.type, payload: (e.payload ?? {}) as Record<string, unknown> })),
+      hotel: hotelNow ? { tier: hotelNow.tier, cash: hotelNow.cash, stars: hotelNow.stars, day: hotelNow.day } : undefined,
+      nearDesk: playerNearDesk(world),
+      renovateCostMinor: hotelNow ? (RENOVATE_COST_MINOR[hotelNow.tier + 1] ?? 0) : 0,
+    });
+    const hudState: HudState = {
+      walkthrough: walkthrough.current(),
+      endCard: walkthrough.endCard(),
+      phase: focusedScreen ? "focused" : pointerLocked ? "playing" : assetStatus.pending > 0 ? "loading" : "entry",
+      locked: pointerLocked,
+      thirdPerson: thirdPersonMirror,
+      target: targetKind,
+      loading: {
+        pending: assetStatus.pending,
+        ok: assetStatus.texturesOk + assetStatus.modelsOk,
+        missing: assetStatus.texturesMissing + assetStatus.modelsMissing,
+        manifest: assetStatus.manifest,
+      },
+    };
+    hud.update(hudState);
   },
   syncScene(ctx: SceneContext, world: IWorld, alpha: number) {
-    ctx.scenery("floor-mesh", () => {
-      // H2b: the static floor/walls/ceiling is ONE merged geometry (it
-      // always was — interiors emits a single mesh), now atlas-textured
-      // with the planar UVs interiors emits and lit by the vertex-colour
-      // bake it folds in. The PS1 material is applied HERE, at the one
-      // place the level's geometry enters the scene, so "the world wears
-      // the look" is a single call rather than a convention.
-      const geometry = toBufferGeometry(floor.mesh);
-      const material = createRetroMaterial({
-        map: atlasTextureFor(sim.seed),
-        vertexColors: true,
-        look: LOOK,
-      });
-      return new THREE.Mesh(geometry, material);
+    // The building: architecture (walls/floors/trim/desk from the same grid
+    // the sim collides against), the street outside, light fixtures and
+    // static decor. Built once; textures and glTF models upgrade in place.
+    // Keyed by tier: each tier's scenery is built once on first sight and
+    // swapped by visibility, so a RENOVATE press changes the building the
+    // same frame the sim changes `hotel.tier`.
+    const tierNumber = readHotel(world)?.tier ?? 0;
+    const hotelTier: HotelTier = tierNumber >= 2 ? 2 : tierNumber === 1 ? 1 : 0;
+    const tierGroup = ctx.scenery(`hotel-t${hotelTier}`, () => {
+      const g = new THREE.Group();
+      g.add(buildArchitecture(floor, hotelTier));
+      g.add(buildExterior(floor, hotelTier));
+      // Decor before fixtures: both share one RoomOccupancy per room
+      // (placement.ts), and paintings must claim wall space before sconces.
+      g.add(buildDecor(floor, hotelTier));
+      g.add(buildFixtures(floor, hotelTier));
+      return g;
     });
+    sceneryByTier.set(hotelTier, tierGroup);
+    for (const [t, g] of sceneryByTier) g.visible = t === hotelTier;
+    if (lightingTier !== hotelTier || !lightingRig) {
+      lightingRig?.dispose();
+      lightingRig = buildLighting(floor, ctx.scene, ctx.renderer, hotelTier);
+      lightingTier = hotelTier;
+    }
+    const rig: LightingRig = lightingRig;
+    rig.update(world, performance.now());
 
     terminalScreens = syncTerminalScreens(ctx, world, controller.registerInteractable);
 
@@ -865,27 +1095,11 @@ const host = createThreeHost(sim, {
 
       let group = doorGroups.get(entity);
       if (!group) {
-        // Doors are atlas-textured now. They used to be flat
-        // vertex-coloured slabs on the argument that "a door panel is a
-        // solid painted surface, not a textured one" — which was true of a
-        // real door and wrong on screen: with the floors and walls textured,
-        // an untextured leaf standing open in a doorway is the largest
-        // untextured object in most interior shots and reads as cardboard.
-        // The atlas has carried a `door` region since H2b synthesized it and
-        // nothing sampled it.
-        const doorMesh = generateDoorMesh(spec, atlasRegionFor(sim.seed, "door"));
-        const geometry = toBufferGeometry(doorMesh);
-        const material = createRetroMaterial({
-          map: atlasTextureFor(sim.seed),
-          vertexColors: true,
-          look: LOOK,
-        });
-        const mesh = new THREE.Mesh(geometry, material);
-        // generateDoorMesh already positions the panel in world space
-        // (docs/PHASE-H0.md's door mesh is centered on the door cell), so
-        // pivot the group at the door center and offset the mesh by the
-        // inverse to rotate around that hinge point rather than the scene
-        // origin.
+        // createDoorLeaf positions the leaf in world space exactly like
+        // interiors' generateDoorMesh did (centered on the door span), so
+        // the same pivot trick applies: group at the door center, leaf
+        // offset by the inverse, rotate the group to swing on the hinge.
+        const mesh = createDoorLeaf(spec, { entrance: spec.doorIndex === floor.entranceDoorIndex });
         group = new THREE.Group();
         group.position.set(spec.xMm / 1000, 0, spec.zMm / 1000);
         mesh.position.set(-spec.xMm / 1000, 0, -spec.zMm / 1000);
@@ -923,7 +1137,7 @@ const host = createThreeHost(sim, {
     //    without this the whole housekeeping/maintenance/hiring layer is
     //    invisible and unclickable in the actual game while every headless
     //    gate stays green.
-    const upkeep = syncUpkeepObjects(ctx, world, alpha, controller.registerInteractable, registeredUpkeepInteractables);
+    const upkeep = syncUpkeepObjects(ctx, world, alpha, controller.registerInteractable, registeredUpkeepInteractables, floor);
     for (const entity of upkeep.live) liveGuests.add(entity);
     pruneCharacters(liveGuests);
 

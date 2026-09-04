@@ -25,3 +25,11 @@ npm run dev -w @claude-engine/hotel
 npm run build -w @claude-engine/hotel
 npm run harness --silent -- walk-collide --verify-replay
 ```
+
+## The alpha look (2026-09-02)
+
+`npm run assets:fetch -w apps/hotel` downloads the CC0 texture/model/HDRI
+pack (gitignored, ~90 MB) that `apps/hotel/assets.manifest.json` describes;
+without it the game runs on flat colours. See
+[docs/ALPHA-LOOK.md](docs/ALPHA-LOOK.md) for the module map, quality tiers
+and verification, and `docs/evidence/alpha-look-*.jpg` for what it looks like.

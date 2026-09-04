@@ -22,6 +22,7 @@ export interface LedgerState {
 
 const PREV_RECT: Rect = { x: 8, y: 420, w: 96, h: 18 };
 const NEXT_RECT: Rect = { x: 112, y: 420, w: 96, h: 18 };
+const RENOVATE_RECT: Rect = { x: 8, y: 380, w: 200, h: 18 };
 const ROWS_PER_PAGE = 8;
 
 function viewData(view: ScreenWorldView): ScreenViewData {
@@ -30,7 +31,7 @@ function viewData(view: ScreenWorldView): ScreenViewData {
 
 /** The one geometry source: reduce hit-tests it, paintSpec places from it. */
 function layoutRects(): Record<string, Rect> {
-  return { prev: PREV_RECT, next: NEXT_RECT };
+  return { prev: PREV_RECT, next: NEXT_RECT, renovate: RENOVATE_RECT };
 }
 
 /** How many pages of closed days exist. Always at least 1 so the guard
@@ -70,6 +71,12 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
     if (hit === "next") {
       return state.pageOffset <= 0 ? state : { pageOffset: state.pageOffset - 1 };
     }
+    if (hit === "renovate") {
+      // The app's guard is a courtesy, never the authority — the sim
+      // re-checks range, tier, stars and cash regardless (applyRenovate).
+      if (!viewData(view).ledger.renovateAvailable) return state;
+      return { state, effect: { type: "hotel.renovate", payload: {} } };
+    }
     return state;
   },
 
@@ -86,15 +93,20 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
     nodes.push({ kind: "text", x: 8, y: 24, text: `Cash on hand: ${formatMinor(data.ledger.cashMinor)}`, color: 8 });
     nodes.push({ kind: "text", x: 8, y: 36, text: `Today (day ${data.ledger.day}) revenue: ${formatMinor(data.ledger.revenueMinor)}`, color: 9 });
     nodes.push({ kind: "text", x: 8, y: 48, text: `Today expenses: ${formatMinor(data.ledger.expenseMinor)}`, color: 10 });
+    // CYCLE-3 lane 5 (CEO ruling): same anti-dark-pattern stance as the
+    // STAFF BUDGET line below — a missed fraud's cost is printed every
+    // day, 0 included, never left for the player to notice only via a
+    // slightly-higher expense total.
+    nodes.push({ kind: "text", x: 8, y: 60, text: `Fraud loss: ${formatMinor(data.ledger.fraudLossMinor)}`, color: 10 });
 
     // The STAFF BUDGET line, printed every day, locked or not.
     const gap = data.ledger.hireThresholdMinor - data.ledger.cashMinor;
     const budgetLine = data.ledger.hireUnlocked
       ? "STAFF BUDGET - UNLOCKED"
       : `STAFF BUDGET - locked, unlocks at ${formatMinor(data.ledger.hireThresholdMinor)} (${formatMinor(gap > 0 ? gap : 0)} to go)`;
-    nodes.push({ kind: "text", x: 8, y: 68, text: budgetLine, color: data.ledger.hireUnlocked ? 9 : 14 });
+    nodes.push({ kind: "text", x: 8, y: 80, text: budgetLine, color: data.ledger.hireUnlocked ? 9 : 14 });
 
-    nodes.push({ kind: "hline", x: 8, y: 84, w: 400, color: 14 });
+    nodes.push({ kind: "hline", x: 8, y: 96, w: 400, color: 14 });
 
     const pages = pageCount(data.ledgerDays.length);
     const offset = state.pageOffset >= pages ? pages - 1 : state.pageOffset < 0 ? 0 : state.pageOffset;
@@ -104,11 +116,11 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
     const start = end - ROWS_PER_PAGE < 0 ? 0 : end - ROWS_PER_PAGE;
     const page = ascending.slice(start < 0 ? 0 : start, end < 0 ? 0 : end);
 
-    nodes.push({ kind: "text", x: 8, y: 92, text: "CLOSED DAYS", color: 12 });
+    nodes.push({ kind: "text", x: 8, y: 104, text: "CLOSED DAYS", color: 12 });
     if (page.length === 0) {
-      nodes.push({ kind: "text", x: 8, y: 108, text: "No days closed yet.", color: 14 });
+      nodes.push({ kind: "text", x: 8, y: 120, text: "No days closed yet.", color: 14 });
     } else {
-      let y = 108;
+      let y = 120;
       for (let i = page.length - 1; i >= 0; i--) {
         const row = page[i]!;
         const net = row.revenueMinor - row.expenseMinor;
@@ -123,9 +135,25 @@ export const ledgerApp: ScreenAppDef<LedgerState> = {
       }
     }
 
+    // RENOVATE status line, printed every day, locked or not — same
+    // anti-dark-pattern stance as the STAFF BUDGET line (DESIGN §6).
+    const renovateGap = data.ledger.renovateCostMinor - data.ledger.cashMinor;
+    const atMaxTier = data.ledger.renovateCostMinor === 0 && data.ledger.hotelTier > 0;
+    const renovateLine = atMaxTier
+      ? "GRAND FOYER - fully renovated, open for business"
+      : `RENOVATE to tier ${data.ledger.hotelTier + 1}: ${formatMinor(data.ledger.renovateCostMinor)}, ` +
+        `${data.ledger.renovateStarReq} stars required (${formatMinor(renovateGap > 0 ? renovateGap : 0)} to go)`;
+    nodes.push({ kind: "text", x: 8, y: 362, text: renovateLine, color: data.ledger.renovateAvailable ? 9 : 14 });
+
     nodes.push({ kind: "text", x: 8, y: 404, text: `Page ${offset + 1} of ${pages}`, color: 8 });
     nodes.push({ kind: "button", rect: PREV_RECT, label: "OLDER", color: 15 });
     nodes.push({ kind: "button", rect: NEXT_RECT, label: "NEWER", color: 15 });
+    nodes.push({
+      kind: "button",
+      rect: RENOVATE_RECT,
+      label: atMaxTier ? "GRAND FOYER OPEN" : "RENOVATE",
+      color: data.ledger.renovateAvailable ? 15 : 8,
+    });
     return nodes;
   },
 };

@@ -40,22 +40,27 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const cliPath = resolve(repoRoot, "packages", "harness", "dist", "cli.js");
 
+// Re-pinned 2026-09-04 at the hotel-phase-2b + grand-foyer-alpha merge: the
+// nine that moved are the alpha branch's sim changes (lobby depth 20-24 cells,
+// fraud rate 200 permille, missed-fraud chargeback). Measured on the alpha
+// branch alone AND on the merged tree -- identical, so H2b carried zero
+// sim-visible change across the merge.
 // name -> { hash, source }. source is "carried" (from the H2a review /
 // handoff record) or "measured" (run by this script's author at the H2b
 // boundary, see file header).
 const PINS = {
   smoke: { hash: 3849639990, source: "carried" },
-  "checkin-rush": { hash: 1978775531, source: "carried" },
-  "one-man-week": { hash: 3423109909, source: "carried" },
+  "checkin-rush": { hash: 2196558366, source: "measured" },
+  "one-man-week": { hash: 4021919040, source: "measured" },
   "demo-walk": { hash: 1289360534, source: "measured" },
   "bots-headless": { hash: 4146301557, source: "measured" },
-  "walk-collide": { hash: 2817230563, source: "measured" },
-  "corridor-headon": { hash: 2843227394, source: "measured" },
-  "fraud-catch": { hash: 1548146672, source: "measured" },
-  "fraud-catch-b": { hash: 2021951628, source: "measured" },
-  "zen-clean": { hash: 312638063, source: "measured" },
-  "first-hire": { hash: 4132986008, source: "measured" },
-  "escalation-stars": { hash: 2672628845, source: "measured" },
+  "walk-collide": { hash: 540994947, source: "measured" },
+  "corridor-headon": { hash: 1136126795, source: "measured" },
+  "fraud-catch": { hash: 1810283670, source: "measured" },
+  "fraud-catch-b": { hash: 1850687857, source: "measured" },
+  "zen-clean": { hash: 3816275859, source: "measured" },
+  "first-hire": { hash: 3189570860, source: "measured" },
+  "escalation-stars": { hash: 2469499419, source: "measured" },
 };
 
 // one-man-week is 42,000 ticks and genuinely slow — tell the reader we

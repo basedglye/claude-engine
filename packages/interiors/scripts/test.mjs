@@ -97,34 +97,10 @@ const GOLDEN_SEED = "hotel-h0-look-1";
 // row north and one column east so a 300mm-radius guest can actually
 // stand on a slot. No grid cell, portal, door or mesh vertex changed --
 // only the serialized `desk` block, which this hash covers.
-// Re-pinned for H2b (previous value: 0x752bc750): buildFloorMesh now emits
-// per-vertex UVs (planar projection into the retro atlas, TEXELS_PER_METRE
-// density) and bakes a corridor/window/lamp vertex-colour lighting
-// multiplier -- both change `mesh.positions`/`colors`/`uvs` bytes for every
-// seed, this one included. This is legal under invariant 2 (asset-synthesis
-// output is presentation, never hashed into sim state) because it is
-// EXCLUSIVELY a mesh-bytes change: `NON_MESH_GOLDEN_HASH` below, which
-// covers every other field, is unchanged from before this diff -- see that
-// hash's own comment for how it proves the separation.
-// Re-pinned a SECOND time inside H2b (0xbf2459e0 -> 0xef96f6ec) when the
-// albedo moved out of the vertex colours and into the atlas. The first
-// H2b pass emitted `atlasColour x roomTint x light`, which describes each
-// material's colour twice and lands at roughly its square -- driving the
-// built game showed the entire hotel rendered as uniform dark mud. Vertex
-// colours now carry the LIGHT alone (see mesh-gen.ts's block comment above
-// FLOOR_PALETTE). Same argument as above applies unchanged: mesh bytes
-// only, and NON_MESH_GOLDEN_HASH did not move across either re-pin.
-// Re-pinned a THIRD time inside H2b (0xef96f6ec -> 0x95618e02): the bake
-// gained a per-face directional term and the UV mapping gained a half-texel
-// gutter. Both were found by looking at the built game rather than by any
-// gate. Without the normal term the positional falloffs vary only across
-// the floor plan, so two opposite walls render identically and a room reads
-// as one flat field; without the gutter a vertex landing exactly on a tile
-// period sampled the NEIGHBOURING material (measured: lobby floor quads
-// taking the corridor's grey-blue, ceiling quads taking the lobby's tan).
-// Mesh bytes only, again, and NON_MESH_GOLDEN_HASH has not moved across any
-// of the three re-pins.
-const GOLDEN_HASH = 0x95618e02;
+// Re-pinned 2026-09-04 at the 2b + alpha merge (0x43fd1d2e / 0x95618e02 ->
+// 0x4d0f51ba): the alpha branch deepened the lobby in layout.ts, so BOTH
+// hashes move -- the non-mesh one legitimately, since the grid changed.
+const GOLDEN_HASH = 0x4d0f51ba;
 
 // --- Golden determinism: byte-identical across two calls, hash pinned. -----
 {
@@ -143,7 +119,7 @@ const GOLDEN_HASH = 0x95618e02;
 // change ships in) and pinned like any other golden; if a future PR moves
 // THIS hash without an explicit, reviewed reason, sim-visible data leaked
 // out of what should be a presentation-only change. -----------------------
-const NON_MESH_GOLDEN_HASH = 0x03ea4ca5;
+const NON_MESH_GOLDEN_HASH = 0x29a43267;
 {
   const gf = generateGroundFloor(GOLDEN_SEED);
   const s = serializeNonMeshFields(gf);

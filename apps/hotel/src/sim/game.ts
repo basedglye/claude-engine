@@ -82,7 +82,7 @@ import {
   type RuleDoc,
   type ResFields,
 } from "./rules.js";
-import { ARCHETYPES, pickArchetype, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
+import { ARCHETYPES, pickGuestName, makeResCode, makeDocNumber } from "./guests.js";
 import {
   scoreReview,
   reputationBySegment,
@@ -96,11 +96,16 @@ import {
   arrivalsForDay,
   totalArrivals,
   generateObjectives,
-  isValidRate,
+  isValidRateForHotelTier,
   OBJECTIVE_KINDS,
   HIRE_THRESHOLD_MINOR,
   DAILY_UTILITIES_MINOR as UTILITIES_MINOR,
   DAILY_OVERHEAD_MINOR,
+  MAX_HOTEL_TIER,
+  RENOVATE_COST_MINOR,
+  RENOVATE_STAR_REQ,
+  SEGMENT_MIN_HOTEL_TIER,
+  CHARGEBACK_ACCOUNT,
 } from "./economy.js";
 import { hotelShell, buildScreenWorldView } from "./screen.js";
 import {
@@ -163,6 +168,26 @@ export const DESK_RADIUS_MM = 1500;
 const REPATH_BUDGET = 10;
 /** stuckTicks threshold that fires nav.stuck (roadmap risk 4 tripwire). */
 const STUCK_THRESHOLD = 40;
+/** W1 round-3 nav fix, fact 2: a `leaving` guest despawns on reaching this
+ *  Chebyshev-cell radius of the street door, not on landing on the exact
+ *  single door cell. Un-reaped bodies queued a few cells short of the
+ *  literal threshold (never arriving there under contention) is exactly
+ *  the mechanism that turned a delay into a permanent jam — see
+ *  docs/alpha-loop/reviews/W1.md round 3 §3.1. */
+const STREET_REGION_RADIUS_CELLS = 2;
+/** W1 round-3 nav fix, fact 2/3 continued: an overflow arrival relocated
+ *  off the exact spawn/departure cell still needs a hard population cap —
+ *  a handful of safe waiting cells absorbs the ordinary case, but alpha-
+ *  loop's sustained tier-2 demand can pile dozens of unslotted arrivals
+ *  onto that same small set, recreating a corridor jam one step removed
+ *  from the original one. Half a day (DAY_TICKS is 6000) of waiting with
+ *  no queue slot is far more patience than any of the pinned fixed-arrival
+ *  gates ever need (their overflow, if any, clears in a few hundred
+ *  ticks), so this never fires there — see the report for the measured
+ *  fact that it changes zero of their hashes. A guest that waits this long
+ *  and never gets in is turned away, legibly: `guest.left`, no charge, no
+ *  review — "the motel was full" is a real outcome the vision allows. */
+const OVERFLOW_PATIENCE_TICKS = 3000;
 
 /** 5 minutes/day at 20 Hz, 4 equal phases (spec system-order item 11). */
 const DAY_TICKS = 4 * 1500;
@@ -328,7 +353,13 @@ export interface ScenarioConfig {
 export const DEFAULTS: ScenarioConfig = {
   guestCount: 8,
   spawnTickMin: 100,
-  fraudRatePermille: 0,
+  // Cycle 3 lane 2 (CEO ruling, docs/alpha-loop/CYCLE-3.md "Lane 2"): the
+  // shipped app must actually spawn fraud. C2-W1's COO review found this at
+  // 0, so the desk beat never existed in the product; headless scenarios
+  // that care about a specific rate override it explicitly and are
+  // unaffected, but any scenario that spreads `...DEFAULTS` without its own
+  // `fraudRatePermille` (and spawns guests) now draws a real fraud stream.
+  fraudRatePermille: 200,
   fixture: "normal",
   upkeep: true,
   arrivals: "demand",
@@ -556,11 +587,12 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     arrivalsToday:
       config.arrivals === "demand"
         ? totalArrivals(
-            arrivalsForDay(demandRng, { ...DEFAULT_RATE_BY_TIER }, {}, 1, DEFAULT_REP_PERMILLE)
+            arrivalsForDay(demandRng, { ...DEFAULT_RATE_BY_TIER }, {}, 1, DEFAULT_REP_PERMILLE, 0)
           )
         : 0,
     arrivalsSpawned: 0,
     hireUnlocked: false,
+    tier: 0,
   });
 
   // -- Nav schedule singleton (the repath cursor — a component, not a
@@ -749,6 +781,104 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     found.sort((a, b) => (a.distSq - b.distSq) || (a.idx - b.idx));
     return found.length > 0 ? found.map((f) => f.cell) : [spawnCell];
   })();
+  /** W1 round-3 nav fix, fact 2/3, dedicated pool: `candidateWaitCells`
+   *  above is sized for a couple of STAFF candidates at a time and its
+   *  CANDIDATE_CLEARANCE_CELLS=3 buffer prunes most of the search radius
+   *  down to a handful of cells — reusing it directly for tier-2 alpha-
+   *  loop's dozens of simultaneous overflow arrivals just re-creates a
+   *  smaller jam on that smaller set (measured: `nav.stuck` dropped from
+   *  46 to 4, not to 0, when this shared the candidate pool). A wider
+   *  search and a lighter clearance (guests only need to clear the queue
+   *  and the street door, not each other) yields a much larger distinct
+   *  pool for the same safe zone.
+   *
+   *  W1 round-4 fix (docs/alpha-loop/reviews/W1.md ROUND 4 §4.1): a
+   *  clearance of 1 against `streetCell` only rejects cells AT the door,
+   *  which admits the door's immediate neighbours — the one-lane
+   *  threshold cells every departing guest must also cross. Those are
+   *  excluded by name below (a bigger clearance specifically against
+   *  `streetCell`, not just "distance 0"), and so is every DOOR portal
+   *  cell (`doorIndexByCell`, seed-pure and already built above) —
+   *  neither a doorway nor its threshold is ever a legal wait cell,
+   *  regardless of which seed's floor this runs against. */
+  /** W2 carry 3 (reviews/W1.md §6 carry 1): `candidateWaitCells` is built
+   *  first (above), so its cells are known here — excluded by index, in
+   *  the same shape as `doorIndexByCell` and the `streetCell` clearance
+   *  immediately below. Without this a STAFF candidate and an overflow
+   *  guest can be hand the same cell as their goal ("two agents, one goal
+   *  cell", the family round 3 closed for other pairings). Seed-pure and
+   *  deterministic: built from `candidateWaitCells` alone, iterated in the
+   *  same sorted array order it was produced in, no bare object-key
+   *  iteration, no `Rng`, no float. */
+  const candidateWaitCellIdx = new Set<number>(candidateWaitCells.map((c) => c.cz * grid.width + c.cx));
+  const overflowWaitCells: PathCell[] = (() => {
+    const QUEUE_CLEARANCE_CELLS = 1;
+    // Squared-distance clearance against the street door specifically:
+    // rejects the door cell itself AND its 8 immediate neighbours (every
+    // pair at Chebyshev distance 1 has squared Euclidean distance <= 2).
+    const STREET_DOOR_CLEARANCE_SQ = 3;
+    const spawnCell = cellOfMm(grid, floor.spawn.xMm, floor.spawn.zMm);
+    const found: { cell: PathCell; distSq: number; idx: number }[] = [];
+    const alwaysOpen = () => true;
+    const SEARCH = 16;
+    for (let dz = -SEARCH; dz <= SEARCH; dz++) {
+      for (let dx = -SEARCH; dx <= SEARCH; dx++) {
+        const cx = spawnCell.cx + dx;
+        const cz = spawnCell.cz + dz;
+        if (cx < 0 || cz < 0 || cx >= grid.width || cz >= grid.height) continue;
+        const idx = cz * grid.width + cx;
+        if (doorIndexByCell.has(idx)) continue; // never a doorway cell
+        if (candidateWaitCellIdx.has(idx)) continue; // never a candidate's wait cell
+        if (!isOccupiableCell(grid, cx, cz, alwaysOpen)) continue;
+        const sdx = cx - streetCell.cx;
+        const sdz = cz - streetCell.cz;
+        if (sdx * sdx + sdz * sdz <= STREET_DOOR_CLEARANCE_SQ) continue;
+        let clear = true;
+        for (const other of floor.desk.queueCells) {
+          const ox = cx - other.cx;
+          const oz = cz - other.cz;
+          if (ox * ox + oz * oz < QUEUE_CLEARANCE_CELLS * QUEUE_CLEARANCE_CELLS) {
+            clear = false;
+            break;
+          }
+        }
+        if (!clear) continue;
+        found.push({ cell: { cx, cz }, distSq: dx * dx + dz * dz, idx });
+      }
+    }
+    found.sort((a, b) => (a.distSq - b.distSq) || (a.idx - b.idx));
+    return found.length > 0 ? found.map((f) => f.cell) : [spawnCell];
+  })();
+  /** C2-W2 carry 3 non-vacuity check (reviews/W1.md §6 carry 1): a
+   *  deterministic, setup-time count of how many `overflowWaitCells`
+   *  survived without being excluded by `candidateWaitCellIdx` above --
+   *  computed straight from the two already-built pools (sorted array
+   *  order, no bare object-key iteration, no Rng, no float), so this is
+   *  exactly as seed-pure as the pools themselves. Emitted once, at tick
+   *  0, only when the count is nonzero -- alpha-loop.scenario.mjs asserts
+   *  zero `nav.sharedWaitCellPool` events, which is a direct structural
+   *  check of the fix rather than the indirect `nav.stuck` proxy. */
+  {
+    const sharedCount = overflowWaitCells.reduce(
+      (n, c) => (candidateWaitCellIdx.has(c.cz * grid.width + c.cx) ? n + 1 : n),
+      0
+    );
+    if (sharedCount > 0) {
+      sim.emit("nav.sharedWaitCellPool", { sharedCount });
+    }
+  }
+  /** W1 round-4 fix, blocking 4.1: allocate by RANK among the currently-
+   *  overflowing guests (the caller iterates `arriving` sorted ascending
+   *  by id, so a per-call counter is a deterministic rank — no `Rng`
+   *  involved), never by `entity % length`. Two ids that happen to differ
+   *  by exactly the pool size used to collide on one goal cell — the one
+   *  case where the sidestep is a guaranteed no-op, because
+   *  `findJitteredPath` ignores `avoidIdx` at the goal (round 3 fact 1's
+   *  documented hole). Rank guarantees distinctness among every guest
+   *  concurrently overflowing THIS tick, up to the pool size; beyond that,
+   *  the caller turns the guest away instead of reusing a cell. */
+  const overflowWaitCellForRank = (rank: number): PathCell => overflowWaitCells[rank]!;
+
   /** One wait cell PER candidate in a round: two candidates sharing a goal
    *  cell means the second yields against the first forever and never
    *  reaches "waiting" at all (observed, before this). */
@@ -911,7 +1041,21 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     }
     if (s.tick < hotel.nextGuestAtTick) return;
 
-    const archetype = pickArchetype(guestSpawnRng);
+    // Segment mix respects the tier gate, not just the daily headcount
+    // (BREAKDOWN §1.5, W1 review item 1): filter to the archetypes
+    // eligible at the CURRENT hotel tier before the single Rng.pick draw,
+    // so a business/leisure guest can never walk in the door of a hotel
+    // that, by the demand model, none of them booked. `Rng.pick` draws
+    // exactly one int regardless of list length, so this is the same
+    // draw count per spawn at every tier (H2 determinism rule 3) — at
+    // MAX_HOTEL_TIER every archetype is eligible and the list (and
+    // therefore the draw) is byte-identical to the ungated form. ARCHETYPES
+    // is a fixed literal array, not an object, so filtering it needs no
+    // extra sorted-key step to stay deterministic.
+    const eligibleArchetypes = ARCHETYPES.filter(
+      (a) => (SEGMENT_MIN_HOTEL_TIER[a.segment] ?? 0) <= hotel.tier,
+    );
+    const archetype = guestSpawnRng.pick(eligibleArchetypes.length > 0 ? eligibleArchetypes : ARCHETYPES);
     const name = pickGuestName(archetype, guestSpawnRng);
     const resCode = makeResCode(guestSpawnRng);
     const docNumber = makeDocNumber(guestSpawnRng);
@@ -970,6 +1114,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       waitedTicks: 0,
       brokenPropNights: 0,
       paidMinor: 0,
+      fraudMissed: false,
     });
     const spawnMm = cellMm(streetCell.cx, streetCell.cz);
     s.setComponent<Pos>(guestEntity, "pos", spawnMm);
@@ -993,7 +1138,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     // cell for that tick's yield checks. Keep that exactly.
     const spawnCtx = ctxFor(s);
     spawnCtx.occupancy.set(streetCell.cz * grid.width + streetCell.cx, guestEntity);
-    s.emit("guest.arrived", { guestEntity });
+    s.emit("guest.arrived", { guestEntity, segment: archetype.segment });
 
     const intervalMin = config.spawnIntervalMinTicks ?? 50;
     const intervalMax = config.spawnIntervalMaxTicks ?? 150;
@@ -1065,9 +1210,66 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (guest && guest.state === "arriving") arriving.push([entity, guest]);
     }
     arriving.sort((a, b) => a[0] - b[0]);
+    // W1 round-4 fix, blocking 4.1: rank among THIS tick's overflowing
+    // guests, incremented once per guest actually turned away from a
+    // queue slot below — deterministic because `arriving` is sorted
+    // ascending by id, so no `Rng` is needed for distinctness.
+    let overflowRank = 0;
+    const turnAway = (entity: EntityId): void => {
+      s.emit("guest.left", { guestEntity: entity, reason: "turned-away" });
+      for (const [docEntity, doc] of [...s.withComponent<DocumentComp>("document")]) {
+        if (doc.ownerEntity === entity) s.despawn(docEntity);
+      }
+      const overflowResEntity = findReservationFor(s, entity);
+      if (overflowResEntity !== undefined) s.despawn(overflowResEntity);
+      s.despawn(entity);
+    };
     for (const [entity, guest] of arriving) {
       const qLen = floor.desk.queueCells.length;
-      if (nextFreeSlot >= qLen) continue; // queue full; wait outside (retry next tick)
+      if (nextFreeSlot >= qLen) {
+        // W1 round-3 nav fix, fact 2/3: an arriving guest that cannot get
+        // a queue slot yet must NOT be left goaled at its own spawn cell
+        // (== the street door, == every `leaving` guest's despawn goal) —
+        // a guest standing on its own already-reached goal has an empty
+        // path and never moves or yields, silently becoming a permanent
+        // plug at the one cell every departure must also cross. Instead it
+        // waits on one of the vetted, distinct, street/queue-clear
+        // `overflowWaitCells`, allocated by RANK (never by id modulo — see
+        // that pool's own comment, W1 round-4 §4.1) so two guests
+        // overflowing on the SAME tick can never be handed the same goal
+        // cell. This changes WHERE an overflow guest stands, never WHETHER
+        // it eventually gets a slot, UNLESS either (a) its rank this tick
+        // exceeds the pool size — no safe cell left to hand out, turned
+        // away immediately, same as round-3's spec asked ("or they are
+        // turned away") — or (b) it has waited past
+        // OVERFLOW_PATIENCE_TICKS (see that constant): a population that
+        // never bounds can still recreate a jam on the waiting set one
+        // step removed from the original one. Both turn-aways are legible
+        // ("the motel is full") and use the same despawn path
+        // `cleanupSystem` uses, with a `reason` on the event so a
+        // turned-away guest is distinguishable from one who actually
+        // stayed (W1 round-4 §4.3). `patienceTicks` (Guest) is the
+        // existing, previously-unused field for the wait clock. No Rng
+        // draw; no stream change.
+        const rank = overflowRank;
+        overflowRank++;
+        if (rank >= overflowWaitCells.length) {
+          turnAway(entity);
+          continue;
+        }
+        const waitedSoFar = guest.patienceTicks + 1;
+        if (waitedSoFar > OVERFLOW_PATIENCE_TICKS) {
+          turnAway(entity);
+          continue;
+        }
+        s.setComponent<Guest>(entity, "guest", { ...guest, patienceTicks: waitedSoFar });
+        const waitCell = overflowWaitCellForRank(rank);
+        const agent = s.getComponent<NavAgent>(entity, "navAgent");
+        if (agent && (agent.goalCx !== waitCell.cx || agent.goalCz !== waitCell.cz)) {
+          setGoal(s, entity, waitCell.cx, waitCell.cz);
+        }
+        continue; // queue full; wait outside (retry next tick)
+      }
       const slot = floor.desk.queueCells[nextFreeSlot]!;
       s.setComponent<Guest>(entity, "guest", { ...guest, state: "queued", queueIndex: nextFreeSlot });
       setGoal(s, entity, slot.cx, slot.cz);
@@ -1374,25 +1576,51 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (targetIdx !== curIdx) {
         const occupant = occupancy.get(targetIdx);
         if (occupant !== undefined && occupant !== entity) {
+          // W1 round-3 nav fix, fact 1 (docs/alpha-loop/reviews/W1.md
+          // round 3 §3.1): an occupant standing exactly ON its own goal,
+          // with no queued step, WILL NEVER MOVE AGAIN — it is a wall, not
+          // a fellow traveller, whatever its entity id. Treating it as
+          // "might vacate because it's low-id" is exactly the case the
+          // original ordering couldn't see (a lower-id parked agent used
+          // to get an unconditional, unexamined "wait" with no sidestep
+          // attempt at all). A permanently-parked occupant now forces
+          // `willVacate = false` and — new — makes the sidestep branch
+          // reachable even against a LOWER id, because waiting forever
+          // behind a wall is wrong regardless of ordering.
+          const occAgent = s.getComponent<NavAgent>(occupant, "navAgent");
+          const occPos = s.getComponent<Pos>(occupant, "pos");
+          const occHasQueuedStep = !!occAgent && occAgent.pathIdx < occAgent.path.length;
+          const occCellNow = occPos ? cellOfMm(grid, occPos.xMm, occPos.zMm) : undefined;
+          const occPermanentlyParked =
+            !!occAgent &&
+            !occHasQueuedStep &&
+            !!occCellNow &&
+            occCellNow.cx === occAgent.goalCx &&
+            occCellNow.cz === occAgent.goalCz;
+
           let blocked: boolean;
-          if (occupant < entity) {
-            // Lower-id agent has priority: wait.
+          let sidestepEligible: boolean;
+          if (occupant < entity && !occPermanentlyParked) {
+            // Lower-id agent has priority: wait. Unchanged for the normal
+            // (moving-or-transiently-idle) case.
             blocked = true;
+            sidestepEligible = false;
           } else {
-            // Higher-id occupant: proceed only if it is itself about to
-            // move off that cell this tick (a lookahead at its own
-            // pending step — occupant hasn't been processed yet this
-            // pass, since it sorts after `entity`); otherwise sidestep by
-            // forcing a fresh repath next opportunity.
-            const occAgent = s.getComponent<NavAgent>(occupant, "navAgent");
-            const occPos = s.getComponent<Pos>(occupant, "pos");
+            // Higher-id occupant, OR a permanently-parked occupant of any
+            // id: proceed only if it is itself about to move off that cell
+            // this tick (a lookahead at its own pending step — occupant
+            // hasn't been processed yet this pass when higher-id, since it
+            // sorts after `entity`); otherwise sidestep by forcing a fresh
+            // repath next opportunity. A permanently-parked occupant's
+            // `willVacate` is false by construction (occHasQueuedStep is
+            // false for it), matching the comment above.
             let willVacate = false;
-            if (occAgent && occPos && occAgent.pathIdx < occAgent.path.length) {
-              const occCell = cellOfMm(grid, occPos.xMm, occPos.zMm);
-              const occTarget = occAgent.path[occAgent.pathIdx]!;
-              willVacate = !(occTarget.cx === occCell.cx && occTarget.cz === occCell.cz);
+            if (occHasQueuedStep && occCellNow) {
+              const occTarget = occAgent!.path[occAgent!.pathIdx]!;
+              willVacate = !(occTarget.cx === occCellNow.cx && occTarget.cz === occCellNow.cz);
             }
             blocked = !willVacate;
+            sidestepEligible = occupant > entity || occPermanentlyParked;
           }
           if (blocked) {
             // The yield rule actually firing. Emitted so a gate can PROVE
@@ -1407,19 +1635,21 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
             if (agent.stuckTicks < STUCK_THRESHOLD && newStuck >= STUCK_THRESHOLD) {
               s.emit("nav.stuck", { entity, cx: curCell.cx, cz: curCell.cz });
             }
-            // SIDESTEP branch: a higher-EntityId agent is sitting on the
-            // cell we want and is not about to leave it. Before H2a this
-            // cleared the path and let pathSystem recompute — which,
-            // because A* is blind to occupancy, produced the IDENTICAL
-            // route and re-blocked on the same cell every tick until
-            // `nav.stuck` fired. Dead code in every H1 gate (verified: the
-            // branch never once fired), but H2a parks a clerk at the desk
-            // work cell and a candidate in the lobby — permanently
-            // stationary, high-EntityId agents directly in guests' way —
-            // so it becomes live. Recording the blocked cell makes the
-            // repath an actual detour; `pathSystem` consumes and clears it
-            // in the same breath, so it is one-shot and cannot wedge.
-            const sidestep = occupant > entity;
+            // SIDESTEP branch: a higher-EntityId agent (or, as of the
+            // W1 round-3 nav fix, a permanently-parked occupant of ANY id)
+            // is sitting on the cell we want and is not about to leave it.
+            // Before H2a this cleared the path and let pathSystem
+            // recompute — which, because A* is blind to occupancy,
+            // produced the IDENTICAL route and re-blocked on the same cell
+            // every tick until `nav.stuck` fired. Dead code in every H1
+            // gate (verified: the branch never once fired), but H2a parks
+            // a clerk at the desk work cell and a candidate in the lobby —
+            // permanently stationary, high-EntityId agents directly in
+            // guests' way — so it becomes live. Recording the blocked cell
+            // makes the repath an actual detour; `pathSystem` consumes and
+            // clears it in the same breath, so it is one-shot and cannot
+            // wedge.
+            const sidestep = sidestepEligible;
             s.setComponent<NavAgent>(entity, "navAgent", {
               ...agent,
               stuckTicks: newStuck,
@@ -1455,10 +1685,29 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       if (dxMm !== 0 || dzMm !== 0) {
         s.setComponent<Yaw>(entity, "yaw", { mdeg: atan2Mdeg(dxMm, dzMm) });
       }
+      // W1 round-3 nav fix, fact 3 (docs/alpha-loop/reviews/W1.md round 3
+      // §3.1): every fresh path returned by findJitteredPath starts with
+      // the agent's OWN current cell (path[0] === from), so the very next
+      // moveSystem pass always "arrives" at that phantom self-target for
+      // free (targetIdx === curIdx here). Resetting stuckTicks to 0 on
+      // THAT step — unconditionally, as before — is what let a
+      // sidestep-forced repath buy the blocked agent a stuckTicks reset
+      // before it ever re-examined the REAL contested cell one index
+      // later: the mechanism that kept `nav.stuck` from firing for the
+      // agent actually causing the alpha-loop entrance jam ("stuckTicks
+      // is 0 the whole time"). A genuine arrival at a REAL target
+      // (targetIdx !== curIdx) still resets stuckTicks — that IS progress.
+      // A self-arrival is not; it carries stuckTicks forward instead of
+      // masking it. Deliberately NOT changed: pathIdx still starts a
+      // fresh path at 0 (unlike an earlier draft of this fix), so a
+      // freshly-spawned or freshly-repathed agent's tick-1 position is
+      // unchanged — `corridor-headon`'s `headonLog` snapshot, taken right
+      // after this system on the agents' first tick, depends on that.
+      const isSelfArrival = targetIdx === curIdx;
       s.setComponent<NavAgent>(entity, "navAgent", {
         ...agent,
         pathIdx: arrivingAtCell ? agent.pathIdx + 1 : agent.pathIdx,
-        stuckTicks: 0,
+        stuckTicks: isSelfArrival ? agent.stuckTicks : 0,
       });
       occupancy.delete(curIdx);
       occupancy.set(targetIdx, entity);
@@ -1719,7 +1968,13 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       // touched.
       const rate = hotel.rateByTier[String(room.tier)] ?? ROOM_RATE_MINOR[room.tier] ?? ROOM_RATE_MINOR[1]!;
       s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, cash: hotel.cash + rate });
-      s.setComponent<Guest>(res.guestEntity, "guest", { ...guest, paidMinor: rate });
+      // CYCLE-3 lane 5: `fraudMissed` is set HERE, at accept-despite-
+      // violation time (the single validated path), and read once at
+      // checkout by `reviewSystem` — never recomputed there, since the
+      // rule table / documents that produced `wasPlanted` are exactly
+      // this tick's ground truth and must not be re-evaluated later
+      // against a possibly-different rule set (stars can change mid-stay).
+      s.setComponent<Guest>(res.guestEntity, "guest", { ...guest, paidMinor: rate, fraudMissed: wasPlanted });
       const ledger = s.spawn();
       s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
         day: hotel.day,
@@ -1774,6 +2029,8 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         applyPricerRate(s, c.actor, c.payload as { tier: number; rateMinor: number });
       } else if (c.type === "mailbox.read") {
         applyMailRead(s, c.actor, c.payload as { mailEntity: EntityId });
+      } else if (c.type === "hotel.renovate") {
+        applyRenovate(s, c.actor, c.payload as Record<string, never>);
       }
     }
   }
@@ -1854,9 +2111,24 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       const view = buildScreenWorldView(s);
       const result = hotelShell.reduce(screenApp.state, input, view);
       const isTagged = result !== null && typeof result === "object" && "state" in result;
-      const nextState = isTagged ? (result as { state: typeof screenApp.state }).state : (result as typeof screenApp.state);
+      let nextState = isTagged ? (result as { state: typeof screenApp.state }).state : (result as typeof screenApp.state);
       const effect: ScreenEffect | undefined = isTagged ? (result as { effect?: ScreenEffect }).effect : undefined;
       const openAppChanged = nextState.openAppId !== screenApp.state.openAppId;
+      // C4-W1: `packages/surface-ui`'s `ScreenInput` union has always had a
+      // `{ kind: "open" }` case (types.ts), but the shell (also read-only
+      // for this lane) never sends it -- switching apps only ever changes
+      // `openAppId`, the child app's `reduce` never sees the switch. AUDIT's
+      // reveal-cadence ritual needs to know the tick it was opened at, so
+      // when a click just switched the open app, deliver ONE follow-up
+      // `{ kind: "open" }` reduce to the (now-focused) app via the SAME
+      // `hotelShell.reduce` entry point -- it routes purely off
+      // `nextState.openAppId`, so this reaches exactly the app that was
+      // just switched to, with no shell.ts change and no second command.
+      if (openAppChanged) {
+        const openResult = hotelShell.reduce(nextState, { kind: "open" }, view);
+        const openIsTagged = openResult !== null && typeof openResult === "object" && "state" in openResult;
+        nextState = openIsTagged ? (openResult as { state: typeof nextState }).state : (openResult as typeof nextState);
+      }
       const changed = nextState !== screenApp.state;
 
       s.setComponent<ScreenApp>(terminal, "screenApp", {
@@ -1882,6 +2154,8 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
           applyPricerRate(s, c.actor, effect.payload as { tier: number; rateMinor: number });
         } else if (effect.type === "mailbox.read") {
           applyMailRead(s, c.actor, effect.payload as { mailEntity: EntityId });
+        } else if (effect.type === "hotel.renovate") {
+          applyRenovate(s, c.actor, effect.payload as Record<string, never>);
         }
       }
     }
@@ -1965,7 +2239,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       s.emit("screen.denied", { reason: "no-such-tier" });
       return;
     }
-    if (!isValidRate(payload.rateMinor)) {
+    if (!isValidRateForHotelTier(payload.rateMinor, hotel.tier)) {
       s.emit("screen.denied", { reason: "rate-out-of-bounds" });
       return;
     }
@@ -1974,6 +2248,55 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       rateByTier: { ...hotel.rateByTier, [key]: payload.rateMinor },
     });
     s.emit("econ.rateSet", { tier: payload.tier, rateMinor: payload.rateMinor, actor });
+  }
+
+  /** The ONE validated renovate path (§4.4/BREAKDOWN §1.2): reached from
+   *  `staffSystem`'s command loop and from `screenSystem`'s effect switch,
+   *  the same shape as `applyPricerRate`/`applyDeskDecision`. The next tier
+   *  is always `hotel.tier + 1` — the payload carries no target, so there
+   *  is only one source of truth for "what tier am I renovating into". */
+  function applyRenovate(s: Sim, actor: string, _payload: Record<string, never>): void {
+    void _payload; // payload is always {} (BREAKDOWN §1.2); kept for call-site symmetry with applyPricerRate et al.
+    const actorEntity = findActorEntity(s, actor);
+    if (actorEntity === undefined) return;
+    const actorPos = s.getComponent<Pos>(actorEntity, "pos");
+    if (!actorPos) return;
+    const dxMm = floor.desk.xMm - actorPos.xMm;
+    const dzMm = floor.desk.zMm - actorPos.zMm;
+    if (dxMm * dxMm + dzMm * dzMm > DESK_RADIUS_MM * DESK_RADIUS_MM) {
+      s.emit("screen.denied", { reason: "out-of-range" });
+      return;
+    }
+
+    const hotel = s.getComponent<Hotel>(hotelEntity, "hotel");
+    if (!hotel) return;
+
+    if (hotel.tier >= MAX_HOTEL_TIER) {
+      s.emit("screen.denied", { reason: "max-tier" });
+      return;
+    }
+    const next = hotel.tier + 1;
+    if (hotel.stars < (RENOVATE_STAR_REQ[next] ?? 0)) {
+      s.emit("screen.denied", { reason: "stars-too-low" });
+      return;
+    }
+    const cost = RENOVATE_COST_MINOR[next] ?? 0;
+    if (hotel.cash < cost) {
+      s.emit("screen.denied", { reason: "insufficient-cash" });
+      return;
+    }
+
+    const from = hotel.tier;
+    s.setComponent<Hotel>(hotelEntity, "hotel", { ...hotel, tier: next, cash: hotel.cash - cost });
+    const ledger = s.spawn();
+    s.setComponent<LedgerEntry>(ledger, "ledgerEntry", {
+      day: hotel.day,
+      debitAccount: "expense:capex",
+      creditAccount: "cash",
+      amountMinor: cost,
+      memo: `renovation to tier ${next}`,
+    });
+    s.emit("hotel.renovated", { from, to: next, costMinor: cost, day: hotel.day, actor });
   }
 
   function applyMailRead(s: Sim, actor: string, payload: { mailEntity: EntityId }): void {
@@ -2298,6 +2621,58 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       const guestEntity = (event.payload as { guestEntity: EntityId }).guestEntity;
       const guest = s.getComponent<Guest>(guestEntity, "guest");
       if (!guest) continue;
+
+      // CYCLE-3 lane 5 (CEO ruling, docs/alpha-loop/CYCLE-3.md): a MISSED
+      // fraud (accepted despite a real rules violation) is a SKIP, not a
+      // normal stay. It pays nothing -- the check-in charge is reversed
+      // via a CHARGEBACK_ACCOUNT ledger line, symmetric with the
+      // "cash / revenue:rooms" pair applyDeskDecision posted at check-in
+      // -- and files no review (no guest.reviewed, no guest.complained,
+      // no complaint mail: this guest was never a real customer). The
+      // hotel still takes a reputation hit "equivalent to one 1-star
+      // review" in that segment: reputationBySegment (reviews.ts) reads
+      // every Review component in the rolling window by (day, segment,
+      // score) alone, with no notion of who or why, so a synthetic
+      // score-1 Review row produces EXACTLY that effect through the
+      // existing math -- no new reputation code needed, and no risk of
+      // it drifting from what a real 1-star review would do. A CAUGHT
+      // fraud (denied at the desk) never sets `fraudMissed` and never
+      // reaches this branch at all -- it stays exactly as it was.
+      if (guest.fraudMissed) {
+        if (guest.paidMinor > 0) {
+          // Re-fetch live: multiple fraud chargebacks can land in the
+          // SAME tick (this loop iterates every guest.checkedOut event
+          // since s.tick), and the outer `hotel` const captured at
+          // function entry would go stale after the first one, losing
+          // every chargeback after it (write-through demands the LATEST
+          // component, never a value carried across a setComponent this
+          // same pass already made).
+          const liveHotel = s.getComponent<Hotel>(hotelEntity, "hotel") ?? hotel;
+          s.setComponent<Hotel>(hotelEntity, "hotel", { ...liveHotel, cash: liveHotel.cash - guest.paidMinor });
+          const chargeback = s.spawn();
+          s.setComponent<LedgerEntry>(chargeback, "ledgerEntry", {
+            day: hotel.day,
+            debitAccount: CHARGEBACK_ACCOUNT,
+            creditAccount: "cash",
+            amountMinor: guest.paidMinor,
+            memo: `fraud chargeback guest ${guestEntity}`,
+          });
+        }
+        const fraudReviewEntity = s.spawn();
+        s.setComponent<Review>(fraudReviewEntity, "review", {
+          day: hotel.day,
+          segment: guest.segment,
+          score: 1,
+          factors: ["fraud-missed"],
+        });
+        s.emit("desk.fraudChargeback", {
+          guestEntity,
+          segment: guest.segment,
+          amountMinor: guest.paidMinor,
+        });
+        continue;
+      }
+
       const tierBaseline = ROOM_RATE_MINOR[1]!;
       const outcome = scoreReview({
         waitedTicks: guest.waitedTicks,
@@ -2453,10 +2828,16 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
     if (newDay !== hotel.day) {
       let revenueMinor = 0;
       let expenseMinor = 0;
+      // CYCLE-3 lane 5: broken out by name (not just folded into
+      // expenseMinor, which it already is -- CHARGEBACK_ACCOUNT is
+      // expense:-prefixed) so the audit/ledger screens can print a
+      // legible "fraud loss" line instead of an anonymous total.
+      let fraudLossMinor = 0;
       for (const [, entry] of s.withComponent<LedgerEntry>("ledgerEntry")) {
         if (entry.day !== hotel.day) continue;
         if (entry.creditAccount.startsWith("revenue:")) revenueMinor += entry.amountMinor;
         if (entry.debitAccount.startsWith("expense:")) expenseMinor += entry.amountMinor;
+        if (entry.debitAccount === CHARGEBACK_ACCOUNT) fraudLossMinor += entry.amountMinor;
       }
 
       // Reputation and stars: RECOMPUTED from the rolling review window,
@@ -2475,7 +2856,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
       // here, at generation time (H2 determinism rule 3).
       const arrivalsBySegment =
         config.arrivals === "demand"
-          ? arrivalsForDay(demandRng, hotel.rateByTier, repBySegment, stars, DEFAULT_REP_PERMILLE)
+          ? arrivalsForDay(demandRng, hotel.rateByTier, repBySegment, stars, DEFAULT_REP_PERMILLE, hotel.tier)
           : {};
       const forecastArrivals = config.arrivals === "demand" ? totalArrivals(arrivalsBySegment) : 0;
 
@@ -2508,6 +2889,7 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
         day: hotel.day,
         revenueMinor,
         expenseMinor,
+        fraudLossMinor,
         closingCashMinor: hotel.cash,
         stars,
         repBySegment,
@@ -2542,18 +2924,42 @@ export function setupWithConfig(sim: Sim, config: ScenarioConfig): void {
   // 12. cleanupSystem — despawn guests in "leaving" state that reached the
   //     street spawn cell (guest, their documents, and the decided
   //     reservation), via core's despawn.
+  /** W1 round-3 nav fix, fact 2: true once `entity` has reached the street
+   *  door exactly (the unchanged fast path, so every scenario whose timing
+   *  already depends on exact-cell arrival keeps that timing), OR has
+   *  reached the street REGION around it (Chebyshev cell distance) AND is
+   *  demonstrably stuck there (`stuckTicks >= STUCK_THRESHOLD`, the same
+   *  bar `nav.stuck` itself uses). The region leniency is deliberately
+   *  gated on genuine stuckness, not mere proximity: a guest that is
+   *  simply walking past on its way elsewhere must never be swept up early
+   *  just because it is momentarily near the door. Un-reaped bodies stuck
+   *  a few cells short of the literal threshold under contention is
+   *  exactly the mechanism that turned a delay into a permanent jam. */
+  function reachedStreetRegion(s: Sim, entity: EntityId): boolean {
+    const pos = s.getComponent<Pos>(entity, "pos");
+    if (!pos) return false;
+    const cur = cellOfMm(grid, pos.xMm, pos.zMm);
+    if (cur.cx === streetCell.cx && cur.cz === streetCell.cz) return true;
+    const withinRegion =
+      Math.abs(cur.cx - streetCell.cx) <= STREET_REGION_RADIUS_CELLS &&
+      Math.abs(cur.cz - streetCell.cz) <= STREET_REGION_RADIUS_CELLS;
+    if (!withinRegion) return false;
+    const agent = s.getComponent<NavAgent>(entity, "navAgent");
+    return !!agent && agent.stuckTicks >= STUCK_THRESHOLD;
+  }
+
   function cleanupSystem(s: Sim): void {
     const toDespawn: EntityId[] = [];
     for (const [entity, guest] of s.withComponent<Guest>("guest")) {
       if (guest.state !== "leaving") continue;
-      if (!hasArrived(s, entity)) continue;
+      if (!reachedStreetRegion(s, entity)) continue;
       toDespawn.push(entity);
     }
     // Rejected candidates walk out the same street door guests do, and
     // take their printed resume with them.
     for (const [entity, candidate] of [...s.withComponent<Candidate>("candidate")]) {
       if (candidate.state !== "rejected") continue;
-      if (!hasArrived(s, entity)) continue;
+      if (!reachedStreetRegion(s, entity)) continue;
       if (candidate.resumeEntity !== 0) s.despawn(candidate.resumeEntity);
       s.despawn(entity);
       s.emit("staff.candidateLeft", { candidateEntity: entity });
@@ -2772,6 +3178,10 @@ export function pricerSetRateCommand(
 
 export function mailboxReadCommand(tick: number, mailEntity: EntityId, actor: string = PLAYER_ACTOR): Command {
   return { tick, actor, type: "mailbox.read", payload: { mailEntity } };
+}
+
+export function renovateCommand(tick: number, actor: string = PLAYER_ACTOR): Command {
+  return { tick, actor, type: "hotel.renovate", payload: {} };
 }
 
 export function deskDecisionCommand(

@@ -39,21 +39,24 @@
 // and present in the replay bundle) exactly like any other player command.
 //
 // DERIVATION OF THE COMMITTED LITERALS (seed hotel-h1-save-1)
-// A throwaway script (node, importing the built apps/hotel/dist-game/sim/
-// game.js and packages/core/dist, run from outside this repo's source
-// tree) constructed a real Sim for this seed, called setup(), and stepped
-// it 100 ticks while submitting a forward "move" command every tick
-// (mirroring a held KeyW), printing player pos + stateHash() at several
-// ticks:
-//   spawn: { xMm: 5875, zMm: 3375 }, yaw 0
-//   tick 1:  { xMm: 5875, zMm: 3575 }              hash 4071970922
-//   tick 10: { xMm: 5875, zMm: 4375 } (pinned)      hash 3401183333
-//   tick 40: { xMm: 5875, zMm: 4375 }               hash 3308430067
-//   tick 90: { xMm: 5875, zMm: 4375 }               hash 1766358549
-// The player is pinned against a wall by ~tick 10 (due-north spawn facing,
-// yaw 0, straight into the lobby's interior), so WALK_TICKS below is
-// intentionally generous (30, then 42-80) rather than tuned to a moving
-// endpoint -- what matters for this gate is NOT where the player ends up,
+// Cycle 3 re-derivation (lobby deepened, see fps-look-interact's header):
+// apps/hotel/scripts/derive-walk.mjs's underlying method (Sim + moveCommand
+// replayed through the real compiled setup()) re-run for this seed, 100
+// ticks of a forward "move" command every tick (mirroring a held KeyW),
+// printing player pos + stateHash() per tick:
+//   spawn: { xMm: 5875, zMm: 5075 } (post-move tick 1 pos; pre-move z is
+//     4875), yaw 0
+//   tick 1:  { xMm: 5875, zMm: 5075 }
+//   tick 13: { xMm: 5875, zMm: 7275 } (pinned -- z stops changing here)
+//   tick 40: { xMm: 5875, zMm: 7275 }               hash 1197426163
+//   tick 90: { xMm: 5875, zMm: 7275 }
+// The player is pinned against a wall by tick 13 (due-north spawn facing,
+// yaw 0, straight into the now-deeper lobby's interior -- later than the
+// old ~tick 10, since the lobby is now 20-24 cells deep instead of 9-12,
+// but still comfortably inside WALK_TICKS_1=30 below with no constant
+// needing to change), so WALK_TICKS below is intentionally generous (30,
+// then 42-80) rather than tuned to a moving endpoint -- what matters for
+// this gate is NOT where the player ends up,
 // it's that the world (guests spawning/queueing/walking under
 // guestSpawnSystem/guestBrainSystem/pathSystem, none of which need player
 // input) keeps changing stateHash() every single tick sampled above, so a

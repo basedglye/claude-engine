@@ -1,7 +1,7 @@
 {
   "name": "@claude-engine/hotel",
   "version": "0.0.1",
-  "description": "ClaudeEngine hotel game — Phase H0 'Walk the Lobby'.",
+  "description": "ClaudeEngine hotel game — GRAND FOYER.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -9,7 +9,10 @@
     "dev": "vite",
     "build:game": "tsc -p tsconfig.game.json",
     "build": "npm run build:game && vite build",
-    "test": "npm run build:game --silent && node scripts/test.mjs"
+    "test": "npm run build:game --silent && node scripts/test.mjs",
+    "assets:fetch": "node scripts/fetch-assets.mjs",
+    "build:artifact": "node scripts/build-artifact.mjs",
+    "build:hosted": "npm run build && node scripts/build-artifact.mjs --copy-to-dist"
   },
   "dependencies": {
     "@claude-engine/assets": "*",

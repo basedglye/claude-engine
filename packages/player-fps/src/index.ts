@@ -232,7 +232,15 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
   // -- Real DOM-facing normalization (no logic beyond unwrapping events) --
 
   function onLook(dxPx: number, dyPx: number): void {
-    applyLook(dxPx, dyPx);
+    // Screen-space -> yaw-space handedness. A positive sim yaw delta is a
+    // LEFT turn (heading (sin yaw, cos yaw) in a right-handed Y-up world
+    // rotates from +Z toward +X, which is on the left when facing +Z), while
+    // a positive `movementX` is the mouse moving RIGHT. Negate here, in the
+    // DOM normalizer, so a real mouse turns the way every FPS does; the
+    // synthetic `pointer.look(dx)` keeps its yaw-space meaning and every
+    // browser gate's hand-derived look script stays valid. Reported by a
+    // human driving the build, 2026-09-02 ("move mouse left, look right").
+    applyLook(-dxPx, dyPx);
   }
   function onClick(): void {
     applyClick();
@@ -374,8 +382,11 @@ export function createFpsController(opts: FpsControllerOptions): FpsController {
     let strafeMilli = 0;
     if (heldKeys.has("KeyW")) forwardMilli += 1000;
     if (heldKeys.has("KeyS")) forwardMilli -= 1000;
-    if (heldKeys.has("KeyD")) strafeMilli += 1000;
-    if (heldKeys.has("KeyA")) strafeMilli -= 1000;
+    // Screen-right handedness: at yaw 0 the camera looks +Z, and screen-right
+    // is -X, so D must send negative strafe. (The companion of the negated
+    // mouse-X fix; measured live 2026-09-03 — D was moving screen-left.)
+    if (heldKeys.has("KeyD")) strafeMilli -= 1000;
+    if (heldKeys.has("KeyA")) strafeMilli += 1000;
     if (forwardMilli !== 0 || strafeMilli !== 0) {
       submit(opts.makeMove(world.tick + 1, forwardMilli, strafeMilli));
     }

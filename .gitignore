@@ -8,3 +8,7 @@ dist-server/
 coverage/
 harness-out/
 artifacts/
+
+# GRAND FOYER CC0 asset payload (fetched by apps/hotel/scripts/fetch-assets.mjs; manifest is committed)
+apps/hotel/public/assets/
+apps/hotel/dist-artifact/

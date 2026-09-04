@@ -48,10 +48,25 @@ export interface ScreenLedgerView {
   day: number;
   revenueMinor: number;
   expenseMinor: number;
+  /** CYCLE-3 lane 5: today's chargebacks so far, from missed-fraud
+   *  checkouts. expense:-prefixed (CHARGEBACK_ACCOUNT, economy.ts), so
+   *  it is already inside expenseMinor above — broken out here purely
+   *  for a legible "fraud loss" line, never a second source of truth. */
+  fraudLossMinor: number;
   closingCashMinor: number;
   cashMinor: number;
   hireUnlocked: boolean;
   hireThresholdMinor: number;
+  /** Hotel renovation tier, 0..2. */
+  hotelTier: number;
+  /** Cost of the NEXT renovation, or 0 at max tier. */
+  renovateCostMinor: number;
+  /** Stars required for the next renovation, or 0 at max tier. */
+  renovateStarReq: number;
+  /** True when pressing RENOVATE at the desk would actually succeed
+   *  (tier, stars and cash all satisfied). Proximity is NOT folded in —
+   *  the view has no actor. */
+  renovateAvailable: boolean;
 }
 
 /** One past day's closed figures, for LEDGER's paging. Ascending by day. */
@@ -59,6 +74,9 @@ export interface ScreenLedgerDayView {
   day: number;
   revenueMinor: number;
   expenseMinor: number;
+  /** CYCLE-3 lane 5: that closed day's chargebacks (see ScreenLedgerView's
+   *  field of the same name). */
+  fraudLossMinor: number;
 }
 
 export interface ScreenObjectiveView {

@@ -26,6 +26,68 @@ export function isValidRate(rateMinor: number): boolean {
   return rateMinor % RATE_STEP_MINOR === 0;
 }
 
+// -- Hotel (renovation) tier --------------------------------------------
+
+/** Highest reachable hotel tier this phase: 0 Motel, 1 Hotel, 2 Grand
+ *  Foyer. */
+export const MAX_HOTEL_TIER = 2;
+
+/** Indexed by TARGET hotel tier; index 0 unused (you never renovate to 0).
+ *  $800.00 then $1,500.00 — tuned 2026-09-02 (COO) against the
+ *  `alpha-loop` bot so tier 1 lands on day 3 and tier 2 on day 7 of a
+ *  14-day run, leaving a week of headroom rather than a cliff. */
+export const RENOVATE_COST_MINOR: readonly number[] = [0, 80_000, 150_000];
+
+/** Stars required to renovate INTO that tier. MAX_STARS is 2 this phase
+ *  (reviews.ts), so 2 is the ceiling and cash is the real gate. */
+export const RENOVATE_STAR_REQ: readonly number[] = [0, 2, 2];
+
+/** Lowest hotel tier at which a segment books at all. CEO ruling
+ *  2026-09-02: the motel must be a viable if grim business, so tier 0
+ *  books the two cheap segments and only the premium one waits for the
+ *  Grand Foyer. Shapes BOTH the arrival quota (`arrivalsForDay`, which
+ *  segment gets ANY RNG draws at all) and the arrival mix
+ *  (`guestSpawnSystem`'s archetype filter, game.ts, which segment an
+ *  actual spawned guest can BE) — closed in that second half by
+ *  docs/alpha-loop/reviews/W1.md round 2 item 1. */
+export const SEGMENT_MIN_HOTEL_TIER: Readonly<Record<string, number>> = {
+  family: 0,
+  leisure: 0,
+  business: 2,
+};
+
+/** Multiplies the capture rate, indexed by hotel tier. Tier 0 is
+ *  deliberately unpenalised (1000): the tier reward is the multiplier
+ *  ABOVE it, not a punishment below it — a 700 here starved the motel
+ *  into insolvency and neither the hire nor a renovation was reachable. */
+export const TIER_DEMAND_MULT_PERMILLE: readonly number[] = [1000, 1300, 1600];
+
+/** PRICER's ceiling, indexed by hotel tier. Each ceiling sits at or just
+ *  above the LOWEST willingness among the segments that book at that tier,
+ *  because `arrivalsForDay` prices every segment against the cheapest room
+ *  rate on offer: a ceiling above that point lets a rate-maximising player
+ *  (or bot) price the whole hotel out of its own market in one day. The
+ *  original 12,000/25,000 did exactly that and collapsed demand to zero
+ *  the day after the first renovation. */
+export const MAX_RATE_BY_TIER_MINOR: readonly number[] = [6_000, 6_500, 7_500];
+
+function clampHotelTier(hotelTier: number): number {
+  if (hotelTier < 0) return 0;
+  if (hotelTier > MAX_HOTEL_TIER) return MAX_HOTEL_TIER;
+  return hotelTier;
+}
+
+export function maxRateForHotelTier(hotelTier: number): number {
+  const tier = clampHotelTier(hotelTier);
+  return MAX_RATE_BY_TIER_MINOR[tier] ?? MAX_RATE_MINOR;
+}
+
+export function isValidRateForHotelTier(rateMinor: number, hotelTier: number): boolean {
+  if (!Number.isInteger(rateMinor)) return false;
+  if (rateMinor < MIN_RATE_MINOR || rateMinor > maxRateForHotelTier(hotelTier)) return false;
+  return rateMinor % RATE_STEP_MINOR === 0;
+}
+
 // -- The hire threshold ------------------------------------------------
 
 /** $600.00. Diegetic and printed: LEDGER shows the locked STAFF BUDGET
@@ -67,6 +129,7 @@ export function capturePermille(
   willingnessMinor: number,
   reputationPermille: number,
   stars: number,
+  tierMultPermille = 1000,
 ): number {
   if (willingnessMinor <= 0) return 0;
   // priceTerm: 1000 at exactly the willingness price, more below it, less
@@ -85,6 +148,8 @@ export function capturePermille(
   let capture = Math.trunc((priceTerm * reputationTerm) / 1000);
   capture = Math.trunc((capture * starBonus) / 1000);
   capture = Math.trunc(capture / 2);
+  // Tier multiplier applies before the final clamp (§4.3).
+  capture = Math.trunc((capture * tierMultPermille) / 1000);
   if (capture < 0) capture = 0;
   if (capture > 1000) capture = 1000;
   return capture;
@@ -103,6 +168,7 @@ export function arrivalsForDay(
   repBySegment: Record<string, number>,
   stars: number,
   defaultReputationPermille: number,
+  hotelTier: number,
 ): Record<string, number> {
   // Segments book against the cheapest tier on offer — a coarse model, and
   // the honest one for a hotel with two tiers and no per-tier preference.
@@ -114,10 +180,18 @@ export function arrivalsForDay(
 
   const out: Record<string, number> = {};
   for (const segment of Object.keys(SEGMENT_POOL).sort()) {
+    // Below its minimum hotel tier, the segment neither books nor draws
+    // RNG — the stream must stay deterministic and skip in lockstep with
+    // which segments are even eligible.
+    if ((SEGMENT_MIN_HOTEL_TIER[segment] ?? 0) > hotelTier) {
+      out[segment] = 0;
+      continue;
+    }
     const pool = SEGMENT_POOL[segment]!;
     const willingness = SEGMENT_WILLINGNESS_MINOR[segment] ?? MAX_RATE_MINOR;
     const reputation = repBySegment[segment] ?? defaultReputationPermille;
-    const capture = capturePermille(rate, willingness, reputation, stars);
+    const tierMult = TIER_DEMAND_MULT_PERMILLE[clampHotelTier(hotelTier)] ?? 1000;
+    const capture = capturePermille(rate, willingness, reputation, stars, tierMult);
     let count = 0;
     for (let i = 0; i < pool; i++) {
       if (rng.int(0, 999) < capture) count++;
@@ -202,3 +276,18 @@ export const DAILY_UTILITIES_MINOR = 1500;
 /** The owner's own draw. Wages for HIRED staff are additional and come from
  *  the `staffed` components. */
 export const DAILY_OVERHEAD_MINOR = 3000;
+
+// -- Fraud chargeback (CYCLE-3 lane 5, CEO ruling) ----------------------
+
+/** The ledger account a missed-fraud guest's check-in charge is reversed
+ *  through at checkout: debitAccount CHARGEBACK_ACCOUNT, creditAccount
+ *  "cash", amountMinor = what they paid -- the same double-entry shape
+ *  every other ledger line in this file's callers uses. expense:-prefixed
+ *  on purpose, exactly like expense:capex: the day-close sweep
+ *  (dayPhaseSystem, game.ts) already folds every expense:-prefixed debit
+ *  into expenseMinor with no per-account allowlist, so a missed fraud's
+ *  cost shows up in the nightly total the instant this account exists --
+ *  no separate wiring needed there. The audit ALSO breaks this one
+ *  account out by name (fraudLossMinor) so it is legible as its own line,
+ *  not just folded anonymously into "expenses". */
+export const CHARGEBACK_ACCOUNT = "expense:chargeback";

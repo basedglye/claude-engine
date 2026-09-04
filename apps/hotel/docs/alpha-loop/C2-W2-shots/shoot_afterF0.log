@@ -1,0 +1,5 @@
+shot spawn-yaw0 triangles 9884
+shot spawn-yaw90 triangles 9866
+shot spawn-yaw180 triangles 9028
+shot spawn-yaw270 triangles 10148
+shot corridor-fly triangles 11084

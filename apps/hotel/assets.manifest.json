@@ -1,0 +1,250 @@
+{
+  "textures": {
+    "lobby-floor": {
+      "dir": "lobby-floor",
+      "tileM": 2,
+      "source": "https://ambientcg.com/view?id=Marble014",
+      "license": "CC0 (ambientCG)"
+    },
+    "lobby-floor-border": {
+      "dir": "lobby-floor-border",
+      "tileM": 1,
+      "source": "https://ambientcg.com/view?id=Marble006",
+      "license": "CC0 (ambientCG)"
+    },
+    "corridor-carpet": {
+      "dir": "corridor-carpet",
+      "tileM": 1.5,
+      "source": "https://ambientcg.com/view?id=Carpet012",
+      "license": "CC0 (ambientCG)"
+    },
+    "room-carpet": {
+      "dir": "room-carpet",
+      "tileM": 1,
+      "source": "https://ambientcg.com/view?id=Carpet016",
+      "license": "CC0 (ambientCG)"
+    },
+    "wall-lobby": {
+      "dir": "wall-lobby",
+      "tileM": 2,
+      "source": "https://ambientcg.com/view?id=PaintedPlaster017",
+      "license": "CC0 (ambientCG)"
+    },
+    "wall-paper": {
+      "dir": "wall-paper",
+      "tileM": 1.5,
+      "source": "https://ambientcg.com/view?id=Wallpaper001A",
+      "license": "CC0 (ambientCG)"
+    },
+    "wall-corridor": {
+      "dir": "wall-corridor",
+      "tileM": 2,
+      "source": "https://ambientcg.com/view?id=Plaster002",
+      "license": "CC0 (ambientCG)"
+    },
+    "ceiling": {
+      "dir": "ceiling",
+      "tileM": 2,
+      "source": "https://ambientcg.com/view?id=Plaster001",
+      "license": "CC0 (ambientCG)"
+    },
+    "wood-trim": {
+      "dir": "wood-trim",
+      "tileM": 1,
+      "source": "https://ambientcg.com/view?id=Wood051",
+      "license": "CC0 (ambientCG)"
+    },
+    "wood-door": {
+      "dir": "wood-door",
+      "tileM": 1,
+      "source": "https://ambientcg.com/view?id=Wood094",
+      "license": "CC0 (ambientCG)"
+    },
+    "desk-top": {
+      "dir": "desk-top",
+      "tileM": 1,
+      "source": "https://ambientcg.com/view?id=Granite002A",
+      "license": "CC0 (ambientCG)"
+    },
+    "street": {
+      "dir": "street",
+      "tileM": 2,
+      "source": "https://ambientcg.com/view?id=PavingStones150",
+      "license": "CC0 (ambientCG)"
+    },
+    "facade": {
+      "dir": "facade",
+      "tileM": 2,
+      "source": "https://ambientcg.com/view?id=Bricks100",
+      "license": "CC0 (ambientCG)"
+    },
+    "fabric": {
+      "dir": "fabric",
+      "tileM": 0.5,
+      "source": "https://ambientcg.com/view?id=Fabric030",
+      "license": "CC0 (ambientCG)"
+    },
+    "leather": {
+      "dir": "leather",
+      "tileM": 0.5,
+      "source": "https://ambientcg.com/view?id=Leather037",
+      "license": "CC0 (ambientCG)"
+    },
+    "metal-brass": {
+      "dir": "metal-brass",
+      "tileM": 1,
+      "source": "https://ambientcg.com/view?id=Metal042A",
+      "license": "CC0 (ambientCG)"
+    }
+  },
+  "models": {
+    "bed-double": {
+      "path": "models/bed-double/bed-double.gltf",
+      "source": "https://polyhaven.com/a/GothicBed_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "nightstand": {
+      "path": "models/nightstand/nightstand.gltf",
+      "source": "https://polyhaven.com/a/ClassicNightstand_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "lamp-table": {
+      "path": "models/lamp-table/lamp-table.gltf",
+      "source": "https://polyhaven.com/a/desk_lamp_arm_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "lamp-floor": {
+      "path": "models/lamp-floor.glb",
+      "source": "https://kenney.nl/assets/furniture-kit",
+      "license": "CC0 (Kenney Furniture Kit)"
+    },
+    "tv": {
+      "path": "models/tv.glb",
+      "source": "https://kenney.nl/assets/furniture-kit",
+      "license": "CC0 (Kenney Furniture Kit)"
+    },
+    "sofa": {
+      "path": "models/sofa/sofa.gltf",
+      "source": "https://polyhaven.com/a/Sofa_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "armchair": {
+      "path": "models/armchair/armchair.gltf",
+      "source": "https://polyhaven.com/a/ArmChair_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "coffee-table": {
+      "path": "models/coffee-table/coffee-table.gltf",
+      "source": "https://polyhaven.com/a/CoffeeTable_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "side-table": {
+      "path": "models/side-table/side-table.gltf",
+      "source": "https://polyhaven.com/a/side_table_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "plant": {
+      "path": "models/plant/plant.gltf",
+      "source": "https://polyhaven.com/a/potted_plant_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "desk": {
+      "path": "models/desk/desk.gltf",
+      "source": "https://polyhaven.com/a/metal_office_desk",
+      "license": "CC0 (Poly Haven)"
+    },
+    "chair": {
+      "path": "models/chair/chair.gltf",
+      "source": "https://polyhaven.com/a/WoodenChair_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "wardrobe": {
+      "path": "models/wardrobe/wardrobe.gltf",
+      "source": "https://polyhaven.com/a/painted_wooden_cabinet",
+      "license": "CC0 (Poly Haven)"
+    },
+    "painting": {
+      "path": "models/painting/painting.gltf",
+      "source": "https://polyhaven.com/a/fancy_picture_frame_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "luggage": {
+      "path": "models/luggage/luggage.gltf",
+      "source": "https://polyhaven.com/a/vintage_suitcase",
+      "license": "CC0 (Poly Haven)"
+    },
+    "chandelier": {
+      "path": "models/chandelier/chandelier.gltf",
+      "source": "https://polyhaven.com/a/Chandelier_01",
+      "license": "CC0 (Poly Haven)"
+    },
+    "wall-sconce": {
+      "path": "models/wall-sconce/wall-sconce.gltf",
+      "source": "https://polyhaven.com/a/industrial_wall_sconce",
+      "license": "CC0 (Poly Haven)"
+    },
+    "minifridge": {
+      "path": "models/minifridge.glb",
+      "source": "https://kenney.nl/assets/furniture-kit",
+      "license": "CC0 (Kenney Furniture Kit)"
+    },
+    "phone": {
+      "path": "models/phone/phone.gltf",
+      "source": "https://polyhaven.com/a/vintage_telephone_wall_clock",
+      "license": "CC0 (Poly Haven)"
+    },
+    "cart": {
+      "path": "models/cart/cart.gltf",
+      "source": "https://polyhaven.com/a/industrial_storage_cart",
+      "license": "CC0 (Poly Haven)"
+    },
+    "bin": {
+      "path": "models/bin/bin.gltf",
+      "source": "https://polyhaven.com/a/metal_trash_can",
+      "license": "CC0 (Poly Haven)"
+    }
+  },
+  "characters": {
+    "guest-c": {
+      "path": "characters/guest-c.glb",
+      "source": "https://kenney.nl/assets/blocky-characters",
+      "license": "CC0 (Kenney Blocky Characters 2.0)",
+      "clips": {
+        "idle": "idle",
+        "walk": "walk"
+      }
+    },
+    "guest-d": {
+      "path": "characters/guest-d.glb",
+      "source": "https://kenney.nl/assets/blocky-characters",
+      "license": "CC0 (Kenney Blocky Characters 2.0)",
+      "clips": {
+        "idle": "idle",
+        "walk": "walk"
+      }
+    },
+    "guest-e": {
+      "path": "characters/guest-e.glb",
+      "source": "https://kenney.nl/assets/blocky-characters",
+      "license": "CC0 (Kenney Blocky Characters 2.0)",
+      "clips": {
+        "idle": "idle",
+        "walk": "walk"
+      }
+    },
+    "guest-f": {
+      "path": "characters/guest-f.glb",
+      "source": "https://kenney.nl/assets/blocky-characters",
+      "license": "CC0 (Kenney Blocky Characters 2.0)",
+      "clips": {
+        "idle": "idle",
+        "walk": "walk"
+      }
+    }
+  },
+  "env": {
+    "path": "env/lobby.hdr",
+    "source": "https://polyhaven.com/a/hotel_room",
+    "license": "CC0 (Poly Haven)"
+  }
+}

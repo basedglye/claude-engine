@@ -171,7 +171,7 @@ live server on it looks exactly like a stale bundle.
    restore — and say so. Two gates in H2a were vacuous when first written
    and only perturbation showed it.
 8. **Constant command counts** on browser gates (currently
-   `fps-look-interact` 12, `reserva-readability` 20, `save-restore` 69,
+   `fps-look-interact` 16, `reserva-readability` 21, `save-restore` 69, (re-pinned 2026-09-03 for the 20-24-cell lobby with ≥200 mm interact margins; were 12 / 20)
    `demo-visual` 18). A green streak over a varying count is not a pass.
 
 ## Traps already hit — each with its lesson

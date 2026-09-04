@@ -5,6 +5,7 @@
 // a test framework.
 import { Rng, Sim } from "@claude-engine/core";
 import { findOverflowingNodes } from "@claude-engine/surface-ui";
+import { generateGroundFloor } from "@claude-engine/interiors";
 import {
   H1_RULES,
   evaluateRules,
@@ -18,6 +19,7 @@ import { reservaApp } from "../dist-game/sim/reserva-app.js";
 import { auditApp } from "../dist-game/sim/audit-app.js";
 import {
   setupWithConfig,
+  DEFAULTS,
   PLAYER_ENTITY,
   interactCommand,
   deskDecisionCommand,
@@ -27,6 +29,7 @@ import {
   HOTEL_APPS,
   pricerSetRateCommand,
   staffHireCommand,
+  renovateCommand,
 } from "../dist-game/sim/game.js";
 import { jitter } from "../dist-game/sim/nav.js";
 import {
@@ -42,11 +45,19 @@ import {
   arrivalsForDay,
   generateObjectives,
   isValidRate,
+  isValidRateForHotelTier,
+  maxRateForHotelTier,
   OBJECTIVE_KINDS,
   SEGMENT_POOL,
+  SEGMENT_MIN_HOTEL_TIER,
   MIN_RATE_MINOR,
   MAX_RATE_MINOR,
+  MAX_RATE_BY_TIER_MINOR,
+  MAX_HOTEL_TIER,
+  RENOVATE_COST_MINOR,
+  RENOVATE_STAR_REQ,
   RATE_STEP_MINOR,
+  CHARGEBACK_ACCOUNT,
 } from "../dist-game/sim/economy.js";
 
 let failures = 0;
@@ -487,8 +498,22 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
   // deskSystem (system-order item 8) sets `reservation.decided` THIS tick;
   // guestBrainSystem (item 4) runs BEFORE deskSystem in the same tick, so
   // it reacts to the decision on the NEXT tick — one more step() needed.
+  // W1 round-4 §4.2: re-verified directly (a throwaway instrumented run of
+  // this exact fixture) that this fixture's guest is still, and only,
+  // "leaving" on that exact next tick — it has not yet reached the street
+  // region (reachedStreetRegion requires either the exact door cell or a
+  // stuckTicks-gated region match, neither true one tick after the
+  // transition) — and is despawned the tick after THAT. So the state is
+  // reliably observable at a fixed offset; asserting it directly (not
+  // OR-ed with the despawn check two lines below, which made the previous
+  // version of this check unfalsifiable) is honest coverage of the
+  // "leaving" state, not decoration.
   sim.step();
-  check("FSM(deny): guest transitions to leaving", sim.getComponent(guestEntity, "guest").state === "leaving");
+  const guestAfterDeny = sim.getComponent(guestEntity, "guest");
+  check(
+    "FSM(deny): guest transitions to leaving",
+    guestAfterDeny !== undefined && guestAfterDeny.state === "leaving",
+  );
 
   let sawLeftEvent = false;
   const despawned = runUntil(sim, 4000, (s) => {
@@ -499,6 +524,76 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
   });
   check("FSM(deny): guest FSM reaches 'left' (despawned)", despawned);
   check("FSM(deny): a guest.left event was emitted for this guest", sawLeftEvent);
+}
+
+// --- Overflow wait-cell allocation: distinct cells under real concurrency ---
+// W1 round-4 fix, blocking 4.1 (docs/alpha-loop/reviews/W1.md ROUND 4):
+// `overflowWaitCellFor(entity) = pool[entity % pool.length]` let two
+// SIMULTANEOUSLY-overflowing guests land on the SAME goal cell whenever
+// their ids happened to differ by exactly the pool size — the one case
+// where the sidestep the yield rule offers is a guaranteed no-op
+// (`findJitteredPath` ignores `avoidIdx` at the goal), because the first
+// guest to arrive parks there (empty path, standing on its own goal) and
+// the second is a wall away from ever moving. Fixed by allocating by RANK
+// among the guests overflowing THIS TICK, which is guaranteed distinct.
+//
+// 10 guests, one 8-slot queue, all spawned on tick 1 (arrivals: "fixed",
+// spawnTickMin === spawnTickMax === 1): exactly 2 guests overflow, on the
+// SAME tick, which is the one case that actually exercises concurrent
+// allocation (staggered arrivals never contend for a rank at all). Their
+// goal cells must be distinct from each other and from the street door.
+{
+  const sim = new Sim("hotel-overflow-alloc-1");
+  setupWithConfig(sim, {
+    guestCount: 10,
+    spawnTickMin: 1,
+    spawnTickMax: 1,
+    // The spawn CADENCE is spawnIntervalMin/MaxTicks (50-150 by default,
+    // "every 50-150 ticks"), not spawnTickMin/Max (only the FIRST guest's
+    // tick) — pinning the interval to 1 is what actually bursts all ten
+    // arrivals back-to-back instead of spreading them over ~500-1500
+    // ticks.
+    spawnIntervalMinTicks: 1,
+    spawnIntervalMaxTicks: 1,
+    fraudRatePermille: 0,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+  });
+  // guestSpawnSystem (item 3) spawns one guest per tick while
+  // `hotel.nextGuestAtTick` allows, and guestBrainSystem (item 4) assigns
+  // queue slots the same tick a guest becomes "arriving". Stepping 15
+  // ticks is generous headroom for all ten to have spawned (one per tick
+  // at minimum) and for the queue-assignment loop to have run against the
+  // full set at least once.
+  for (let i = 0; i < 15; i++) sim.step();
+
+  const overflowing = [...sim.withComponent("guest")]
+    .filter(([, g]) => g.state === "arriving")
+    .map(([entity]) => ({ entity, agent: sim.getComponent(entity, "navAgent") }));
+  check("overflow alloc: exactly 2 of 10 guests overflow the 8-slot queue", overflowing.length === 2);
+  check(
+    "overflow alloc: every overflowing guest has a navAgent goal",
+    overflowing.every(({ agent }) => agent !== undefined),
+  );
+  const goalKeys = overflowing.map(({ agent }) => `${agent.goalCx},${agent.goalCz}`);
+  check(
+    "overflow alloc: the two overflow goal cells are DISTINCT (the round-4 4.1 bug: id-modulo could collide them)",
+    new Set(goalKeys).size === overflowing.length,
+  );
+
+  const floor = generateGroundFloor("hotel-overflow-alloc-1");
+  const streetDoor = floor.doors[floor.entranceDoorIndex];
+  const streetCellKey = `${Math.floor(streetDoor.xMm / 250)},${Math.floor(streetDoor.zMm / 250)}`;
+  const queueCellKeys = new Set(floor.desk.queueCells.map((c) => `${c.cx},${c.cz}`));
+  check(
+    "overflow alloc: neither overflow goal is the street door cell (round-3 fact 2/3: never stack the departure goal)",
+    goalKeys.every((k) => k !== streetCellKey),
+  );
+  check(
+    "overflow alloc: neither overflow goal is a queue cell (queue slots are for slotted guests only)",
+    goalKeys.every((k) => !queueCellKeys.has(k)),
+  );
 }
 
 // --- Double-entry ledger -----------------------------------------------------
@@ -664,6 +759,55 @@ const FSM_CONFIG = { guestCount: 2, spawnTickMin: 1, spawnTickMax: 1, fraudRateP
   const a4 = jitter(12345, 3, 7, 64);
   check("jitter: interleaving calls with other inputs does not perturb prior results", a4 === a1);
   void b;
+}
+
+// --- default fraudRatePermille is non-zero (C3-W2, CYCLE-3.md "Lane 2") -----
+// C2-W1's COO review found the app's *default* setup config wired
+// `fraudRatePermille: 0`, so the shipped game never spawned a fraudulent
+// guest even though every headless gate that cared about fraud passed its
+// own explicit rate. The CEO ruling moved the default to 200 (game.ts's
+// `DEFAULTS`). This is the non-vacuity pair for that ruling: run a
+// 200-guest headless stream at the DEFAULT rate and confirm at least one
+// guest actually gets a planted violation, then run the same stream with
+// the rate forced back to 0 and confirm none do — so a future regression
+// back to 0 (or a broken plant path) fails loudly either direction.
+{
+  const spawnAllGuests = (config) => {
+    const sim = new Sim("hotel-c3w2-fraud-nonvacuity-1");
+    setupWithConfig(sim, config);
+    runUntil(sim, 50_000, (s) => {
+      const hotelEntity = [...s.withComponent("hotel")][0]?.[0];
+      const hotel = hotelEntity !== undefined ? s.getComponent(hotelEntity, "hotel") : undefined;
+      return hotel !== undefined && hotel.guestsSpawned >= config.guestCount;
+    });
+    let plantedCount = 0;
+    for (const [, r] of sim.withComponent("reservation")) {
+      if (r.plantedViolations.length > 0) plantedCount++;
+    }
+    return plantedCount;
+  };
+
+  const defaultRateConfig = {
+    ...DEFAULTS,
+    guestCount: 200,
+    spawnTickMin: 1,
+    spawnIntervalMinTicks: 1,
+    spawnIntervalMaxTicks: 1,
+    fixture: "normal",
+    upkeep: false,
+    arrivals: "fixed",
+  };
+  const plantedAtDefault = spawnAllGuests(defaultRateConfig);
+  check(
+    `fraud non-vacuity: default fraudRatePermille (${DEFAULTS.fraudRatePermille}) plants at least one violation across 200 guests (got ${plantedAtDefault})`,
+    plantedAtDefault > 0,
+  );
+
+  const plantedAtZero = spawnAllGuests({ ...defaultRateConfig, fraudRatePermille: 0 });
+  check(
+    `fraud non-vacuity: fraudRatePermille 0 plants no violations across 200 guests (got ${plantedAtZero})`,
+    plantedAtZero === 0,
+  );
 }
 
 // --- despawn clears departed guests and their documents ----------------------
@@ -859,6 +1003,116 @@ function focusTerminal(sim, terminalEntity) {
   // above) -- one more step() before the guest's FSM has moved.
   sim.step();
   check("decision(deny): the guest ends up leaving", sim.getComponent(guestEntity, "guest").state === "leaving");
+
+  // CYCLE-3 lane 5 (c): a CAUGHT fraud is unchanged by the missed-fraud
+  // ruling -- it never even sets `fraudMissed`, so none of the checkout-
+  // time consequences (chargeback, synthetic review) apply to it.
+  check("decision(deny): a caught fraud never sets guest.fraudMissed", sim.getComponent(guestEntity, "guest").fraudMissed === false);
+  const despawnedDenied = runUntil(sim, 4000, (s) => s.getComponent(guestEntity, "guest") === undefined);
+  check("decision(deny): the denied guest eventually despawns (never checked in, never a checkout)", despawnedDenied);
+  check(
+    "decision(deny): no chargeback ledger entry exists anywhere (a denied guest was never charged)",
+    [...sim.withComponent("ledgerEntry")].every(([, e]) => e.debitAccount !== CHARGEBACK_ACCOUNT),
+  );
+  check(
+    "decision(deny): no synthetic fraud-missed review exists anywhere",
+    [...sim.withComponent("review")].every(([, r]) => !r.factors.includes("fraud-missed")),
+  );
+}
+
+// --- CYCLE-3 lane 5: a missed fraud must cost something -----------------
+// CEO ruling (docs/alpha-loop/CYCLE-3.md "Lane 5"): accepting a guest
+// despite a real rules violation is a SKIP at checkout -- the check-in
+// charge is reversed via an expense:chargeback ledger line, the guest
+// files no review, but a synthetic one-star Review row still lands in
+// the reputation window for that guest's segment.
+{
+  const sim = new Sim("hotel-fraud-missed-1");
+  setupWithConfig(sim, { guestCount: 1, spawnTickMin: 1, spawnTickMax: 1, fraudRatePermille: 1000, fixture: "normal", upkeep: false, arrivals: "fixed" });
+
+  runUntil(sim, 3000, (s) => findGuestAtQueueHead(s) !== undefined);
+  const [guestEntity] = findGuestAtQueueHead(sim);
+  teleportPlayerNextTo(sim, guestEntity);
+  sim.submit(interactCommand(sim.tick + 1, guestEntity));
+  sim.step();
+
+  const [resEntity, resBefore] = findReservationForGuest(sim, guestEntity);
+  check("fraud missed: the presenting guest's reservation carries a planted violation", resBefore.plantedViolations.length > 0);
+  const [roomEntity] = findVacantRoom(sim);
+
+  const deskTerminalPos = (() => {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  })();
+  sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPos);
+
+  // Accept DESPITE the violation -- a missed fraud.
+  sim.submit(deskDecisionCommand(sim.tick + 1, resEntity, true, roomEntity));
+  sim.step();
+
+  const missedEvents = sim.eventsSince(0).filter(
+    (e) => e.type === "desk.fraudMissed" && e.payload?.reservationEntity === resEntity,
+  );
+  check("fraud missed: desk.fraudMissed fired for this reservation", missedEvents.length === 1);
+  const guestAfterAccept = sim.getComponent(guestEntity, "guest");
+  check("fraud missed: guest.fraudMissed is set", guestAfterAccept.fraudMissed === true);
+  const paidMinor = guestAfterAccept.paidMinor;
+  check("fraud missed: the guest was actually charged something at check-in", paidMinor > 0);
+
+  const hotelEntry = () => [...sim.withComponent("hotel")][0];
+  const cashAfterCheckin = hotelEntry()[1].cash;
+
+  const checkedOut = runUntil(sim, 4000, (s) => {
+    for (const e of s.eventsSince(s.tick)) {
+      if (e.type === "guest.checkedOut" && e.payload?.guestEntity === guestEntity) return true;
+    }
+    return false;
+  });
+  check("fraud missed: the guest eventually checks out", checkedOut);
+
+  const chargebackEntries = [...sim.withComponent("ledgerEntry")]
+    .map(([, e]) => e)
+    .filter((e) => e.debitAccount === CHARGEBACK_ACCOUNT && e.creditAccount === "cash");
+  check(
+    "fraud missed: exactly one chargeback ledger entry, matching what was paid",
+    chargebackEntries.length === 1 && chargebackEntries[0].amountMinor === paidMinor,
+  );
+
+  const cashAfterCheckout = hotelEntry()[1].cash;
+  check(
+    "fraud missed: the chargeback exactly reverses the check-in charge (net zero cash from this guest -- pays nothing)",
+    cashAfterCheckout === cashAfterCheckin - paidMinor,
+  );
+
+  check(
+    "fraud missed: no guest.reviewed event was emitted (files no review)",
+    sim.eventsSince(0).filter((e) => e.type === "guest.reviewed" && e.payload?.guestEntity === guestEntity).length === 0,
+  );
+  check(
+    "fraud missed: no guest.complained event either",
+    sim.eventsSince(0).filter((e) => e.type === "guest.complained" && e.payload?.guestEntity === guestEntity).length === 0,
+  );
+
+  const fraudReview = [...sim.withComponent("review")]
+    .map(([, r]) => r)
+    .find((r) => r.segment === guestAfterAccept.segment && r.score === 1 && r.factors.includes("fraud-missed"));
+  check(
+    "fraud missed: a synthetic one-star Review row lands in the reputation window for the guest's segment",
+    fraudReview !== undefined,
+  );
+
+  // Ledger still balances overall: every account's debit/credit pair nets
+  // to zero, same check the harness scenarios run.
+  const allEntries = [...sim.withComponent("ledgerEntry")].map(([, e]) => e);
+  const byAccount = new Map();
+  for (const e of allEntries) {
+    if (!Number.isInteger(e.amountMinor)) continue;
+    byAccount.set(e.debitAccount, (byAccount.get(e.debitAccount) ?? 0) + e.amountMinor);
+    byAccount.set(e.creditAccount, (byAccount.get(e.creditAccount) ?? 0) - e.amountMinor);
+  }
+  let net = 0;
+  for (const v of byAccount.values()) net += v;
+  check("fraud missed: the ledger still balances (every debit/credit pair nets to zero)", net === 0);
 }
 
 // --- Screen overflow gate (surface-ui's findOverflowingNodes) ------------
@@ -951,7 +1205,10 @@ function focusTerminal(sim, terminalEntity) {
   );
   if (reservaViolations.length > 0) console.log(JSON.stringify(reservaViolations, null, 2));
 
-  const auditNodes = auditApp.paintSpec(auditApp.init(), view);
+  // AUDIT reveals its rows on a tick cadence after open (audit-app.ts), so
+  // the worst-case paint is the fully revealed one: a view well past the
+  // last reveal threshold.
+  const auditNodes = auditApp.paintSpec(auditApp.init(), { ...view, tick: 1000 });
   check(
     "overflow-gate setup: the worst-case AUDIT paint actually contains all three objective rows",
     OBJECTIVE_KINDS.every((t) => JSON.stringify(auditNodes).includes(t.kind)),
@@ -1278,8 +1535,8 @@ const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixtur
   );
 
   // Draw-at-generation: the same Rng state produces the same day.
-  const one = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE);
-  const two = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE);
+  const one = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE, 2);
+  const two = arrivalsForDay(new Rng("demand-1"), { 1: 5000, 2: 8000 }, {}, 1, DEFAULT_REP_PERMILLE, 2);
   check("demand: arrivalsForDay is deterministic for a given Rng state", JSON.stringify(one) === JSON.stringify(two));
   check(
     "demand: arrivals are integers and bounded by the segment pools",
@@ -1294,6 +1551,112 @@ const UPKEEP_ON = { guestCount: 1, spawnTickMin: 1, fraudRatePermille: 0, fixtur
   check("pricer: above the ceiling is invalid", !isValidRate(MAX_RATE_MINOR + RATE_STEP_MINOR));
   check("pricer: an off-step rate is invalid", !isValidRate(MIN_RATE_MINOR + 1));
   check("pricer: a non-integer rate is invalid", !isValidRate(5000.5));
+
+  // back-compat: capturePermille's four-argument form is unchanged.
+  check(
+    "demand: capturePermille's four-argument form returns exactly today's value",
+    capturePermille(6000, 6000, 500, 1) === 500 && capturePermille(3000, 6000, 500, 1) === capturePermille(3000, 6000, 500, 1, 1000),
+  );
+
+  // isValidRateForHotelTier at each tier's boundary and one step past it.
+  for (let tier = 0; tier <= MAX_HOTEL_TIER; tier++) {
+    const ceiling = MAX_RATE_BY_TIER_MINOR[tier];
+    check(`pricer: tier ${tier}'s ceiling rate is valid`, isValidRateForHotelTier(ceiling, tier));
+    check(`pricer: one step past tier ${tier}'s ceiling is invalid`, !isValidRateForHotelTier(ceiling + RATE_STEP_MINOR, tier));
+    check(`pricer: maxRateForHotelTier(${tier}) matches the table`, maxRateForHotelTier(tier) === ceiling);
+  }
+
+  // arrivalsForDay: business books at 0/1 only at tier 2.
+  {
+    const rates = { 1: MIN_RATE_MINOR, 2: MIN_RATE_MINOR };
+    const tier0 = arrivalsForDay(new Rng("tier-gate-1"), rates, {}, 2, DEFAULT_REP_PERMILLE, 0);
+    const tier1 = arrivalsForDay(new Rng("tier-gate-1"), rates, {}, 2, DEFAULT_REP_PERMILLE, 1);
+    check("demand: business contributes zero arrivals at hotel tier 0", tier0.business === 0);
+    check("demand: business contributes zero arrivals at hotel tier 1", tier1.business === 0);
+    check(
+      "demand: SEGMENT_MIN_HOTEL_TIER gates business at tier 2",
+      SEGMENT_MIN_HOTEL_TIER.business === 2,
+    );
+    let sawNonZeroBusiness = false;
+    for (let i = 0; i < 40; i++) {
+      const tier2 = arrivalsForDay(new Rng(`tier-gate-2-${i}`), rates, {}, 2, DEFAULT_REP_PERMILLE, 2);
+      if (tier2.business > 0) sawNonZeroBusiness = true;
+    }
+    check("demand: business is non-zero-capable at hotel tier 2", sawNonZeroBusiness);
+  }
+}
+
+// --- applyRenovate: the four refusal reasons, driven through renovateCommand ---
+{
+  function deniedReasons(sim) {
+    return sim.eventsSince(0).filter((e) => e.type === "screen.denied").map((e) => e.payload?.reason);
+  }
+  function deskTerminalPosOf(sim) {
+    for (const [e] of sim.withComponent("terminal")) return sim.getComponent(e, "pos");
+    return undefined;
+  }
+
+  // 1. out-of-range: player nowhere near the desk (default spawn).
+  {
+    const sim = new Sim("hotel-renovate-out-of-range-1");
+    setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, spawnTickMax: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+    const [hotelEntity, hotel0] = [...sim.withComponent("hotel")][0];
+    sim.setComponent(hotelEntity, "hotel", { ...hotel0, cash: 1_000_000, stars: 2 });
+    sim.submit(renovateCommand(sim.tick + 1));
+    sim.step();
+    check("applyRenovate: out-of-range is refused when the player is away from the desk", deniedReasons(sim).includes("out-of-range"));
+  }
+
+  // 2. max-tier: at MAX_HOTEL_TIER already.
+  {
+    const sim = new Sim("hotel-renovate-max-tier-1");
+    setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, spawnTickMax: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+    sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPosOf(sim));
+    const [hotelEntity, hotel0] = [...sim.withComponent("hotel")][0];
+    sim.setComponent(hotelEntity, "hotel", { ...hotel0, cash: 1_000_000, stars: 2, tier: MAX_HOTEL_TIER });
+    sim.submit(renovateCommand(sim.tick + 1));
+    sim.step();
+    check("applyRenovate: renovating past MAX_HOTEL_TIER is refused", deniedReasons(sim).includes("max-tier"));
+  }
+
+  // 3. stars-too-low.
+  {
+    const sim = new Sim("hotel-renovate-stars-1");
+    setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, spawnTickMax: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+    sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPosOf(sim));
+    const [hotelEntity, hotel0] = [...sim.withComponent("hotel")][0];
+    sim.setComponent(hotelEntity, "hotel", { ...hotel0, cash: 1_000_000, stars: 1, tier: 0 });
+    sim.submit(renovateCommand(sim.tick + 1));
+    sim.step();
+    check("applyRenovate: too few stars is refused", deniedReasons(sim).includes("stars-too-low"));
+  }
+
+  // 4. insufficient-cash.
+  {
+    const sim = new Sim("hotel-renovate-cash-1");
+    setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, spawnTickMax: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+    sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPosOf(sim));
+    const [hotelEntity, hotel0] = [...sim.withComponent("hotel")][0];
+    sim.setComponent(hotelEntity, "hotel", { ...hotel0, cash: 0, stars: 2, tier: 0 });
+    sim.submit(renovateCommand(sim.tick + 1));
+    sim.step();
+    check("applyRenovate: insufficient cash is refused", deniedReasons(sim).includes("insufficient-cash"));
+  }
+
+  // Success path, for contrast: at the desk, enough stars and cash.
+  {
+    const sim = new Sim("hotel-renovate-success-1");
+    setupWithConfig(sim, { guestCount: 0, spawnTickMin: 100000, spawnTickMax: 100000, fraudRatePermille: 0, fixture: "normal", upkeep: false, arrivals: "fixed" });
+    sim.setComponent(PLAYER_ENTITY, "pos", deskTerminalPosOf(sim));
+    const [hotelEntity, hotel0] = [...sim.withComponent("hotel")][0];
+    sim.setComponent(hotelEntity, "hotel", { ...hotel0, cash: RENOVATE_COST_MINOR[1], stars: RENOVATE_STAR_REQ[1], tier: 0 });
+    sim.submit(renovateCommand(sim.tick + 1));
+    sim.step();
+    const hotelAfter = sim.getComponent(hotelEntity, "hotel");
+    check("applyRenovate: a fully-qualified renovation succeeds and moves to tier 1", hotelAfter.tier === 1 && hotelAfter.cash === 0);
+    const renovatedEvents = sim.eventsSince(0).filter((e) => e.type === "hotel.renovated");
+    check("applyRenovate: emits hotel.renovated with from/to", renovatedEvents.length === 1 && renovatedEvents[0].payload.from === 0 && renovatedEvents[0].payload.to === 1);
+  }
 }
 
 // --- objectives: sim-derived targets, no punishment ----------------------

@@ -11,6 +11,10 @@ import type { FrameStats } from "./test-hook.js";
 export interface SceneContext {
   scene: THREE.Scene;
   camera: THREE.Camera;
+  /** The WebGL renderer, exposed so a game can configure tone mapping,
+   *  shadow maps, output color space, etc. Host owns its lifecycle
+   *  (creation/dispose); games only ever configure it. */
+  renderer: THREE.WebGLRenderer;
   /** Get-or-create the scene object for an entity. The host disposes/removes
    *  objects whose entity no longer exists in the world. */
   objectFor(entity: EntityId, create: () => THREE.Object3D): THREE.Object3D;
@@ -63,6 +67,18 @@ export interface ThreeHostOptions {
    *  pre-H2b values, so no existing caller changes. */
   ambientIntensity?: number;
   keyLightIntensity?: number;
+  /** When false, the host adds NO default lights (no ambient, no sun) —
+   *  for a game that builds its own lighting rig. Defaults to true, so
+   *  every existing caller (living-world, scenarios, the harness) is
+   *  unaffected. */
+  defaultLights?: boolean;
+  /** Passed through to the WebGLRenderer constructor alongside `canvas`.
+   *  Optional; omitting it preserves today's `{ antialias: true }`. */
+  rendererOptions?: { antialias?: boolean; powerPreference?: WebGLPowerPreference };
+  /** Called once, right after the renderer is created and before the
+   *  render loop starts, so a game can configure tone mapping / shadow
+   *  maps / etc. before anything ever renders. */
+  onRendererCreated?(renderer: THREE.WebGLRenderer, scene: THREE.Scene): void;
 }
 
 export interface ThreeHost {
@@ -90,18 +106,33 @@ export function createOrthographicCamera(viewHeight: number, near = 0.1, far = 1
  * knowledge: entity->visual mapping is entirely the game's `syncScene`.
  */
 export function createThreeHost(world: IWorld, options: ThreeHostOptions): ThreeHost {
-  const { canvas, stepSim, submit, syncScene, keymap, pointerHandlers, onFrame } = options;
+  const {
+    canvas,
+    stepSim,
+    submit,
+    syncScene,
+    keymap,
+    pointerHandlers,
+    onFrame,
+    defaultLights = true,
+    rendererOptions,
+    onRendererCreated,
+  } = options;
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, ...rendererOptions });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
   const scene = new THREE.Scene();
   const camera = options.camera ?? new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
 
-  const ambient = new THREE.AmbientLight(0xffffff, options.ambientIntensity ?? 0.6);
-  const sun = new THREE.DirectionalLight(0xffffff, options.keyLightIntensity ?? 0.8);
-  sun.position.set(5, 10, 5);
-  scene.add(ambient, sun);
+  if (defaultLights) {
+    const ambient = new THREE.AmbientLight(0xffffff, options.ambientIntensity ?? 0.6);
+    const sun = new THREE.DirectionalLight(0xffffff, options.keyLightIntensity ?? 0.8);
+    sun.position.set(5, 10, 5);
+    scene.add(ambient, sun);
+  }
+
+  onRendererCreated?.(renderer, scene);
 
   const objects = new Map<EntityId, THREE.Object3D>();
   const scenery = new Map<string, THREE.Object3D>();
@@ -147,7 +178,7 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     }
   }
 
-  const ctx: SceneContext = { scene, camera, objectFor, scenery: sceneryFor };
+  const ctx: SceneContext = { scene, camera, renderer, objectFor, scenery: sceneryFor };
 
   function resize(): void {
     const width = canvas.clientWidth || window.innerWidth;
@@ -184,7 +215,16 @@ export function createThreeHost(world: IWorld, options: ThreeHostOptions): Three
     return document.pointerLockElement === canvas;
   }
   function onCanvasClick(): void {
-    canvas.requestPointerLock();
+    // A sandboxed host (an iframe without allow-pointer-lock) throws or
+    // rejects here. Swallow it: the game's own fallback (if any) listens
+    // for pointerlockerror / the absence of pointerlockchange, and an
+    // uncaught error would otherwise spam the console on every click.
+    try {
+      const r = (canvas.requestPointerLock as () => void | Promise<void>)();
+      if (r && typeof (r as Promise<void>).catch === "function") (r as Promise<void>).catch(() => {});
+    } catch {
+      /* refused; fallback handles it */
+    }
   }
   function onMouseMove(e: MouseEvent): void {
     if (!isPointerLocked()) return;

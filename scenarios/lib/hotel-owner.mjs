@@ -32,6 +32,12 @@ import {
   buildScreenWorldView,
 } from "../../apps/hotel/dist-game/sim/game.js";
 import { H1_RULES, evaluateRules, rulesForStars } from "../../apps/hotel/dist-game/sim/rules.js";
+import {
+  SEGMENT_WILLINGNESS_MINOR,
+  SEGMENT_MIN_HOTEL_TIER,
+  RATE_STEP_MINOR,
+  MIN_RATE_MINOR,
+} from "../../apps/hotel/dist-game/sim/economy.js";
 import { atan2Mdeg, cellOfMm, CELL_SIZE_MM } from "../../packages/space/dist/index.js";
 
 export const OWNER_ACTOR = "player";
@@ -99,6 +105,14 @@ export function makeOwnerBot(opts) {
      *  OTHER entry point — the command form, which RESERVA's filtered room
      *  list would never let a screen click reach. */
     probeNotReadyRoom = false,
+    /** Off by default (no existing scenario changes behaviour). When true:
+     *  whenever LEDGER's `renovateAvailable` is true, walk to the desk, open
+     *  LEDGER, and click RENOVATE — same one-press action a human takes.
+     *  Once a renovation lands, also raise every rate toward the new
+     *  ceiling (via PRICER's existing RATE + click) so the higher-tier
+     *  economy actually pays for itself, rather than sitting at the old
+     *  rate under a new, higher cap. */
+    renovate = false,
   } = opts;
 
   const behaviour = {
@@ -279,6 +293,18 @@ export function makeOwnerBot(opts) {
   const doneDays = new Set();
   let lastAppOpened = "";
   let probedNotReady = false;
+  // Anti-wedge counter for the chore loops: `alpha-loop`'s 14-day run can
+  // pile up a heavier mess/prop backlog than one-man-week ever produces,
+  // and reachAndInteract's straight-line nudge fallback can occasionally
+  // ping-pong on a single stubborn target instead of converging. Tracked
+  // by (position, target) so a genuinely slow approach is never mistaken
+  // for a wedge — only "same target, hasn't actually moved" counts.
+  let choreStuckRefPos = null;
+  let choreStuckRefTick = 0;
+  let choreStuckTarget = -1;
+  let choreSkipIndex = 0;
+  const CHORE_WEDGE_WINDOW_TICKS = 60;
+  const CHORE_WEDGE_NET_MM = 300;
 
   return {
     actor: OWNER_ACTOR,
@@ -294,23 +320,59 @@ export function makeOwnerBot(opts) {
       const { pos } = self(world, playerEntity);
       if (!pos) return [];
 
+      /** Picks the target this tick's chore should pursue, and detects a
+       *  wedge: net displacement near zero over a rolling window while
+       *  chasing the SAME target (catches both "stopped dead" and the
+       *  ping-pong a straight-line nudge can fall into against certain
+       *  geometry). On a detected wedge, `choreSkipIndex` advances so the
+       *  NEXT call rotates to a different candidate — a heavier backlog
+       *  than one-man-week/zen-clean ever produce is exactly what
+       *  `alpha-loop`'s 14-day run can build up, and one stubborn item must
+       *  never wedge the whole round forever. */
+      function pickChoreTarget(list, entityPos, tick) {
+        if (list.length === 0) {
+          choreStuckTarget = -1;
+          return undefined;
+        }
+        const target = list[choreSkipIndex % list.length];
+        if (target[0] !== choreStuckTarget) {
+          choreStuckTarget = target[0];
+          choreStuckRefPos = entityPos;
+          choreStuckRefTick = tick;
+          return target;
+        }
+        if (tick - choreStuckRefTick >= CHORE_WEDGE_WINDOW_TICKS) {
+          const dx = entityPos.xMm - choreStuckRefPos.xMm;
+          const dz = entityPos.zMm - choreStuckRefPos.zMm;
+          if (dx * dx + dz * dz < CHORE_WEDGE_NET_MM * CHORE_WEDGE_NET_MM) {
+            choreSkipIndex++;
+            choreStuckTarget = -1;
+            return list[choreSkipIndex % list.length];
+          }
+          choreStuckRefPos = entityPos;
+          choreStuckRefTick = tick;
+        }
+        return target;
+      }
+
       /** The wipe-then-repair round, or null if there is nothing to do. */
-      function choreIntents(w, isFocused) {
+      function choreIntents(w, isFocused, entityPos, tick) {
         if (behaviour.clean) {
           const messes = scan(w, "mess");
           if (messes.length > 0) {
             if (isFocused) return [{ type: "screen.blur", payload: {} }];
-            const target = messes[0];
-            const mPos = w.getComponent(target[0], "pos");
+            const target = pickChoreTarget(messes, entityPos, tick);
+            const mPos = target && w.getComponent(target[0], "pos");
             if (mPos) return reachAndInteract(w, target[0], mPos);
           }
         }
         if (behaviour.repair) {
-          const broken = scan(w, "prop").find(([, p]) => p.broken);
-          if (broken) {
+          const broken = scan(w, "prop").filter(([, p]) => p.broken);
+          if (broken.length > 0) {
             if (isFocused) return [{ type: "screen.blur", payload: {} }];
-            const pPos = w.getComponent(broken[0], "pos");
-            if (pPos) return reachAndInteract(w, broken[0], pPos);
+            const target = pickChoreTarget(broken, entityPos, tick);
+            const pPos = target && w.getComponent(target[0], "pos");
+            if (pPos) return reachAndInteract(w, target[0], pPos);
           }
         }
         return null;
@@ -425,7 +487,7 @@ export function makeOwnerBot(opts) {
               // The guest is fine, but every room is dirty or broken. The
               // only thing that changes that is walking upstairs — the
               // one-man-show squeeze, made literal.
-              const chore = choreIntents(world, focused);
+              const chore = choreIntents(world, focused, pos, tick);
               if (chore) return chore;
               return [];
             }
@@ -469,9 +531,113 @@ export function makeOwnerBot(opts) {
         }
       }
 
-      // ---- the zen loops: wipe, then repair ----
-      const chore = choreIntents(world, focused);
+      // ---- the zen loops: wipe, then repair. Kept at the SAME priority it
+      //      always had — a renovation or a rate change is never worth
+      //      letting the house go to pieces, so `renovate` below is
+      //      strictly lower priority than a chore that exists right now. ----
+      const chore = choreIntents(world, focused, pos, tick);
       if (chore) return chore;
+
+      // ---- renovate whenever it is actually affordable, then price like a
+      //      competent human — never "chase the ceiling". A human who
+      //      overprices their own guests loses stars, so the target rate is
+      //      the LOWEST willingness among the segments actually eligible to
+      //      book at the current hotel tier (read from economy.js, never
+      //      hardcoded), clamped to the tier's ceiling. Only reached once
+      //      desk service, hiring and every open chore have nothing to do
+      //      this tick. ----
+      if (renovate) {
+        const view = buildScreenWorldView(world);
+        const ledgerView = view.data.ledger;
+        const pricingView = view.data.pricing;
+
+        if (ledgerView.renovateAvailable) {
+          if (!focused) return reachAndInteract(world, terminal, { xMm: floor.desk.xMm, zMm: floor.desk.zMm });
+          const state = world.getComponent(terminal, "screenApp").state;
+          const rects = shellRects(world, terminal);
+          if (state.openAppId !== "ledger") {
+            const open = clickIntent(rects, "taskbar:ledger");
+            return open ? [open] : [];
+          }
+          const press = clickIntent(rects, "app:renovate");
+          return press ? [press] : [];
+        }
+
+        // The lowest willingness among segments eligible at THIS hotel
+        // tier — e.g. family ($50) at tiers 0-1, still family at tier 2
+        // unless a later tier ever drops family (it does not this phase).
+        // Never assume; derive from SEGMENT_MIN_HOTEL_TIER + the real
+        // willingness table every tick, so a constants retune is picked up
+        // automatically.
+        const eligibleWillingness = Object.keys(SEGMENT_WILLINGNESS_MINOR)
+          .filter((seg) => (SEGMENT_MIN_HOTEL_TIER[seg] ?? 0) <= hotel.tier)
+          .map((seg) => SEGMENT_WILLINGNESS_MINOR[seg]);
+        const lowestWillingness =
+          eligibleWillingness.length > 0 ? Math.min(...eligibleWillingness) : pricingView.maxRateMinor;
+        const rawTarget = Math.min(lowestWillingness, pricingView.maxRateMinor);
+        // Rates are step-quantised (isValidRate/isValidRateForHotelTier) —
+        // round DOWN so the target is never itself an overprice, and never
+        // below the floor.
+        const steppedTarget = Math.floor(rawTarget / RATE_STEP_MINOR) * RATE_STEP_MINOR;
+        const targetRateMinor = Math.max(MIN_RATE_MINOR, steppedTarget);
+
+        const tiers = Object.keys(pricingView.rateByTier)
+          .map((k) => Number.parseInt(k, 10))
+          .sort((a, b) => a - b);
+        // A room tier whose CURRENT rate is already outside [min, max] for
+        // the current hotel tier (e.g. the tier-2 room's committed opening
+        // rate, $80, is above hotel-tier-0/1's $60/$65 ceiling) can never
+        // be walked toward target one step at a time: PRICER's own guard
+        // refuses any click whose result is still out of bounds, so
+        // "current !== target" alone made the bot click the SAME refused
+        // "down" forever — an infinite loop that left the terminal focused
+        // and locked a hired clerk out of the desk for the rest of the
+        // run (measured directly: fraudRatePermille 200's real desk load
+        // never mattered, the bot was stuck on this before a single guest
+        // could even be invited). Only treat a tier as reachable-this-tick
+        // if the very next step actually lands inside bounds; an
+        // unreachable tier is left alone until a renovation raises the
+        // ceiling enough to admit its first step.
+        const offTarget = tiers.find((t) => {
+          const current = pricingView.rateByTier[String(t)];
+          if (current === targetRateMinor) return false;
+          const next = current < targetRateMinor ? current + pricingView.stepMinor : current - pricingView.stepMinor;
+          return next >= pricingView.minRateMinor && next <= pricingView.maxRateMinor;
+        });
+        if (offTarget !== undefined) {
+          if (!focused) return reachAndInteract(world, terminal, { xMm: floor.desk.xMm, zMm: floor.desk.zMm });
+          const state = world.getComponent(terminal, "screenApp").state;
+          const rects = shellRects(world, terminal);
+          if (state.openAppId !== "pricer") {
+            const open = clickIntent(rects, "taskbar:pricer");
+            return open ? [open] : [];
+          }
+          if (state.appStates.pricer?.selectedTier !== offTarget) {
+            const select = clickIntent(rects, `app:tier:${offTarget}`);
+            return select ? [select] : [];
+          }
+          const current = pricingView.rateByTier[String(offTarget)];
+          const step = clickIntent(rects, current < targetRateMinor ? "app:up" : "app:down");
+          return step ? [step] : [];
+        }
+
+        // Nothing left to do on the terminal this tick (no renovation
+        // available, every rate already at target). If a PRIOR tick left
+        // the screen focused (LEDGER/PRICER open) while walking here or
+        // finishing a click, blur it now rather than leave it held — a
+        // hired clerk's `staffBrainSystem` stands down for as long as
+        // ANY other actor holds terminal focus (`focusedBy !== "" &&
+        // focusedBy !== the clerk's actor`), so an owner that parks at
+        // the desk with the screen still open after finishing renovate/
+        // pricer business silently locks the clerk out of the desk
+        // forever — measured: the queue sat at 8/8 with nobody
+        // presenting for roughly two full days once a clerk was on
+        // payroll, until this fired. Every OTHER branch in this bot
+        // already blurs before falling through to something else; this
+        // one is the same discipline, just at the tail of the newest
+        // branch.
+        if (focused) return [{ type: "screen.blur", payload: {} }];
+      }
 
       // ---- once someone else runs the desk, get out of the way ----
       void lastAppOpened;

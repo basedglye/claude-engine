@@ -1,0 +1,4 @@
+[
+  {"name":"spawn-yaw0","q":"hotelTier=T"},
+  {"name":"spawn-yaw180","q":"hotelTier=T&yaw=180"}
+]

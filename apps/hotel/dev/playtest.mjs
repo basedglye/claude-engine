@@ -79,13 +79,13 @@ function taskbarRect(appId) {
   if (idx < 0) throw new Error(`unknown app ${appId}`);
   return { x: 4 + idx * (TASKBAR_BTN_W + TASKBAR_BTN_GAP), y: TASKBAR_BTN_Y, w: TASKBAR_BTN_W, h: 16 };
 }
-// reserva-app.ts (re-run, C3-W6): ACCEPT/DENY moved to y=104 per fix-list
+// reserva-app.ts (2b+alpha merge, 2026-09-04): ACCEPT/DENY sit on the H2b action bar at y=434
 // item F2 (were off-screen at y=440 from the standing desk pose — COO
 // review apps/hotel/docs/alpha-loop/reviews/C2-W1.md §1d). Room list still
 // starts at y=220.
 const RESERVA = {
-  accept: { x: 8, y: 104, w: 96, h: 18 },
-  deny: { x: 112, y: 104, w: 96, h: 18 },
+  accept: { x: 8, y: 434, w: 120, h: 20 },
+  deny: { x: 136, y: 434, w: 120, h: 20 },
   roomListX: 8,
   roomListY: 220,
   roomRowH: 18,

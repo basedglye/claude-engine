@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "_schema": "Machine index of durable project state. Never invent values: unknown scalars are the literal string \"unknown\", unknown lists are []. Refresh at every phase boundary, alongside HANDOFF.md. See brain/reference/project-status-protocol.md. Pause fields (pause_at_next_break, paused_at, resume_after, continuation) are read by ~/.claude/hooks/peak-pause.js — see reference/tool-scoping-runbook.md. Atlas (_meta/atlas-brief.js) reads status/parked_at: status is \"active\" or \"parked\"; parked projects sink in the daily brief and skip the 7-day stall nudge.",
+  "name": "ClaudeEngine / GRAND FOYER (apps/hotel)",
+  "phase": "H2b parked after merging hotel-phase-2b + grand-foyer alpha onto main",
+  "percent_complete": "H2b implementation complete; review + flagship browser gate outstanding",
+  "last_verified_state": "2026-09-04: main = 3ee51c6 + docs; build/lint/purity green, smoke 3849639990, 609 workspace checks, goldens 12/12 (re-pinned to alpha values), alpha-loop headless PASS, browser gates fps-look-interact/reserva-readability/save-restore/demo-visual PASS on Chromium; art-lock/save-resume/upkeep-click RED (H2b literals vs alpha lobby depth, see docs/HANDOFF.md)",
+  "next_milestone": "Flagship-path repeatable browser gate (door -> desk -> RESERVA -> audit), both engines, constant command count",
+  "next_action": "Fresh worktree off main; npm ci; npm run assets:fetch -w apps/hotel; derive the flagship walk with apps/hotel/scripts/derive-walk.mjs; author scenarios/flagship-path.scenario.mjs",
+  "blockers": [
+    "H2b review predates the merge and rules on the PS1 look no longer on the level mesh",
+    "human LOOK-LOCKED sign-off never recorded",
+    "Firefox second-engine runs not executed on merged tree"
+  ],
+  "model_effort": "Opus 5 lead, low effort; Haiku/Sonnet workers",
+  "provider": "claude-code",
+  "handoff_path": "docs/HANDOFF.md",
+  "repo_path": "C:ClaudeGameclaude-engine",
+  "updated": "2026-09-04",
+  "status": "active",
+  "parked_at": null,
+  "pause_at_next_break": false,
+  "paused_at": null,
+  "resume_after": null,
+  "continuation": null
+}
